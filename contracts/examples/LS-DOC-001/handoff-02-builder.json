@@ -1,0 +1,97 @@
+{
+  "contractVersion": "1.1.0",
+  "handoffId": "HND-002",
+  "taskRef": {
+    "taskId": "LS-DOC-001",
+    "path": ".github/contracts/examples/LS-DOC-001/task.json"
+  },
+  "sourceAgent": "builder",
+  "destinationAgent": "qa",
+  "taskStatusAfter": "in-validation",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "documentation",
+      "description": "Wrote the execution-contract documentation page with the canonical role names, status vocabulary, and evidence rules."
+    },
+    {
+      "id": "W-02",
+      "kind": "implementation",
+      "description": "Documented the read-only validation command and its exit codes so operators can reproduce the check."
+    }
+  ],
+  "filesReviewed": [
+    "README.md",
+    "scripts/validate.sh",
+    "docs/workflows/feature-lifecycle.md"
+  ],
+  "filesModified": ["docs/workflows/agent-execution-contracts.md"],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-contract-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-link-integrity"]
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:05:00Z",
+      "executor": "LoomSphere Builder (agent session)",
+      "evidenceRef": "Local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "Schema and example checks passed with zero errors."
+    },
+    {
+      "checkId": "factory-link-integrity",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:05:00Z",
+      "executor": "LoomSphere Builder (agent session)",
+      "evidenceRef": "Local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "All relative links in the touched documentation resolved."
+    },
+    {
+      "checkId": "ci-projection",
+      "category": "other",
+      "outcome": "inconclusive",
+      "outcomeRationale": "No workflow run URL was observed for this branch, so the CI projection remains unverified.",
+      "kind": "asserted",
+      "summary": "CI was expected to pass because local static validation passed, but no workflow run was observed for this branch."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [],
+  "humanDecisionsRequired": [],
+  "recommendation": {
+    "verdict": "accept",
+    "rationale": "The documentation change is complete and locally validated; no application behavior or protected file was touched.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "qa",
+    "stage": "validation",
+    "rationale": "Independent verification should confirm the observed evidence and record the checks that were not run."
+  },
+  "metadata": {
+    "createdAt": "2026-10-24T14:06:00Z",
+    "producedBy": "builder",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-001. The asserted CI projection is deliberately not an observed result."
+}

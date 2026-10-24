@@ -1,0 +1,816 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loomsphere.local/contracts/handoff-contract.schema.json",
+  "title": "LoomSphere agent handoff contract",
+  "description": "Compact record of work one agent completed and what the next agent or human must do. Manual handoff only: writing this file transfers no authority and executes nothing.",
+  "type": "object",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^x-[a-z0-9-]+$": {
+      "description": "Extension slot for local annotations. Never interpreted as workflow control."
+    }
+  },
+  "required": [
+    "contractVersion",
+    "handoffId",
+    "taskRef",
+    "sourceAgent",
+    "destinationAgent",
+    "taskStatusAfter",
+    "workPerformed",
+    "filesReviewed",
+    "filesModified",
+    "acceptanceCriteriaAddressed",
+    "validation",
+    "continuousIntegration",
+    "findings",
+    "humanDecisionsRequired",
+    "recommendation",
+    "nextAction",
+    "metadata"
+  ],
+  "properties": {
+    "contractVersion": {
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md.",
+      "const": "1.1.0"
+    },
+    "handoffId": {
+      "type": "string",
+      "pattern": "^HND-[0-9]{3}$",
+      "description": "Unique within a task directory; ordering is lexical."
+    },
+    "taskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId", "path"],
+      "properties": {
+        "taskId": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*-[A-Z0-9]+(-[A-Z0-9]+)*$"
+        },
+        "path": {
+          "$ref": "#/$defs/repoFilePath"
+        }
+      }
+    },
+    "sourceAgent": {
+      "$ref": "#/$defs/agentRole"
+    },
+    "destinationAgent": {
+      "$ref": "#/$defs/agentOrHuman"
+    },
+    "taskStatusAfter": {
+      "$ref": "#/$defs/taskStatus",
+      "description": "Task status the source agent believes it leaves behind. A belief, not an approval."
+    },
+    "workPerformed": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "description"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^W-[0-9]{2}$"
+          },
+          "kind": {
+            "enum": ["analysis", "design", "implementation", "test", "review", "documentation"]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          }
+        }
+      }
+    },
+    "filesReviewed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/repoFilePath"
+      }
+    },
+    "filesModified": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/repoFilePath"
+      }
+    },
+    "acceptanceCriteriaAddressed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterionRef", "status", "evidenceCheckRefs"],
+        "properties": {
+          "criterionRef": {
+            "type": "string",
+            "pattern": "^AC-[0-9]{2,3}$"
+          },
+          "status": {
+            "enum": ["addressed", "partially-addressed", "not-addressed"]
+          },
+          "evidenceCheckRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "addressed"
+                }
+              },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": {
+                "evidenceCheckRefs": {
+                  "minItems": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "validation": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidenceRecord"
+      }
+    },
+    "continuousIntegration": {
+      "$ref": "#/$defs/continuousIntegrationClaim"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "description", "status", "blocking"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^FND-[0-9]{2}$"
+          },
+          "severity": {
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "status": {
+            "enum": ["open", "resolved", "accepted-risk"]
+          },
+          "blocking": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "humanDecisionsRequired": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question", "state", "reference", "blocking"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^HD-[0-9]{2}$"
+          },
+          "question": {
+            "type": "string",
+            "minLength": 10
+          },
+          "state": {
+            "enum": ["pending", "recorded"],
+            "description": "Only a human can move a decision to recorded."
+          },
+          "reference": {
+            "type": ["string", "null"]
+          },
+          "blocking": {
+            "type": "boolean"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "recorded"
+                }
+              },
+              "required": ["state"]
+            },
+            "then": {
+              "required": ["reference"],
+              "properties": {
+                "reference": {
+                  "type": "string",
+                  "minLength": 8
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "reference": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "rationale", "approvalGranted"],
+      "properties": {
+        "verdict": {
+          "enum": ["accept", "accept-with-findings", "fix-required", "reject", "blocked"]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 10
+        },
+        "approvalGranted": {
+          "const": false,
+          "description": "Structurally false: an agent handoff never grants human approval."
+        }
+      }
+    },
+    "nextAction": {
+      "$ref": "#/$defs/nextAction"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["createdAt", "producedBy", "executionMode"],
+      "properties": {
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "producedBy": {
+          "$ref": "#/$defs/agentRole"
+        },
+        "executionMode": {
+          "const": "manual-handoff"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "Reviewer outcome consistency: a review that requires rework must leave the task in changes-requested and return it to the Builder.",
+      "if": {
+        "properties": {
+          "sourceAgent": {
+            "const": "reviewer"
+          },
+          "recommendation": {
+            "properties": {
+              "verdict": {
+                "const": "fix-required"
+              }
+            },
+            "required": ["verdict"]
+          }
+        },
+        "required": ["sourceAgent", "recommendation"]
+      },
+      "then": {
+        "properties": {
+          "taskStatusAfter": {
+            "const": "changes-requested"
+          },
+          "nextAction": {
+            "properties": {
+              "agent": {
+                "const": "builder"
+              },
+              "stage": {
+                "const": "rework"
+              }
+            }
+          },
+          "findings": {
+            "contains": {
+              "properties": {
+                "blocking": {
+                  "const": true
+                },
+                "status": {
+                  "const": "open"
+                }
+              },
+              "required": ["blocking", "status"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Reviewer outcome consistency: only an accepting review may leave the task ready for the human final approval.",
+      "if": {
+        "properties": {
+          "sourceAgent": {
+            "const": "reviewer"
+          },
+          "recommendation": {
+            "properties": {
+              "verdict": {
+                "enum": ["accept", "accept-with-findings"]
+              }
+            },
+            "required": ["verdict"]
+          }
+        },
+        "required": ["sourceAgent", "recommendation"]
+      },
+      "then": {
+        "properties": {
+          "taskStatusAfter": {
+            "const": "ready-for-human-approval"
+          },
+          "nextAction": {
+            "properties": {
+              "agent": {
+                "const": "human"
+              },
+              "stage": {
+                "const": "human-final-approval"
+              }
+            }
+          },
+          "findings": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "blocking": {
+                    "const": true
+                  },
+                  "status": {
+                    "const": "open"
+                  }
+                },
+                "required": ["blocking", "status"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Reviewer outcome consistency: a rejected review leaves the task rejected and the decision with the human.",
+      "if": {
+        "properties": {
+          "sourceAgent": {
+            "const": "reviewer"
+          },
+          "recommendation": {
+            "properties": {
+              "verdict": {
+                "const": "reject"
+              }
+            },
+            "required": ["verdict"]
+          }
+        },
+        "required": ["sourceAgent", "recommendation"]
+      },
+      "then": {
+        "properties": {
+          "taskStatusAfter": {
+            "const": "rejected"
+          },
+          "nextAction": {
+            "properties": {
+              "agent": {
+                "const": "human"
+              },
+              "stage": {
+                "const": "human-final-approval"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Reviewer outcome consistency: a blocked review keeps the task blocked and requires an open blocking human decision.",
+      "if": {
+        "properties": {
+          "sourceAgent": {
+            "const": "reviewer"
+          },
+          "recommendation": {
+            "properties": {
+              "verdict": {
+                "const": "blocked"
+              }
+            },
+            "required": ["verdict"]
+          }
+        },
+        "required": ["sourceAgent", "recommendation"]
+      },
+      "then": {
+        "properties": {
+          "taskStatusAfter": {
+            "const": "blocked"
+          },
+          "nextAction": {
+            "properties": {
+              "agent": {
+                "const": "human"
+              },
+              "stage": {
+                "const": "review"
+              }
+            }
+          },
+          "humanDecisionsRequired": {
+            "contains": {
+              "properties": {
+                "state": {
+                  "const": "pending"
+                },
+                "blocking": {
+                  "const": true
+                }
+              },
+              "required": ["state", "blocking"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "agentRole": {
+      "enum": ["architect", "builder", "qa", "reviewer"]
+    },
+    "agentOrHuman": {
+      "enum": ["architect", "builder", "qa", "reviewer", "human"]
+    },
+    "taskStatus": {
+      "description": "Shared task-status vocabulary. Unknown values are schema violations and are never treated as success.",
+      "enum": [
+        "draft",
+        "awaiting-human-scope-approval",
+        "approved",
+        "in-implementation",
+        "implemented",
+        "in-validation",
+        "validation-failed",
+        "in-review",
+        "changes-requested",
+        "ready-for-human-approval",
+        "complete",
+        "rejected",
+        "blocked"
+      ]
+    },
+    "lifecycleStage": {
+      "enum": [
+        "requirements",
+        "architecture",
+        "human-scope-approval",
+        "implementation",
+        "validation",
+        "review",
+        "human-final-approval",
+        "rework",
+        "closed"
+      ]
+    },
+    "repoFilePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]+$",
+      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected."
+    },
+    "evidenceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One check result. `kind` records how the result was obtained; `outcome` records the semantic judgment. A process exit code is execution metadata, never proof that an acceptance criterion passed.",
+      "required": ["checkId", "category", "kind", "outcome", "summary"],
+      "properties": {
+        "checkId": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+        },
+        "category": {
+          "enum": [
+            "pytest",
+            "playwright",
+            "lint",
+            "build",
+            "static-validation",
+            "manual-review",
+            "documentation-review",
+            "other"
+          ]
+        },
+        "kind": {
+          "enum": ["observed", "asserted", "blocked", "not-run", "skipped"],
+          "description": "How the result was obtained. observed requires captured execution facts. asserted is an agent belief without captured execution. blocked/not-run/skipped carry no execution metadata."
+        },
+        "outcome": {
+          "enum": ["passed", "failed", "inconclusive", "blocked", "not-executed"],
+          "description": "Semantic result of the check, kept distinct from the process exit code. passed is never inferred from exitCode 0 alone; failed may coexist with exitCode 0 when the assertion itself failed."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 3
+        },
+        "exitCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "expectedExitCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Exit code the check is expected to produce. Required to document a successful negative test whose expected exit code is nonzero."
+        },
+        "outcomeRationale": {
+          "type": "string",
+          "minLength": 10,
+          "description": "Why this outcome was assigned, including the signal that was asserted. Required when the outcome is failed/inconclusive or the exit code is nonzero."
+        },
+        "executedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "executor": {
+          "type": "string",
+          "minLength": 3
+        },
+        "evidenceRef": {
+          "type": "string",
+          "minLength": 3,
+          "description": "Where the captured output or transcript can be inspected."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 5
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "observed"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["command", "exitCode", "executedAt", "executor", "evidenceRef"],
+            "properties": {
+              "outcome": {
+                "enum": ["passed", "failed", "inconclusive"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "asserted"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": ["passed", "failed", "inconclusive"]
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "blocked"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["not-run", "skipped"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "not-executed"
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "blocked"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-executed"
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": ["not-run", "skipped"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["expectedExitCode"]
+          },
+          "then": {
+            "required": ["exitCode"],
+            "properties": {
+              "kind": {
+                "const": "observed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "passed"
+              },
+              "exitCode": {
+                "not": {
+                  "const": 0
+                }
+              }
+            },
+            "required": ["outcome", "exitCode"]
+          },
+          "then": {
+            "required": ["expectedExitCode", "outcomeRationale"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": ["failed", "inconclusive"]
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "required": ["outcomeRationale"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "exitCode": {
+                "not": {
+                  "const": 0
+                }
+              }
+            },
+            "required": ["exitCode"]
+          },
+          "then": {
+            "required": ["outcomeRationale"]
+          }
+        }
+      ]
+    },
+    "continuousIntegrationClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "observedRunUrl"],
+      "description": "A CI claim is an assertion unless an observed run URL is recorded.",
+      "properties": {
+        "claim": {
+          "enum": ["not-claimed", "passed", "failed"]
+        },
+        "observedRunUrl": {
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "claim": {
+                "enum": ["passed", "failed"]
+              }
+            },
+            "required": ["claim"]
+          },
+          "then": {
+            "required": ["observedRunUrl"],
+            "properties": {
+              "observedRunUrl": {
+                "type": "string",
+                "pattern": "^https://github\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/actions/runs/[0-9]+$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "observedRunUrl": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nextAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "stage", "rationale"],
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/agentOrHuman"
+        },
+        "stage": {
+          "$ref": "#/$defs/lifecycleStage"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 10
+        }
+      }
+    }
+  }
+}

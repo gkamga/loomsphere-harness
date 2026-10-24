@@ -1,0 +1,130 @@
+{
+  "contractVersion": "1.1.0",
+  "handoffId": "HND-003",
+  "taskRef": {
+    "taskId": "LS-DOC-001",
+    "path": ".github/contracts/examples/LS-DOC-001/task.json"
+  },
+  "sourceAgent": "qa",
+  "destinationAgent": "reviewer",
+  "taskStatusAfter": "in-review",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "test",
+      "description": "Re-ran the read-only factory validation command and compared the reported checks with the acceptance criteria."
+    },
+    {
+      "id": "W-02",
+      "kind": "review",
+      "description": "Classified each acceptance criterion as addressed or partially addressed and recorded the checks that could not run."
+    }
+  ],
+  "filesReviewed": [
+    "docs/workflows/agent-execution-contracts.md",
+    "scripts/validate_factory.py",
+    ".github/contracts/examples/LS-DOC-001/task.json"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-contract-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-link-integrity"]
+    },
+    {
+      "criterionRef": "AC-03",
+      "status": "partially-addressed",
+      "evidenceCheckRefs": []
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:18:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Independent local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "Independent re-run reproduced the same zero-error result."
+    },
+    {
+      "checkId": "factory-link-integrity",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:18:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Independent local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "No broken relative link was reported for the touched documentation."
+    },
+    {
+      "checkId": "backend-safe-tests",
+      "category": "pytest",
+      "outcome": "not-executed",
+      "kind": "not-run",
+      "summary": "Not executed by QA: the task changes documentation only and does not alter backend behavior or tests."
+    },
+    {
+      "checkId": "playwright-e2e",
+      "category": "playwright",
+      "outcome": "blocked",
+      "kind": "blocked",
+      "summary": "Blocked: end-to-end validation requires a verified disposable database, and isolation was not confirmed for this session."
+    },
+    {
+      "checkId": "negative-validation-demonstration",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "uv run python ../scripts/validate_factory.py  # against a deliberately mutated contract copy",
+      "exitCode": 1,
+      "expectedExitCode": 1,
+      "outcome": "passed",
+      "outcomeRationale": "The validator is expected to exit non-zero for the mutated copy; the exit code is the asserted signal, so this negative test succeeded.",
+      "executedAt": "2026-10-24T14:20:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Disposable copy under the session temporary directory; the mutated artifact left the repository untouched",
+      "summary": "Documents a successful negative test whose correct outcome is a non-zero exit code."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "low",
+      "description": "AC-03 relies on manual comparison of validation categories because no automated check asserts that the documented list matches validate.sh.",
+      "status": "open",
+      "blocking": false
+    }
+  ],
+  "humanDecisionsRequired": [],
+  "recommendation": {
+    "verdict": "accept-with-findings",
+    "rationale": "The static validation evidence is reproducible and no blocking defect was found; one low-severity finding remains open.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "reviewer",
+    "stage": "review",
+    "rationale": "Review should confirm scope, ADR conformance, and that the documentation matches the implemented validator."
+  },
+  "metadata": {
+    "createdAt": "2026-10-24T14:19:00Z",
+    "producedBy": "qa",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-001 that demonstrates blocked and not-run evidence without converting either into success."
+}

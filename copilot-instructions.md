@@ -23,6 +23,13 @@
 - Preserve existing application behavior, conventions, and uncommitted work. Do not overwrite unrelated user changes.
 - Never hardcode secrets or expose them in output.
 
+## Execution contracts
+
+- Task and handoff records follow [the contracts guide](contracts/README.md) and the lifecycle in [agent-execution-contracts.md](../docs/workflows/agent-execution-contracts.md). Validate them with `bash scripts/validate.sh --factory`.
+- Contracts are manual handoffs, not an orchestrator. Writing them starts nothing, and a schema-valid record is not an approval. Agents must not set recorded human approvals, mark a task `approved` or `complete`, or grant an approval themselves.
+- Record only observed results as `observed`; use `asserted`, `blocked`, `not-run`, or `skipped` otherwise. A claimed CI pass without an observed run URL is not evidence.
+- Never place credentials, tokens, or connection URLs with embedded credentials in a contract or in validation output.
+
 ## Tests and validation
 
 - Add or update tests for behavior changes. Pytest and Playwright are required backend and end-to-end validation for application changes; run them before reporting implementation complete when their prerequisites are safe and verified. If a required check cannot safely run, report the work as unverified rather than claiming it passed.

@@ -25,6 +25,8 @@ jobs:
       - name: Install locked backend dependencies
         working-directory: backend
         run: uv sync --locked
+      - name: Validate agent, skill, and contract definitions
+        run: bash scripts/validate.sh --factory
       - name: Run backend safe validation
         run: bash scripts/validate.sh --backend
 
