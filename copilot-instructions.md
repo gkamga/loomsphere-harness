@@ -18,6 +18,8 @@
 - Before implementation, consult the relevant PRD, design documents, architecture guidance, and ADRs.
 - Report material discrepancies between requirements, approved architecture, documentation, and implementation.
 - Do not silently change an approved architectural decision. Surface the evidence and obtain approval before implementing a deviation.
+- Follow [ADR governance](../docs/decisions/README.md): proposed ADRs are not approval, and agents must not mark decisions accepted or superseded without explicit recorded human approval. Stop and request a human decision when requirements or constraints conflict with an accepted ADR.
+- Include conformance evidence for accepted ADRs in implementation plans and reviews; link verification to the relevant tests or checks.
 - Preserve existing application behavior, conventions, and uncommitted work. Do not overwrite unrelated user changes.
 - Never hardcode secrets or expose them in output.
 
