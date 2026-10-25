@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loomsphere.local/contracts/execution-evidence.schema.json",
+  "title": "LoomSphere execution evidence record",
+  "description": "Observed process evidence emitted by scripts/factory_execute.py for exactly one explicitly allowlisted validation check. This document records what one local process observed. It is not an approval, not an agent assertion, not a CI verdict, and not tamper-proof: a digest stored inside the same editable file does not authenticate that file. Consumers must treat the record as untrusted input that still requires a trusted execution environment.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifactVersion",
+    "artifactKind",
+    "executionId",
+    "producedAt",
+    "runner",
+    "check",
+    "repository",
+    "process",
+    "result",
+    "authority",
+    "limitations"
+  ],
+  "properties": {
+    "artifactVersion": {
+      "description": "Version of this artifact format. Bump only with a migration note in .github/contracts/README.md.",
+      "const": "1.0.0"
+    },
+    "artifactKind": {
+      "description": "Discriminator identifying this file as an execution evidence record.",
+      "const": "factory-execution-result"
+    },
+    "executionId": {
+      "description": "Unique identifier for this single execution attempt.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "producedAt": {
+      "description": "UTC timestamp at which the record was produced.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "runner": {
+      "description": "Identity of the program that produced this record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "implementation", "provenance"],
+      "properties": {
+        "name": {
+          "const": "factory_execute"
+        },
+        "version": {
+          "description": "Runner version. Recorded so a consumer can detect format drift.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "implementation": {
+          "description": "Repository-relative path of the runner implementation.",
+          "const": "scripts/factory_execute.py"
+        },
+        "provenance": {
+          "description": "Classifies the evidence as observed process execution rather than an assertion.",
+          "const": "runner-observed-process-execution"
+        }
+      }
+    },
+    "check": {
+      "description": "The single allowlisted check this record describes. The argument vector is fixed by the runner and is never derived from caller input.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkId",
+        "category",
+        "argv",
+        "displayCommand",
+        "workingDirectory",
+        "expectedExitCode",
+        "timeoutSeconds",
+        "description"
+      ],
+      "properties": {
+        "checkId": {
+          "description": "Allowlisted check identifier. This enum must stay in sync with the runner allowlist; unknown identifiers can never carry a result.",
+          "type": "string",
+          "enum": ["backend-safe-tests", "factory-contract-validation"]
+        },
+        "category": {
+          "description": "Kind of validation the check performs.",
+          "type": "string",
+          "enum": ["pytest", "static-validation"]
+        },
+        "argv": {
+          "description": "Exact argument vector executed, as a list so no shell quoting can be reinterpreted.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "displayCommand": {
+          "description": "Shell-quoted rendering of argv for human readability. Never re-executed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "workingDirectory": {
+          "description": "Repository-relative working directory the allowlist declares.",
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedExitCode": {
+          "description": "Exit status this check defines as success.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "timeoutSeconds": {
+          "description": "Effective timeout used. A caller may only tighten the allowlisted default.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 900
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      }
+    },
+    "repository": {
+      "description": "Revision context observed with read-only git commands.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "revisionSource", "commit", "dirtyWorktree"],
+      "properties": {
+        "scope": {
+          "const": "loomsphere"
+        },
+        "revisionSource": {
+          "description": "'unavailable' means git could not be read; the revision is then simply unknown, never guessed.",
+          "type": "string",
+          "enum": ["git-rev-parse", "unavailable"]
+        },
+        "commit": {
+          "description": "Full commit sha, or null when the revision is unavailable.",
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "dirtyWorktree": {
+          "description": "True when the working tree had uncommitted changes at execution time; null when unknown.",
+          "type": ["boolean", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "revisionSource": { "const": "git-rev-parse" } },
+            "required": ["revisionSource"]
+          },
+          "then": {
+            "properties": {
+              "commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+              "dirtyWorktree": { "type": "boolean" }
+            }
+          },
+          "else": {
+            "properties": {
+              "commit": { "type": "null" },
+              "dirtyWorktree": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "process": {
+      "description": "Process facts captured by the runner. Exit status is a fact, not an acceptance-criteria claim.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startedAt",
+        "completedAt",
+        "durationMs",
+        "exitCode",
+        "timedOut",
+        "termination",
+        "launchError",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "startedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "completedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exitCode": {
+          "description": "Observed exit status, or null when the process never produced one.",
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 255
+        },
+        "timedOut": {
+          "type": "boolean"
+        },
+        "termination": {
+          "description": "'exited' means the process produced an exit status; 'timeout' and 'launch-error' both mean it did not.",
+          "type": "string",
+          "enum": ["exited", "timeout", "launch-error"]
+        },
+        "launchError": {
+          "description": "Bounded, redacted description when the allowlisted command could not start.",
+          "type": ["string", "null"],
+          "maxLength": 512
+        },
+        "stdout": {
+          "$ref": "#/$defs/capturedStream"
+        },
+        "stderr": {
+          "$ref": "#/$defs/capturedStream"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "termination": { "const": "exited" } },
+            "required": ["termination"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "timedOut": { "const": false },
+              "launchError": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "termination": { "const": "timeout" } },
+            "required": ["termination"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": { "type": "null" },
+              "timedOut": { "const": true },
+              "launchError": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "termination": { "const": "launch-error" } },
+            "required": ["termination"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": { "type": "null" },
+              "timedOut": { "const": false },
+              "launchError": { "type": "string", "minLength": 1, "maxLength": 512 }
+            }
+          }
+        }
+      ]
+    },
+    "result": {
+      "description": "How the observed process facts map to this check's own expectation. A passing check does not prove that any acceptance criterion is satisfied.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "outcome", "outcomeRationale"],
+      "properties": {
+        "kind": {
+          "description": "'observed' means the runner captured process facts. 'not-run' is reserved for records that describe a check that never executed.",
+          "type": "string",
+          "enum": ["observed", "not-run"]
+        },
+        "outcome": {
+          "description": "Whether the observed exit status matched the expected status. A timeout is never a pass.",
+          "type": "string",
+          "enum": ["passed", "failed", "inconclusive", "not-executed"]
+        },
+        "outcomeRationale": {
+          "description": "Short, redacted explanation. Required for failed and inconclusive outcomes.",
+          "type": ["string", "null"],
+          "maxLength": 512
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "observed" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": { "enum": ["passed", "failed", "inconclusive"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "not-run" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": { "const": "not-executed" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "enum": ["failed", "inconclusive"] } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "outcomeRationale": { "type": "string", "minLength": 10, "maxLength": 512 }
+            }
+          }
+        }
+      ]
+    },
+    "authority": {
+      "description": "Explicit statement that this record confers no authority. Every grant field is a constant false so an edited file cannot claim approval without also breaking its own verification.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grantsApproval",
+        "grantsMerge",
+        "grantsDeployment",
+        "grantsContractLifecyclePromotion",
+        "authenticated",
+        "note"
+      ],
+      "properties": {
+        "grantsApproval": { "const": false },
+        "grantsMerge": { "const": false },
+        "grantsDeployment": { "const": false },
+        "grantsContractLifecyclePromotion": { "const": false },
+        "authenticated": { "const": false },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      }
+    },
+    "limitations": {
+      "description": "What this record cannot establish. Always non-empty.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 400
+      }
+    }
+  },
+  "$defs": {
+    "capturedStream": {
+      "description": "Digest and bounded redacted summary of one captured output stream. The summary is truncated, so absence of a string in it proves nothing about the full output.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "bytes", "truncated", "summary"],
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "description": "True when the digests cover more bytes than the stored summary.",
+          "type": "boolean"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 403
+        }
+      }
+    }
+  }
+}

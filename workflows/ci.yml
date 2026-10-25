@@ -29,6 +29,16 @@ jobs:
         run: bash scripts/validate.sh --factory
       - name: Run backend safe validation
         run: bash scripts/validate.sh --backend
+      - name: Record and verify allowlisted execution evidence
+        run: |
+          set -euo pipefail
+          artifact="${RUNNER_TEMP}/factory-execution-evidence.json"
+          uv run --project backend python scripts/factory_execute.py --list
+          uv run --project backend python scripts/factory_execute.py \
+            --check factory-contract-validation \
+            --output "${artifact}"
+          uv run --project backend python scripts/factory_execute.py --verify "${artifact}"
+          cat "${artifact}"
 
   frontend-quality:
     name: Frontend quality and build
