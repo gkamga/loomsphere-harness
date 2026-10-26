@@ -1,0 +1,69 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-101",
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "architect",
+  "destinationAgent": "human",
+  "taskStatusAfter": "awaiting-human-scope-approval",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "analysis",
+      "description": "Compared the 1.1.0 and 1.2.0 schema diffs and listed each additive keyword with the rule it enables."
+    },
+    {
+      "id": "W-02",
+      "kind": "design",
+      "description": "Defined a documentation-only scope with a prohibited path list, including one bracketed repository path."
+    }
+  ],
+  "filesReviewed": [
+    ".github/contracts/task-contract.schema.json",
+    ".github/contracts/handoff-contract.schema.json",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [],
+  "validation": [
+    {
+      "checkId": "scope-analysis",
+      "category": "manual-review",
+      "kind": "asserted",
+      "outcome": "passed",
+      "summary": "Scope analysis was performed by reading repository documents; no executable check applies before implementation."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Is the documentation-only scope, with the listed prohibited paths, approved for implementation?",
+      "state": "recorded",
+      "reference": "Scope approval recorded in the requesting work order for this synthetic example, 2026-10-25",
+      "blocking": false
+    }
+  ],
+  "recommendation": {
+    "verdict": "accept",
+    "rationale": "The scope is bounded, verifiable with the read-only validator, and touches no implementation or security file.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "human",
+    "stage": "human-scope-approval",
+    "rationale": "The architect hands the scope decision to the human before any implementation starts, because the scope boundary is the human's to set."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:01:00Z",
+    "producedBy": "architect",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002. It demonstrates the architect to human transition added in 1.2.0: a human gate placed inside an agent chain. The recorded human approval reference is illustrative and grants no authority by itself."
+}

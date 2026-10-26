@@ -31,8 +31,8 @@
   ],
   "properties": {
     "contractVersion": {
-      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md.",
-      "const": "1.1.0"
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0 and 1.2.0 are both accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
+      "enum": ["1.1.0", "1.2.0"]
     },
     "handoffId": {
       "type": "string",
@@ -62,6 +62,34 @@
     "taskStatusAfter": {
       "$ref": "#/$defs/taskStatus",
       "description": "Task status the source agent believes it leaves behind. A belief, not an approval."
+    },
+    "predecessorHandoffId": {
+      "type": "string",
+      "pattern": "^HND-[0-9]{3}$",
+      "description": "Added in 1.2.0. The handoff this one responds to, stated explicitly instead of being inferred from ref order or from timestamp rounding. Absent only on the first handoff of a chain."
+    },
+    "reassessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Added in 1.2.0. Declares that this handoff is a bounded repeat assessment by a role that has already reported once in this chain. Without it, a repeated role cannot be distinguished from a broken or duplicated chain.",
+      "required": ["iteration", "triggeredByHandoffId", "basis"],
+      "properties": {
+        "iteration": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "Count of assessments by this role in the chain, counting this one."
+        },
+        "triggeredByHandoffId": {
+          "type": "string",
+          "pattern": "^HND-[0-9]{3}$",
+          "description": "Earlier handoff whose findings made this reassessment necessary."
+        },
+        "basis": {
+          "type": "string",
+          "minLength": 20,
+          "description": "What new evidence the reassessment rests on. Re-running the same checks on the same revision is not a new basis."
+        }
+      }
     },
     "workPerformed": {
       "type": "array",
@@ -273,6 +301,30 @@
   },
   "allOf": [
     {
+      "description": "1.2.0 vocabulary is additive: a 1.1.0 record may not use the new predecessor, reassessment, or execution-state vocabulary, so that a version number keeps meaning what it says. Forbidding executionState here is what preserves the 1.1.0 rule that an observed validation carries a captured exitCode: without the gate, a 1.1.0 record could take the 1.2.0 escape hatch and omit exitCode, silently weakening the version it declares.",
+      "if": {
+        "properties": {
+          "contractVersion": {
+            "const": "1.1.0"
+          }
+        },
+        "required": ["contractVersion"]
+      },
+      "then": {
+        "properties": {
+          "predecessorHandoffId": false,
+          "reassessment": false,
+          "validation": {
+            "items": {
+              "properties": {
+                "executionState": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "description": "Reviewer outcome consistency: a review that requires rework must leave the task in changes-requested and return it to the Builder.",
       "if": {
         "properties": {
@@ -409,9 +461,12 @@
       }
     },
     {
-      "description": "Reviewer outcome consistency: a blocked review keeps the task blocked and requires an open blocking human decision.",
+      "description": "Reviewer outcome consistency (1.1.0 only): a blocked review keeps the task blocked and requires an open blocking human decision. In 1.2.0 this rule was replaced because it made an agent-initiated block unwritable for every role except the reviewer, and forced every block to be escalated past the agent that found it.",
       "if": {
         "properties": {
+          "contractVersion": {
+            "const": "1.1.0"
+          },
           "sourceAgent": {
             "const": "reviewer"
           },
@@ -454,6 +509,98 @@
               "required": ["state", "blocking"]
             }
           }
+        }
+      }
+    },
+    {
+      "description": "Blocked outcome consistency (1.2.0): any role may report a block. A block leaves the task blocked and is never routed to the builder, because a block states that a decision is missing rather than that the implementation is wrong. A block that stays with the agents must declare a reassessment, and must cite either an open blocking finding or a pending blocking human decision.",
+      "if": {
+        "properties": {
+          "contractVersion": {
+            "const": "1.2.0"
+          },
+          "recommendation": {
+            "properties": {
+              "verdict": {
+                "const": "blocked"
+              }
+            },
+            "required": ["verdict"]
+          }
+        },
+        "required": ["contractVersion", "recommendation"]
+      },
+      "then": {
+        "properties": {
+          "taskStatusAfter": {
+            "const": "blocked"
+          },
+          "nextAction": {
+            "properties": {
+              "agent": {
+                "enum": ["human", "qa", "reviewer"]
+              },
+              "stage": {
+                "enum": ["review", "validation"]
+              }
+            }
+          }
+        },
+        "anyOf": [
+          {
+            "required": ["humanDecisionsRequired"],
+            "properties": {
+              "humanDecisionsRequired": {
+                "contains": {
+                  "properties": {
+                    "state": {
+                      "const": "pending"
+                    },
+                    "blocking": {
+                      "const": true
+                    }
+                  },
+                  "required": ["state", "blocking"]
+                }
+              }
+            }
+          },
+          {
+            "required": ["findings"],
+            "properties": {
+              "findings": {
+                "contains": {
+                  "properties": {
+                    "blocking": {
+                      "const": true
+                    },
+                    "status": {
+                      "const": "open"
+                    }
+                  },
+                  "required": ["blocking", "status"]
+                }
+              }
+            }
+          }
+        ],
+        "if": {
+          "properties": {
+            "nextAction": {
+              "properties": {
+                "agent": {
+                  "not": {
+                    "const": "human"
+                  }
+                }
+              },
+              "required": ["agent"]
+            }
+          },
+          "required": ["nextAction"]
+        },
+        "then": {
+          "required": ["reassessment"]
         }
       }
     }
@@ -499,8 +646,8 @@
     "repoFilePath": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]+$",
-      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected."
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/\\[\\]-]+$",
+      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected. Square brackets are allowed so that Next.js route segments such as frontend/app/projects/[projectId]/page.tsx can be named."
     },
     "evidenceRecord": {
       "type": "object",
@@ -527,6 +674,10 @@
         "kind": {
           "enum": ["observed", "asserted", "blocked", "not-run", "skipped"],
           "description": "How the result was obtained. observed requires captured execution facts. asserted is an agent belief without captured execution. blocked/not-run/skipped carry no execution metadata."
+        },
+        "executionState": {
+          "enum": ["exited", "timed-out", "launch-failed", "exit-not-captured"],
+          "description": "Added in 1.2.0. What the process itself did, kept distinct from both the semantic outcome and the exit code. exited requires exitCode. exit-not-captured records that execution was attempted and output retained, but no exit status was captured; it never implies exit code 0."
         },
         "outcome": {
           "enum": ["passed", "failed", "inconclusive", "blocked", "not-executed"],
@@ -581,11 +732,56 @@
             "required": ["kind"]
           },
           "then": {
-            "required": ["command", "exitCode", "executedAt", "executor", "evidenceRef"],
+            "required": ["command", "executedAt", "executor", "evidenceRef"],
             "properties": {
               "outcome": {
                 "enum": ["passed", "failed", "inconclusive"]
               }
+            },
+            "anyOf": [
+              {
+                "description": "The process exited and its status was captured.",
+                "required": ["exitCode"]
+              },
+              {
+                "description": "Execution was attempted but did not produce a captured exit status. Added in 1.2.0; before that, such a check could only be recorded as asserted, which overstated the absence of execution.",
+                "required": ["executionState"],
+                "properties": {
+                  "executionState": {
+                    "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "executionState": {
+                "const": "exited"
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "required": ["exitCode"]
+          }
+        },
+        {
+          "description": "A process that timed out, failed to launch, or whose status was not captured has no exit code, so none may be recorded.",
+          "if": {
+            "properties": {
+              "executionState": {
+                "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": false,
+              "expectedExitCode": false
             }
           }
         },
@@ -606,6 +802,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false
@@ -629,6 +826,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false
@@ -652,6 +850,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false

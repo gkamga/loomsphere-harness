@@ -1,0 +1,121 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-103",
+  "predecessorHandoffId": "HND-102",
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "qa",
+  "destinationAgent": "reviewer",
+  "taskStatusAfter": "in-review",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "test",
+      "description": "Re-ran the read-only factory validation command and compared the reported checks with both acceptance criteria."
+    },
+    {
+      "id": "W-02",
+      "kind": "review",
+      "description": "Classified each acceptance criterion and recorded the check whose exit status could not be captured."
+    }
+  ],
+  "filesReviewed": [
+    ".github/contracts/README.md",
+    "handoff-02-builder.json",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-contract-validation", "playwright-output-retained"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "partially-addressed",
+      "evidenceCheckRefs": ["documented-transition-review"]
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-25T02:11:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Independent local terminal transcript for this synthetic example session, 2026-10-25",
+      "summary": "Independent re-run reproduced the same zero-error result."
+    },
+    {
+      "checkId": "playwright-output-retained",
+      "category": "playwright",
+      "kind": "observed",
+      "command": "npx playwright test",
+      "executionState": "exit-not-captured",
+      "outcome": "inconclusive",
+      "outcomeRationale": "The suite executed and its output was retained, but the launch wrapper did not propagate an exit status. An uncaptured exit status is never read as a success.",
+      "executedAt": "2026-10-25T02:12:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Retained console output for this synthetic example session, 2026-10-25",
+      "summary": "Executed with output retained and no exit status captured."
+    },
+    {
+      "checkId": "backend-safe-tests",
+      "category": "pytest",
+      "kind": "not-run",
+      "outcome": "not-executed",
+      "summary": "Not executed by QA: the task changes documentation only and does not alter backend behavior or tests."
+    },
+    {
+      "checkId": "playwright-e2e",
+      "category": "playwright",
+      "kind": "blocked",
+      "outcome": "blocked",
+      "summary": "Blocked: end-to-end validation requires a verified disposable database, and isolation was not confirmed for this session."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "low",
+      "description": "AC-02 has no automated check asserting that the documented transition list matches the enforced set.",
+      "status": "open",
+      "blocking": false
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Does the documented transition set need an automated comparison check before this phase closes?",
+      "state": "pending",
+      "reference": null,
+      "blocking": false
+    }
+  ],
+  "recommendation": {
+    "verdict": "accept-with-findings",
+    "rationale": "The observed validation evidence is reproducible and no blocking defect was found; one low-severity finding remains open.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "reviewer",
+    "stage": "review",
+    "rationale": "Review should confirm that the documentation matches the schemas and the enforced transition set."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:13:00Z",
+    "producedBy": "qa",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002 that records execution whose output was retained while its exit status was not captured, and keeps that state distinct from both passed and failed."
+}

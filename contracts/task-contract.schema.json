@@ -32,8 +32,8 @@
   ],
   "properties": {
     "contractVersion": {
-      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md.",
-      "const": "1.1.0"
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0 and 1.2.0 are both accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
+      "enum": ["1.1.0", "1.2.0"]
     },
     "taskId": {
       "type": "string",
@@ -144,12 +144,14 @@
             "minLength": 10
           },
           "verification": {
+            "description": "cross-document-validation was added in 1.2.0 because a criterion can require agreement between records (task status, handoff chronology, approval state) which no single-record check can establish.",
             "enum": [
               "pytest",
               "playwright",
               "lint",
               "build",
               "static-validation",
+              "cross-document-validation",
               "manual-review",
               "documentation-review"
             ]
@@ -371,6 +373,32 @@
   },
   "allOf": [
     {
+      "description": "1.2.0 vocabulary is additive: a 1.1.0 task may not use the execution-state vocabulary introduced for handoff validation records. Forbidding executionState here is what preserves the 1.1.0 rule that an observed validation carries a captured exitCode, because the shared evidenceRecord definition cannot read the parent record's contractVersion on its own.",
+      "if": {
+        "properties": {
+          "contractVersion": {
+            "const": "1.1.0"
+          }
+        },
+        "required": ["contractVersion"]
+      },
+      "then": {
+        "properties": {
+          "executionEvidence": {
+            "properties": {
+              "validations": {
+                "items": {
+                  "properties": {
+                    "executionState": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "description": "Final approval is a human action. A complete task must record it; every other status must leave it unrecorded.",
       "if": {
         "properties": {
@@ -499,14 +527,14 @@
     "repoPathScope": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._*?/-]+$",
-      "description": "Repository-relative path or glob. Absolute paths and parent traversal are rejected."
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._*?/\\[\\]-]+$",
+      "description": "Repository-relative path or glob. Absolute paths and parent traversal are rejected. Square brackets are allowed so that Next.js route segments such as frontend/app/projects/[projectId]/page.tsx can be named; they are literal characters, not glob syntax."
     },
     "repoFilePath": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/-]+$",
-      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected."
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/\\[\\]-]+$",
+      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected. Square brackets are allowed so that Next.js route segments such as frontend/app/projects/[projectId]/page.tsx can be named."
     },
     "evidenceRecord": {
       "type": "object",
@@ -533,6 +561,10 @@
         "kind": {
           "enum": ["observed", "asserted", "blocked", "not-run", "skipped"],
           "description": "How the result was obtained. observed requires captured execution facts. asserted is an agent belief without captured execution. blocked/not-run/skipped carry no execution metadata."
+        },
+        "executionState": {
+          "enum": ["exited", "timed-out", "launch-failed", "exit-not-captured"],
+          "description": "Added in 1.2.0. What the process itself did, kept distinct from both the semantic outcome and the exit code. exited requires exitCode. exit-not-captured records that execution was attempted and output retained, but no exit status was captured; it never implies exit code 0."
         },
         "outcome": {
           "enum": ["passed", "failed", "inconclusive", "blocked", "not-executed"],
@@ -587,11 +619,56 @@
             "required": ["kind"]
           },
           "then": {
-            "required": ["command", "exitCode", "executedAt", "executor", "evidenceRef"],
+            "required": ["command", "executedAt", "executor", "evidenceRef"],
             "properties": {
               "outcome": {
                 "enum": ["passed", "failed", "inconclusive"]
               }
+            },
+            "anyOf": [
+              {
+                "description": "The process exited and its status was captured.",
+                "required": ["exitCode"]
+              },
+              {
+                "description": "Execution was attempted but did not produce a captured exit status. Added in 1.2.0; before that, such a check could only be recorded as asserted, which overstated the absence of execution.",
+                "required": ["executionState"],
+                "properties": {
+                  "executionState": {
+                    "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "executionState": {
+                "const": "exited"
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "required": ["exitCode"]
+          }
+        },
+        {
+          "description": "A process that timed out, failed to launch, or whose status was not captured has no exit code, so none may be recorded.",
+          "if": {
+            "properties": {
+              "executionState": {
+                "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": false,
+              "expectedExitCode": false
             }
           }
         },
@@ -612,6 +689,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false
@@ -635,6 +713,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false
@@ -658,6 +737,7 @@
               "command": false,
               "exitCode": false,
               "expectedExitCode": false,
+              "executionState": false,
               "executedAt": false,
               "executor": false,
               "evidenceRef": false

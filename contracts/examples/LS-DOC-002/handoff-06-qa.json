@@ -1,0 +1,106 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-106",
+  "predecessorHandoffId": "HND-105",
+  "reassessment": {
+    "iteration": 2,
+    "triggeredByHandoffId": "HND-105",
+    "basis": "QA re-ran the validator with the additional record-set flag and captured the resulting exit code, so its second report rests on observed runtime evidence that its first report did not have."
+  },
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "qa",
+  "destinationAgent": "human",
+  "taskStatusAfter": "blocked",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "test",
+      "description": "Re-ran the validator for both record sets and captured the exit code, then compared the documented transition list with the enforced set."
+    },
+    {
+      "id": "W-02",
+      "kind": "review",
+      "description": "Recorded that the comparison resolves AC-02 only for the documented subset, leaving the human decision about the remainder open."
+    }
+  ],
+  "filesReviewed": [
+    "handoff-05-reviewer.json",
+    ".github/contracts/README.md",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-record-set-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "partially-addressed",
+      "evidenceCheckRefs": ["factory-record-set-validation"]
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-record-set-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --records .github/contracts/examples/LS-DOC-002",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-25T02:19:00Z",
+      "executor": "LoomSphere QA (agent session)",
+      "evidenceRef": "Local terminal transcript for this synthetic example session, 2026-10-25",
+      "summary": "Both scan roots were reported and the validator exited zero, which is evidence about those roots only."
+    },
+    {
+      "checkId": "backend-safe-tests",
+      "category": "pytest",
+      "kind": "not-run",
+      "outcome": "not-executed",
+      "summary": "Not executed by QA: the task changes documentation only and does not alter backend behavior or tests."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "medium",
+      "description": "The comparison covers only the transitions the documentation lists, so an undocumented transition would not be detected.",
+      "status": "open",
+      "blocking": false
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Is the documented subset sufficient for this phase, or must the full enforced set be documented before approval?",
+      "state": "pending",
+      "reference": null,
+      "blocking": true
+    }
+  ],
+  "recommendation": {
+    "verdict": "blocked",
+    "rationale": "QA cannot close the remaining question because it is a scope decision, and the task must not advance to final approval without it.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "human",
+    "stage": "review",
+    "rationale": "The remaining question is a scope decision, so the chain ends with the human and the task stays blocked until it is answered."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:20:00Z",
+    "producedBy": "qa",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002 that ends a six-handoff chain at the human with the task still blocked and with no final approval recorded."
+}

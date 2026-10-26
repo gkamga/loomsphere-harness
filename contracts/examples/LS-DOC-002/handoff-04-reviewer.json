@@ -1,0 +1,102 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-104",
+  "predecessorHandoffId": "HND-103",
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "reviewer",
+  "destinationAgent": "human",
+  "taskStatusAfter": "blocked",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "review",
+      "description": "Reviewed the documentation diff against both contract schemas and the enforced transition set."
+    },
+    {
+      "id": "W-02",
+      "kind": "review",
+      "description": "Compared the recorded evidence set with the checks that were actually executed and found one criterion resting on an uncaptured exit status."
+    }
+  ],
+  "filesReviewed": [
+    ".github/contracts/README.md",
+    "handoff-03-qa.json",
+    ".github/contracts/handoff-contract.schema.json",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "partially-addressed",
+      "evidenceCheckRefs": ["factory-contract-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "not-addressed",
+      "evidenceCheckRefs": []
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-25T02:16:00Z",
+      "executor": "LoomSphere Reviewer (agent session)",
+      "evidenceRef": "Independent local terminal transcript for this synthetic example session, 2026-10-25",
+      "summary": "Schema validation passed, which is a precondition for review and not a substitute for it."
+    },
+    {
+      "checkId": "transition-set-comparison",
+      "category": "other",
+      "kind": "blocked",
+      "outcome": "blocked",
+      "summary": "Blocked: the comparison needs the enforced transition set to be exposed as data, and it is currently a literal inside the validator."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "high",
+      "description": "AC-02 has no observable evidence: the documentation lists transitions but nothing verifies the correspondence.",
+      "status": "open",
+      "blocking": true
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Should AC-02 be withdrawn, or must the transition set be exposed as data so it can be compared?",
+      "state": "pending",
+      "reference": null,
+      "blocking": true
+    }
+  ],
+  "recommendation": {
+    "verdict": "blocked",
+    "rationale": "The review cannot conclude because one acceptance criterion has no verifiable evidence and no test artifact exists for it.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "human",
+    "stage": "review",
+    "rationale": "The scope of AC-02 is a human decision, so the block is escalated rather than resolved by an agent."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:17:00Z",
+    "producedBy": "reviewer",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002 that blocks a task without claiming completion, and preserves the distinction between a schema-valid document and a review that concluded."
+}
