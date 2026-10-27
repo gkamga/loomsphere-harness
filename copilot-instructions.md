@@ -3,7 +3,7 @@
 ## Project architecture
 
 - LoomSphere is an AI software factory in development. The current application is a foundation, not the completed factory; see [the project README](../README.md).
-- Backend: FastAPI, SQLAlchemy, Alembic, PostgreSQL, and Redis. Keep API, service, database, and schema responsibilities aligned with the existing backend structure.
+- Backend: FastAPI, SQLAlchemy, Alembic, and PostgreSQL. Keep API, service, database, and schema responsibilities aligned with the existing backend structure.
 - Frontend: Next.js, React, TypeScript, and Tailwind CSS. Follow existing application patterns and consult [frontend/AGENTS.md](../frontend/AGENTS.md) for Next.js-specific guidance; do not duplicate or override it here.
 - Use TypeScript for frontend changes. Use `uv` and `pyproject.toml` for Python dependencies and tooling. Follow existing Docker and Docker Compose conventions when container changes are approved.
 
