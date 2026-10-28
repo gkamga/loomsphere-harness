@@ -241,10 +241,11 @@ jobs:
       # specs self-skip without. Only the agent runtime is a test double: the
       # queue, git worktrees, review gates, delivery provider (simulated, never
       # network-reachable), and the sandboxed validation command all really run.
+      # AGENT_REPOSITORY_ROOT and AGENT_WORKSPACE_ROOT are set on the Playwright
+      # step instead, because the `runner` context is unavailable in job-level
+      # env.
       AGENT_RUN_INLINE: 'true'
       AGENT_RUNNER_MODE: scripted
-      AGENT_REPOSITORY_ROOT: ${{ runner.temp }}/loomsphere-e2e-repo
-      AGENT_WORKSPACE_ROOT: ${{ runner.temp }}/loomsphere-e2e-workspaces
       GITHUB_MODE: simulated
       GITHUB_REPOSITORY: acme/widgets
       PGHOST: 127.0.0.1
@@ -315,6 +316,9 @@ jobs:
           esac
           echo "Sandbox image: ${image_id}"
       - name: Run Playwright validation
+        env:
+          AGENT_REPOSITORY_ROOT: ${{ runner.temp }}/loomsphere-e2e-repo
+          AGENT_WORKSPACE_ROOT: ${{ runner.temp }}/loomsphere-e2e-workspaces
         run: bash scripts/validate.sh --e2e
       - name: Upload Playwright failure artifacts
         if: failure()
