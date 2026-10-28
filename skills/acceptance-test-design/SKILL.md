@@ -18,7 +18,7 @@ The design work is advisory. `backend/app/services/scope_approvals.py` freezes t
 3. Decide whether the criterion is `mandatory`. Mandatory means a delivery without recorded evidence for it must fail, so at least one criterion must be mandatory.
 4. Choose the evidence route:
    - `pytest` with a bounded relative selector such as `tests/test_module.py::test_case` when application code can execute the check itself.
-   - `unverified` when no machine check exists. That is honest and still enforceable: the criterion then depends on agent reports and stays `unverified` until they exist; it never silently passes.
+   - `unverified` when no machine check exists. This records a limitation; it is not evidence. Builder, QA, and Reviewer claims cannot satisfy it, and a mandatory unverified criterion blocks readiness. The current application has no explicit human-verification or waiver route.
 5. Prefer a selector that exists, or that the approved scope is expected to add. A declared selector that does not exist will fail, and a failing check blocks delivery.
 6. Keep wording stable. Identifiers are positional (`AC-1`, `AC-2`, ...), and the contract digest covers the wording, so re-approval produces a new version rather than a silent edit.
 7. Remove criteria that cannot be observed, and say so explicitly rather than leaving them implied.
@@ -28,7 +28,7 @@ The design work is advisory. `backend/app/services/scope_approvals.py` freezes t
 - every criterion is optional
 - two criteria describe the same requirement in different words
 - a criterion depends on "all tests pass" with no identifiable test
-- the verification route is a human assertion that no reported evidence will ever record
+- the verification route is an agent or human assertion without an attributable record
 - the criteria contradict an accepted ADR
 
 ## Output
