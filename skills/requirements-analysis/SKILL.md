@@ -15,12 +15,20 @@ Use this skill when a task needs requirement decomposition, missing-criteria che
 4. Distinguish clear requirements from incomplete or contradictory language.
 5. Produce a concise requirement-to-implementation map with open questions.
 6. Flag any requirement that needs human clarification before engineering can proceed safely.
+7. Shape each criterion so it can survive approval: one observable outcome, an explicit `mandatory` flag, and a verification route. Use the [acceptance-test-design](../acceptance-test-design/SKILL.md) skill for the mapping itself.
+
+## Criteria that survive approval
+
+- Application code assigns criterion identifiers (`AC-1`, `AC-2`, ...) positionally at approval time, so ordering matters and agents must not invent identifiers.
+- Wording is part of the frozen contract digest. Repeat it verbatim in later reports; a paraphrase is treated as a different requirement.
+- A criterion must be checkable by someone who did not write it. "The behavior is correct" is not a criterion.
+- Do not fold several requirements into one criterion to keep the list short. Approval will refuse criteria that normalize to the same wording.
 
 ## Output
 
 - objective and scope
 - required behavior
-- derived acceptance criteria
+- acceptance criteria mapping with mandatory flags and verification routes
 - dependencies and assumptions
 - ambiguities or blocked questions
 - implementation references
