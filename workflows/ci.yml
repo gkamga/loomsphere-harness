@@ -118,6 +118,33 @@ jobs:
             exit 1
           fi
           echo "LOOMSPHERE_DB_ISOLATION_VERIFIED=1" >> "$GITHUB_ENV"
+      # Both standard validation and acceptance-criterion checks run
+      # Builder-controlled code inside this image, so the loop cannot produce a
+      # human-approval candidate without it. The executor fails closed: a missing
+      # image is recorded as `sandbox-image-unavailable` and nothing runs on the
+      # host. Building the image here is the provisioning step, not a relaxation
+      # of that boundary.
+      - name: Build the sandbox execution image
+        run: docker build --tag loomsphere-sandbox:latest docker/sandbox
+      - name: Verify Docker and the sandbox image
+        run: |
+          set -euo pipefail
+          docker version
+          image_id="$(docker image inspect --format '{{.Id}}' loomsphere-sandbox:latest)"
+          case "${image_id}" in
+            sha256:*) ;;
+            *)
+              echo "The sandbox image is not inspectable by pinned image ID." >&2
+              exit 1
+              ;;
+          esac
+          echo "Sandbox image: ${image_id}"
+      # Proves the worker can execute through the real boundary (unprivileged
+      # UID, read-only workspace, no network, no Docker socket) and that a
+      # missing image still blocks instead of falling back to the host.
+      - name: Smoke-test the sandbox execution boundary
+        working-directory: backend
+        run: uv run pytest tests/test_sandbox.py -q
       - name: Run database integration validation
         run: bash scripts/validate.sh --db
 
@@ -210,6 +237,16 @@ jobs:
       PLAYWRIGHT_API_PORT: '8000'
       PLAYWRIGHT_WEB_PORT: '3000'
       NEXT_TELEMETRY_DISABLED: '1'
+      # Enable the scripted-runner fixtures the architect, loop, and delivery
+      # specs self-skip without. Only the agent runtime is a test double: the
+      # queue, git worktrees, review gates, delivery provider (simulated, never
+      # network-reachable), and the sandboxed validation command all really run.
+      AGENT_RUN_INLINE: 'true'
+      AGENT_RUNNER_MODE: scripted
+      AGENT_REPOSITORY_ROOT: ${{ runner.temp }}/loomsphere-e2e-repo
+      AGENT_WORKSPACE_ROOT: ${{ runner.temp }}/loomsphere-e2e-workspaces
+      GITHUB_MODE: simulated
+      GITHUB_REPOSITORY: acme/widgets
       PGHOST: 127.0.0.1
       PGPORT: '5432'
       PGUSER: loomsphere_ci
@@ -259,6 +296,24 @@ jobs:
             exit 1
           fi
           echo "LOOMSPHERE_DB_ISOLATION_VERIFIED=1" >> "$GITHUB_ENV"
+      # The inline scripted-runner specs execute the loop's validation command
+      # inside the sandbox, so this job needs the same provisioned image as the
+      # backend integration job.
+      - name: Build the sandbox execution image
+        run: docker build --tag loomsphere-sandbox:latest docker/sandbox
+      - name: Verify Docker and the sandbox image
+        run: |
+          set -euo pipefail
+          docker version
+          image_id="$(docker image inspect --format '{{.Id}}' loomsphere-sandbox:latest)"
+          case "${image_id}" in
+            sha256:*) ;;
+            *)
+              echo "The sandbox image is not inspectable by pinned image ID." >&2
+              exit 1
+              ;;
+          esac
+          echo "Sandbox image: ${image_id}"
       - name: Run Playwright validation
         run: bash scripts/validate.sh --e2e
       - name: Upload Playwright failure artifacts
