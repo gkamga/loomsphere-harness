@@ -31,8 +31,8 @@
   ],
   "properties": {
     "contractVersion": {
-      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0 and 1.2.0 are both accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
-      "enum": ["1.1.0", "1.2.0"]
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0, 1.2.0, and 1.3.0 are all accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
+      "enum": ["1.1.0", "1.2.0", "1.3.0"]
     },
     "handoffId": {
       "type": "string",
@@ -513,11 +513,11 @@
       }
     },
     {
-      "description": "Blocked outcome consistency (1.2.0): any role may report a block. A block leaves the task blocked and is never routed to the builder, because a block states that a decision is missing rather than that the implementation is wrong. A block that stays with the agents must declare a reassessment, and must cite either an open blocking finding or a pending blocking human decision.",
+      "description": "Blocked outcome consistency (1.2.0 and later): any role may report a block. A block leaves the task blocked and is never routed to the builder, because a block states that a decision is missing rather than that the implementation is wrong. A block that stays with the agents must declare a reassessment, and must cite either an open blocking finding or a pending blocking human decision.",
       "if": {
         "properties": {
           "contractVersion": {
-            "const": "1.2.0"
+            "enum": ["1.2.0", "1.3.0"]
           },
           "recommendation": {
             "properties": {
@@ -607,10 +607,10 @@
   ],
   "$defs": {
     "agentRole": {
-      "enum": ["architect", "builder", "qa", "reviewer"]
+      "enum": ["architect", "builder", "qa", "reviewer", "security-reviewer"]
     },
     "agentOrHuman": {
-      "enum": ["architect", "builder", "qa", "reviewer", "human"]
+      "enum": ["architect", "builder", "qa", "reviewer", "security-reviewer", "human"]
     },
     "taskStatus": {
       "description": "Shared task-status vocabulary. Unknown values are schema violations and are never treated as success.",

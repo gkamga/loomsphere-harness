@@ -32,8 +32,8 @@
   ],
   "properties": {
     "contractVersion": {
-      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0 and 1.2.0 are both accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
-      "enum": ["1.1.0", "1.2.0"]
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0, 1.2.0, and 1.3.0 are all accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
+      "enum": ["1.1.0", "1.2.0", "1.3.0"]
     },
     "taskId": {
       "type": "string",
@@ -488,10 +488,10 @@
   ],
   "$defs": {
     "agentRole": {
-      "enum": ["architect", "builder", "qa", "reviewer"]
+      "enum": ["architect", "builder", "qa", "reviewer", "security-reviewer"]
     },
     "agentOrHuman": {
-      "enum": ["architect", "builder", "qa", "reviewer", "human"]
+      "enum": ["architect", "builder", "qa", "reviewer", "security-reviewer", "human"]
     },
     "taskStatus": {
       "description": "Shared task-status vocabulary. Unknown values are schema violations and are never treated as success.",

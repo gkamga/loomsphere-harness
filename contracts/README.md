@@ -21,9 +21,9 @@ before producing either record.
 | `examples/_fixtures/` | Deliberately invalid documents used to prove that validation fails; parsed as JSON only and exempt from every other check |
 
 Both contract schemas use JSON Schema 2020-12. Both accept `contractVersion`
-`1.1.0` and `1.2.0`, and share one task-status vocabulary, one lifecycle-stage
-vocabulary, and one evidence model. The validator rejects drift between the
-shared definitions.
+`1.1.0`, `1.2.0`, and `1.3.0`, and share one task-status vocabulary, one
+lifecycle-stage vocabulary, and one evidence model. The validator rejects drift
+between the shared definitions.
 
 The third schema, [`execution-evidence.schema.json`](execution-evidence.schema.json),
 is deliberately *not* a contract: it has its own artifact version, it is not part
@@ -36,7 +36,7 @@ for the trust boundary and the mapping into `evidenceRecord`.
 ## Contract versioning
 
 `contractVersion` names one contract version. The schema publishes which versions
-are still readable — currently `1.1.0` and `1.2.0` — and every artifact must
+are still readable — currently `1.1.0`, `1.2.0`, and `1.3.0` — and every artifact must
 declare exactly one of them. A range, a minimum, or an "or later" value is not
 valid, because a record has to say which rules it was authored under. Any
 incompatible change requires a new version string, a migration note in this file,
@@ -95,6 +95,29 @@ repeat assessments, ends blocked without approval, and keeps a captured output
 with no exit status from implying success. The two examples are validated as
 separate record sets, so the mixed-version and reused-identifier cases that a
 single tree would produce never arise.
+
+### Migrating 1.2.0 → 1.3.0
+
+`1.3.0` is additive and adds one role: the routed **security reviewer**, a
+specialist reviewer that the factory selects from the approved scope, the risk
+classification, and the recorded change set. It never replaces the reviewer; a
+change that requires it needs both conclusions.
+
+| Change | Kind | Action required |
+| --- | --- | --- |
+| `contractVersion` accepts `1.3.0` | additive | None. Declare the version the record was authored against |
+| `agentRole` / `agentOrHuman` accept `security-reviewer` | additive | Use it only on a `1.3.0` record. A `1.2.0` record that names it fails its own version's transition rules |
+| `qa → security-reviewer` became a permitted transition | relaxation | Needed so QA can hand evidence to a routed specialist |
+| `security-reviewer → reviewer` became a permitted transition | relaxation | An approving specialist hands off to the final review |
+| `security-reviewer → builder` became a permitted transition | relaxation | A specialist that requires changes returns the work, like the reviewer |
+| `security-reviewer → human` became a permitted transition | relaxation | A specialist that blocks escalates; it cannot approve or close |
+| `reviewer → security-reviewer` became a permitted transition | relaxation | The final reviewer may request specialist re-verification |
+| The blocked-outcome consistency rule applies to `1.3.0` as well | guard | Unchanged behaviour. `1.3.0` inherits the `1.2.0` structural rule rather than dodging it |
+
+Nothing was removed and no `1.1.0` or `1.2.0` rule changed. `1.2.0` remains a
+valid version for new records; `1.3.0` is the version that can express a chain
+through a specialist reviewer. The bundled examples remain at their original
+versions, which is what keeps them meaningful as regression baselines.
 
 `executionState` is the one additive field that would *weaken* a `1.1.0` record,
 because it is the escape hatch that lets an `observed` entry omit `exitCode`. It
