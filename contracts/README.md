@@ -16,6 +16,7 @@ before producing either record.
 | [`task-contract.schema.json`](task-contract.schema.json) | Approved scope, boundaries, approvals, evidence, risks, and next action for one task |
 | [`handoff-contract.schema.json`](handoff-contract.schema.json) | What one agent did, what it observed, what remains, and who acts next |
 | [`execution-evidence.schema.json`](execution-evidence.schema.json) | Observed process evidence emitted by `scripts/factory_execute.py` for one allowlisted validation check; an input to contract evidence, not a contract |
+| [`agent-catalog.schema.json`](agent-catalog.schema.json) | One review specialist the trusted agent catalog declares: identity, stage and role, authorized tools and skills, selection rules, path/text signals, prompt profile. Read by `scripts/validate_factory.py` and by the runtime loader |
 | [`examples/LS-DOC-001/`](examples/LS-DOC-001/) | Complete Architect → Builder → QA → Reviewer example for a documentation-only task, at `1.1.0` |
 | [`examples/LS-DOC-002/`](examples/LS-DOC-002/) | Six-handoff example at `1.2.0` that exercises a human scope gate, a `reviewer → qa` return, a repeat assessment, and a chain that ends blocked without approval |
 | `examples/_fixtures/` | Deliberately invalid documents used to prove that validation fails; parsed as JSON only and exempt from every other check |
@@ -24,6 +25,12 @@ Both contract schemas use JSON Schema 2020-12. Both accept `contractVersion`
 `1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0`, and share one task-status vocabulary, one
 lifecycle-stage vocabulary, and one evidence model. The validator rejects drift
 between the shared definitions.
+
+The agent catalog schema describes configuration rather than a task record: it
+constrains one specialist declaration and nothing about who may approve what. The
+runtime loader (`backend/app/services/agent_catalog.py`) enforces the same contract
+independently and fails closed, so a deployment cannot start with a catalog the
+validator would reject.
 
 The third schema, [`execution-evidence.schema.json`](execution-evidence.schema.json),
 is deliberately *not* a contract: it has its own artifact version, it is not part
