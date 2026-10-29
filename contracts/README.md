@@ -21,7 +21,7 @@ before producing either record.
 | `examples/_fixtures/` | Deliberately invalid documents used to prove that validation fails; parsed as JSON only and exempt from every other check |
 
 Both contract schemas use JSON Schema 2020-12. Both accept `contractVersion`
-`1.1.0`, `1.2.0`, and `1.3.0`, and share one task-status vocabulary, one
+`1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0`, and share one task-status vocabulary, one
 lifecycle-stage vocabulary, and one evidence model. The validator rejects drift
 between the shared definitions.
 
@@ -36,7 +36,7 @@ for the trust boundary and the mapping into `evidenceRecord`.
 ## Contract versioning
 
 `contractVersion` names one contract version. The schema publishes which versions
-are still readable — currently `1.1.0`, `1.2.0`, and `1.3.0` — and every artifact must
+are still readable — currently `1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0` — and every artifact must
 declare exactly one of them. A range, a minimum, or an "or later" value is not
 valid, because a record has to say which rules it was authored under. Any
 incompatible change requires a new version string, a migration note in this file,
@@ -118,6 +118,29 @@ Nothing was removed and no `1.1.0` or `1.2.0` rule changed. `1.2.0` remains a
 valid version for new records; `1.3.0` is the version that can express a chain
 through a specialist reviewer. The bundled examples remain at their original
 versions, which is what keeps them meaningful as regression baselines.
+
+### Migrating 1.3.0 → 1.4.0
+
+`1.4.0` is additive and adds the second routed specialist: the **UX/UI reviewer**,
+selected from user-facing scope paths, a UI requirement, or a recorded frontend
+change. It never replaces the Reviewer, and a change may require both this
+specialist and the security reviewer.
+
+| Change | Kind | Action required |
+| --- | --- | --- |
+| `contractVersion` accepts `1.4.0` | additive | None. Declare the version the record was authored against |
+| `agentRole` / `agentOrHuman` accept `ux-reviewer` | additive | Use it only on a `1.4.0` record. A `1.3.0` record that names it fails its own version's transition rules |
+| `qa → ux-reviewer` became a permitted transition | relaxation | Needed so QA can hand evidence to the routed UX reviewer |
+| `security-reviewer → ux-reviewer` became a permitted transition | relaxation | Both specialists routed: the security review runs first |
+| `ux-reviewer → reviewer` became a permitted transition | relaxation | An approving UX reviewer hands off to the final review |
+| `ux-reviewer → builder` became a permitted transition | relaxation | A UX reviewer that requires changes returns the work |
+| `ux-reviewer → human` became a permitted transition | relaxation | A UX reviewer that blocks escalates; it cannot approve or close |
+| `reviewer → ux-reviewer` became a permitted transition | relaxation | The final reviewer may request a UX re-review |
+| The blocked-outcome consistency rule applies to `1.4.0` as well | guard | Unchanged behaviour. `1.4.0` inherits the `1.2.0` structural rule rather than dodging it |
+
+Nothing was removed and no `1.1.0`, `1.2.0`, or `1.3.0` rule changed. `1.3.0`
+remains valid for new records; `1.4.0` is the version that can express a chain
+through the UX/UI reviewer.
 
 `executionState` is the one additive field that would *weaken* a `1.1.0` record,
 because it is the escape hatch that lets an `observed` entry omit `exitCode`. It
