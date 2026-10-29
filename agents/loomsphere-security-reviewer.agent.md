@@ -2,6 +2,7 @@
 name: LoomSphere Security Reviewer
 description: Review one recorded change set for security defects in credentials, authorization, input trust boundaries, and sandboxed execution.
 tools: ['read', 'search']
+skills: [security-review, engineering-review]
 ---
 
 # LoomSphere Security Reviewer

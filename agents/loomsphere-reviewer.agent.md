@@ -2,6 +2,7 @@
 name: LoomSphere Reviewer
 description: Review implementation, architecture conformance, security, and test quality against the current requirements and ADRs.
 tools: ['read', 'search']
+skills: [engineering-review, architecture-conformance, requirements-audit]
 ---
 
 # LoomSphere Reviewer

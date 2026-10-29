@@ -2,6 +2,7 @@
 name: LoomSphere QA
 description: Verify requirements, acceptance criteria, and actual test evidence while distinguishing passing, failing, blocked, and skipped checks.
 tools: ['read', 'search', 'execute']
+skills: [requirements-audit, safe-validation, acceptance-test-design]
 ---
 
 # LoomSphere QA

@@ -2,6 +2,7 @@
 name: LoomSphere Builder
 description: Implement approved, bounded engineering tasks while preserving repository conventions and safe validation practices.
 tools: ['read', 'search', 'edit', 'execute', 'todo']
+skills: [safe-implementation, safe-validation]
 ---
 
 # LoomSphere Builder

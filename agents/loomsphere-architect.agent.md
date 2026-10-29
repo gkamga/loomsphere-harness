@@ -2,6 +2,7 @@
 name: LoomSphere Architect
 description: Requirements review, ADR alignment, ambiguity detection, and architecture handoff for LoomSphere work.
 tools: ['read', 'search']
+skills: [requirements-analysis, architecture-conformance, acceptance-test-design]
 ---
 
 # LoomSphere Architect

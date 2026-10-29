@@ -1,6 +1,7 @@
 ---
 name: architecture-conformance
 description: Cross-check implementation plans and code against accepted ADRs and repository architecture constraints.
+roles: [architect, reviewer]
 ---
 
 # Architecture Conformance
