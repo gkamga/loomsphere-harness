@@ -20,6 +20,7 @@ The design work is advisory. `backend/app/services/scope_approvals.py` freezes t
 3. Decide whether the criterion is `mandatory`. Mandatory means a delivery without recorded evidence for it must fail, so at least one criterion must be mandatory.
 4. Choose the evidence route:
    - `pytest` with a bounded relative selector such as `tests/test_module.py::test_case` when application code can execute the check itself.
+   - `protected-pytest` with a trusted registry artifact key and test-node selector when the check must be Builder-inaccessible. The artifact is pinned by digest at scope approval and executed from the protected registry, not the implementation checkout.
    - `unverified` when no machine check exists. This records a limitation; it is not evidence. Builder, QA, and Reviewer claims cannot satisfy it, and a mandatory unverified criterion blocks readiness. The current application has no explicit human-verification or waiver route.
 5. Prefer a selector that exists, or that the approved scope is expected to add. A declared selector that does not exist will fail, and a failing check blocks delivery.
 6. Keep wording stable. Identifiers are positional (`AC-1`, `AC-2`, ...), and the contract digest covers the wording, so re-approval produces a new version rather than a silent edit.
