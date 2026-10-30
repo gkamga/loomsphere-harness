@@ -2,6 +2,7 @@
 name: acceptance-test-design
 description: Turn approved acceptance criteria into frozen, identifier-addressed obligations with a verifiable evidence route for each one.
 roles: [architect, qa]
+stages: [architecture, validation]
 ---
 
 # Acceptance Test Design

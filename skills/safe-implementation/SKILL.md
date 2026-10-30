@@ -2,6 +2,7 @@
 name: safe-implementation
 description: Make minimal, approved implementation changes with evidence, test updates, and validation awareness.
 roles: [builder]
+stages: [implementation]
 ---
 
 # Safe Implementation

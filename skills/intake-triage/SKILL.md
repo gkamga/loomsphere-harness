@@ -2,6 +2,7 @@
 name: intake-triage
 description: Triage an engineering request into intent, affected areas, ambiguities, implications, and specialist recommendations without designing the solution.
 roles: [intake]
+stages: [intake]
 ---
 
 # Intake Triage

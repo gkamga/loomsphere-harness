@@ -2,6 +2,7 @@
 name: requirements-audit
 description: Audit recorded agent evidence against every approved acceptance criterion and report omissions, contradictions, and unverifiable claims independently of the agents that produced them.
 roles: [qa, reviewer]
+stages: [validation, review]
 ---
 
 # Requirements Audit

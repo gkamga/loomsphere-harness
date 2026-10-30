@@ -2,6 +2,7 @@
 name: safe-validation
 description: Run the repository's safe validation path, preserve failing exit codes, and block unsafe database checks until isolation is verified.
 roles: [builder, qa]
+stages: [implementation, validation]
 ---
 
 # Safe Validation

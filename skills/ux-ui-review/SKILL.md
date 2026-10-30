@@ -2,6 +2,7 @@
 name: ux-ui-review
 description: Review a recorded change set for user-facing defects in flow, states, accessibility, layout, and interface consistency.
 roles: [ux-reviewer]
+stages: [ux-review]
 ---
 
 # UX/UI Review

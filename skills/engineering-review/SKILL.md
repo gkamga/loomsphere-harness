@@ -2,6 +2,7 @@
 name: engineering-review
 description: Inspect implementation and tests for correctness, ADR conformance, security, and overall engineering quality.
 roles: [reviewer, security-reviewer, ux-reviewer]
+stages: [review, security-review, ux-review]
 ---
 
 # Engineering Review

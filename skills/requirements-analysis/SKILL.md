@@ -2,6 +2,7 @@
 name: requirements-analysis
 description: Analyze PRDs, user stories, and acceptance criteria; extract measurable requirements and surface gaps before implementation.
 roles: [architect, intake]
+stages: [intake, architecture]
 ---
 
 # Requirement Analysis

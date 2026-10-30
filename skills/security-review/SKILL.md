@@ -2,6 +2,7 @@
 name: security-review
 description: Review one recorded change set for security defects in credentials, authorization, trust boundaries, and sandboxed execution.
 roles: [security-reviewer]
+stages: [security-review]
 ---
 
 # Security Review
