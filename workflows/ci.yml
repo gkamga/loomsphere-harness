@@ -156,24 +156,24 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_DB: loomsphere_ci
+          POSTGRES_DB: loomsphere_ci_test
           POSTGRES_USER: loomsphere_ci
           POSTGRES_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U loomsphere_ci -d loomsphere_ci"
+          --health-cmd "pg_isready -U loomsphere_ci -d loomsphere_ci_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql+psycopg://loomsphere_ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/loomsphere_ci
-      TEST_DATABASE_URL: postgresql+psycopg://loomsphere_ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/loomsphere_ci
+      DATABASE_URL: postgresql+psycopg://loomsphere_ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/loomsphere_ci_test
+      TEST_DATABASE_URL: postgresql+psycopg://loomsphere_ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/loomsphere_ci_test
       JWT_SECRET_KEY: ci-only-jwt-secret-key-with-at-least-32-characters
       PGHOST: 127.0.0.1
       PGPORT: '5432'
       PGUSER: loomsphere_ci
-      PGDATABASE: loomsphere_ci
+      PGDATABASE: loomsphere_ci_test
       PGPASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -195,7 +195,7 @@ jobs:
           fi
           identity="$(psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
             --command "SELECT current_database() || '|' || current_user || '|' || inet_server_addr()")"
-          if [[ "$identity" != "loomsphere_ci|loomsphere_ci|"* ]]; then
+          if [[ "$identity" != "loomsphere_ci_test|loomsphere_ci|"* ]]; then
             echo "Connected PostgreSQL identity did not match the job-scoped database." >&2
             exit 1
           fi
