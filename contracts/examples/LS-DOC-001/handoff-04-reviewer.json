@@ -1,0 +1,113 @@
+{
+  "contractVersion": "1.1.0",
+  "handoffId": "HND-004",
+  "taskRef": {
+    "taskId": "LS-DOC-001",
+    "path": ".github/contracts/examples/LS-DOC-001/task.json"
+  },
+  "sourceAgent": "reviewer",
+  "destinationAgent": "human",
+  "taskStatusAfter": "ready-for-human-approval",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "review",
+      "description": "Reviewed the documentation diff, the contract artifacts, and the task boundaries for scope violations."
+    },
+    {
+      "id": "W-02",
+      "kind": "review",
+      "description": "Confirmed that ADR-002 remains untouched and that the prohibited authentication paths were not modified."
+    }
+  ],
+  "filesReviewed": [
+    ".github/contracts/examples/LS-DOC-001/task.json",
+    ".github/contracts/examples/LS-DOC-001/handoff-01-architect.json",
+    ".github/contracts/examples/LS-DOC-001/handoff-02-builder.json",
+    ".github/contracts/examples/LS-DOC-001/handoff-03-qa.json",
+    "docs/workflows/agent-execution-contracts.md",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-contract-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-link-integrity"]
+    },
+    {
+      "criterionRef": "AC-03",
+      "status": "addressed",
+      "evidenceCheckRefs": ["scope-diff-review"]
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:25:00Z",
+      "executor": "LoomSphere Reviewer (agent session)",
+      "evidenceRef": "Reviewer local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "Validation reproduced with zero errors after reading the full diff."
+    },
+    {
+      "checkId": "scope-diff-review",
+      "category": "manual-review",
+      "kind": "observed",
+      "command": "git diff --stat origin/main...HEAD",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-24T14:24:00Z",
+      "executor": "LoomSphere Reviewer (agent session)",
+      "evidenceRef": "Reviewer local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+      "summary": "The diff touched documentation and contract artifacts only; no prohibited path appeared."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "low",
+      "description": "Documentation drift remains possible if later phases change validation modes; the finding is non-blocking and accepted for v1.",
+      "status": "accepted-risk",
+      "blocking": false
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Approve the LS-DOC-001 documentation change for merge into main?",
+      "state": "pending",
+      "reference": null,
+      "blocking": true
+    }
+  ],
+  "recommendation": {
+    "verdict": "accept-with-findings",
+    "rationale": "Scope, evidence, and ADR boundaries are satisfied; one accepted low-severity risk remains and human approval is outstanding.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "human",
+    "stage": "human-final-approval",
+    "rationale": "The reviewer cannot approve, merge, or deploy; the change requires an explicit human decision."
+  },
+  "metadata": {
+    "createdAt": "2026-10-24T14:26:00Z",
+    "producedBy": "reviewer",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-001. It records a recommendation only; approvalGranted stays false by schema."
+}

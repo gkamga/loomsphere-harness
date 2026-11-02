@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loomsphere.local/contracts/agent-catalog.schema.json",
+  "title": "LoomSphere agent catalog entry",
+  "description": "One review specialist the trusted factory may select and execute. Every field is read by application code: identity derives the persisted stage and agent role, tools and skills are the authorization, and the selection rules are the routing table. The runtime validates the same contract in backend/app/services/agent_catalog.py and fails closed on a disagreement.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "order",
+    "label",
+    "role",
+    "stage",
+    "definition",
+    "definition_name",
+    "factor_key",
+    "read_only",
+    "tools",
+    "skills",
+    "selection",
+    "prompt"
+  ],
+  "properties": {
+    "catalog_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+){0,2}$",
+      "description": "The specialist name. It derives the stage (<name>-review) and the agent role (<name>-reviewer), and it is the value persisted in specialist_reviews.specialist."
+    },
+    "order": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Review order. Selection reasons and the routed stage chain follow it."
+    },
+    "label": {
+      "type": "string",
+      "minLength": 3,
+      "description": "Human label used in prompts and evidence."
+    },
+    "role": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*-reviewer$",
+      "description": "Persisted agent role; must be <name>-reviewer."
+    },
+    "stage": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*-review$",
+      "description": "Persisted factory stage; must be <name>-review."
+    },
+    "definition": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.agent\\.md$",
+      "description": "Bare file name of the agent definition inside .github/agents."
+    },
+    "definition_name": {
+      "type": "string",
+      "minLength": 3,
+      "description": "The name the agent definition must declare."
+    },
+    "persona_setting": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "description": "Optional deployment setting that may override the definition path."
+    },
+    "factor_key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Legacy classified-fact key recorded for backwards-compatible evidence."
+    },
+    "read_only": {
+      "type": "boolean",
+      "const": true,
+      "description": "A review specialist must never be able to alter the evidence it judges."
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "read",
+          "search",
+          "edit",
+          "execute",
+          "agent",
+          "todo",
+          "web"
+        ]
+      },
+      "description": "The authorized tool set. It must equal the agent definition's declared tools and may not contain edit or execute."
+    },
+    "skills": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+){0,7}$"
+      },
+      "description": "The authorized skills. They must equal the agent definition's declared skills, and each skill must declare the role in its own frontmatter."
+    },
+    "risk_tier": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "description": "When a match raises the task's risk level."
+    },
+    "implied_task_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The task type a match implies."
+    },
+    "implied_task_type_from_paths": {
+      "type": "boolean",
+      "description": "Whether a matched scope path, not only matched text, implies implied_task_type."
+    },
+    "reviews_rendered_evidence": {
+      "type": "boolean"
+    },
+    "text_markers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 2
+      },
+      "description": "Whole-word markers matched against the requirement text."
+    },
+    "path_signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_reason"
+      ],
+      "properties": {
+        "change_reason": {
+          "type": "string",
+          "minLength": 3,
+          "description": "Recorded reason a changed path added this specialist after the commit."
+        },
+        "description": {
+          "type": "string"
+        },
+        "regexes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "suffixes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[A-Za-z0-9.]+$"
+          }
+        },
+        "segments": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "areas": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "selection": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 3,
+            "description": "Recorded reason the route includes this specialist."
+          },
+          "task_types": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "risk_levels": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          },
+          "complexities": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          },
+          "areas": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "paths": {
+            "type": "boolean",
+            "description": "Requires this entry's path signal to have matched the scope."
+          },
+          "text": {
+            "type": "boolean",
+            "description": "Requires this entry's text markers to have matched the requirement."
+          }
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mission",
+        "focus",
+        "focus_rules",
+        "focus_heading",
+        "path_label"
+      ],
+      "properties": {
+        "mission": {
+          "type": "string",
+          "minLength": 12
+        },
+        "focus": {
+          "type": "string",
+          "minLength": 12
+        },
+        "focus_rules": {
+          "type": "string",
+          "minLength": 12
+        },
+        "focus_heading": {
+          "type": "string",
+          "minLength": 12
+        },
+        "path_label": {
+          "type": "string",
+          "minLength": 12
+        }
+      }
+    }
+  }
+}

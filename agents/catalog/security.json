@@ -1,0 +1,106 @@
+{
+  "catalog_version": 1,
+  "name": "security",
+  "order": 10,
+  "label": "Security Reviewer",
+  "role": "security-reviewer",
+  "stage": "security-review",
+  "definition": "loomsphere-security-reviewer.agent.md",
+  "definition_name": "LoomSphere Security Reviewer",
+  "persona_setting": "SECURITY_REVIEWER_PERSONA_PATH",
+  "factor_key": "security_paths",
+  "read_only": true,
+  "tools": [
+    "read",
+    "search"
+  ],
+  "skills": [
+    "security-review",
+    "engineering-review"
+  ],
+  "risk_tier": "high",
+  "implied_task_type": "security",
+  "implied_task_type_from_paths": false,
+  "reviews_rendered_evidence": false,
+  "path_signal": {
+    "description": "A path is security sensitive when one of these markers appears as a path segment or file-name fragment. The list is deliberately explicit: a false positive only adds review, a false negative would skip it.",
+    "regexes": [
+      "(?i)(?:^|/)(?:auth|authentication|authorization|authn|authz|security|token|tokens|credential|credentials|secret|secrets|password|passwords|permission|permissions|rbac|jwt|session|sessions|crypto|cryptography|tls|certificates?|signatures?)(?:[_.\\-/]|$)",
+      "(?i)(?:^|/)sandbox(?:[_.\\-/]|$)",
+      "(?i)(?:^|/)protected_verification\\.py$",
+      "(?i)(?:^|/)\\.github/workflows/",
+      "(?i)(?:^|/)migrations/versions/"
+    ],
+    "change_reason": "security-sensitive-path"
+  },
+  "text_markers": [
+    "auth",
+    "authenticate",
+    "authentication",
+    "authorization",
+    "authz",
+    "credential",
+    "credentials",
+    "jwt",
+    "token",
+    "tokens",
+    "secret",
+    "secrets",
+    "password",
+    "passwords",
+    "permission",
+    "permissions",
+    "privilege",
+    "encrypt",
+    "encryption",
+    "decrypt",
+    "crypto",
+    "signature",
+    "injection",
+    "xss",
+    "csrf",
+    "ssrf",
+    "sanitize",
+    "tls",
+    "certificate",
+    "vulnerability",
+    "exploit",
+    "access control",
+    "rbac",
+    "sandbox escape"
+  ],
+  "selection": [
+    {
+      "reason": "security-sensitive-scope-path",
+      "paths": true
+    },
+    {
+      "reason": "security-task-type",
+      "task_types": [
+        "security"
+      ]
+    },
+    {
+      "reason": "high-risk",
+      "risk_levels": [
+        "high"
+      ]
+    },
+    {
+      "reason": "high-complexity-backend-change",
+      "complexities": [
+        "high"
+      ],
+      "areas": [
+        "backend"
+      ]
+    }
+  ],
+  "prompt": {
+    "mission": "You review one recorded change set for security defects before it may reach the final Reviewer and the human approval queue.",
+    "focus": "- Trust boundaries: untrusted input reaching a query, path, command, template, or redirect.\n- Authentication and authorization: a weakened check, a widened scope, a dropped\n  audience or expiry check, or a privileged path reachable without its guard.\n- Credentials and secrets: new literals, and any log or error path that would print one.\n- Cryptography: hand-rolled primitives, downgraded algorithms, naive comparisons,\n  reused nonces or salts.\n- Execution boundary: anything that would let generated code escape the sandboxed\n  validation boundary.\n- Data exposure: broadened serialization, a new field returning a secret, or an\n  error detail leaking internals.",
+    "focus_rules": "A finding about credentials, authorization, input trust boundaries, or sandbox\nescape is `blocking` unless you show why it cannot be reached.",
+    "focus_heading": "Why this change is in scope for security review",
+    "path_label": "Security-sensitive paths in the recorded change set:"
+  }
+}

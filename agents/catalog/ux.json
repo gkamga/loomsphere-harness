@@ -1,0 +1,81 @@
+{
+  "catalog_version": 1,
+  "name": "ux",
+  "order": 20,
+  "label": "UX/UI Reviewer",
+  "role": "ux-reviewer",
+  "stage": "ux-review",
+  "definition": "loomsphere-ux-reviewer.agent.md",
+  "definition_name": "LoomSphere UX/UI Reviewer",
+  "persona_setting": "UX_REVIEWER_PERSONA_PATH",
+  "factor_key": "ui_paths",
+  "read_only": true,
+  "tools": [
+    "read",
+    "search"
+  ],
+  "skills": [
+    "ux-ui-review",
+    "engineering-review"
+  ],
+  "implied_task_type": "ui",
+  "implied_task_type_from_paths": true,
+  "reviews_rendered_evidence": true,
+  "path_signal": {
+    "description": "A UX review is required when a path is in the frontend area, is a file type that defines presentation, or sits in a directory that holds presentation code.",
+    "areas": [
+      "frontend"
+    ],
+    "suffixes": [
+      ".tsx",
+      ".jsx",
+      ".css",
+      ".scss",
+      ".sass",
+      ".less",
+      ".html",
+      ".vue",
+      ".svelte",
+      ".astro"
+    ],
+    "segments": [
+      "components",
+      "styles",
+      "stylesheets",
+      "design-system"
+    ],
+    "change_reason": "ui-change-path"
+  },
+  "text_markers": [
+    "ui",
+    "ux",
+    "frontend",
+    "front-end",
+    "accessibility",
+    "screen reader",
+    "responsive",
+    "design system",
+    "layout",
+    "component",
+    "page"
+  ],
+  "selection": [
+    {
+      "reason": "ui-scope-path",
+      "paths": true
+    },
+    {
+      "reason": "ui-task-type",
+      "task_types": [
+        "ui"
+      ]
+    }
+  ],
+  "prompt": {
+    "mission": "You review one recorded change set for user-facing defects before it may reach the final Reviewer and the human approval queue.",
+    "focus": "- User-visible states: default, loading, empty, error, disabled, and destructive\n  paths. A missing state is a defect, not a nuance.\n- Accessibility semantics readable in the change: accessible names and roles,\n  labels, keyboard reachability and focus order, error association, alt text.\n- Layout and responsiveness: breakpoints, overflow, truncation, target sizes.\n- Consistency with the existing interface: design-system components versus ad-hoc\n  markup, duplicated styles, tone of copy, and component reuse.\n- Interaction cost: extra steps, unclear affordances, and destructive actions\n  without confirmation.",
+    "focus_rules": "A finding about a broken user-facing flow, an inaccessible control, a required state\nthat is missing, or a destructive action without confirmation is `blocking` unless\nyou show why it cannot be reached.",
+    "focus_heading": "Why this change is in scope for UX/UI review",
+    "path_label": "User-facing paths in the recorded change set:"
+  }
+}

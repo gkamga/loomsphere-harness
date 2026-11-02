@@ -1,0 +1,176 @@
+{
+  "contractVersion": "1.1.0",
+  "taskId": "LS-DOC-001",
+  "projectId": "loomsphere",
+  "title": "Document the factory contract validation entry point",
+  "objective": "Give agents and operators one documented, tested way to validate factory agent, skill, and execution-contract definitions before relying on them.",
+  "requirements": [
+    {
+      "id": "R-001",
+      "description": "Document the read-only factory validation command, its scope, and its exit-code meaning.",
+      "source": "docs/workflows/agent-execution-contracts.md"
+    },
+    {
+      "id": "R-002",
+      "description": "Keep documented validation commands consistent with scripts/validate.sh and the CI jobs that run them.",
+      "source": "scripts/validate.sh"
+    },
+    {
+      "id": "R-003",
+      "description": "Preserve existing application test and build coverage; document only, without changing runtime behavior.",
+      "source": "README.md"
+    }
+  ],
+  "adrReferences": [
+    {
+      "id": "ADR-002",
+      "path": "docs/decisions/adr-002-authentication.md",
+      "status": "accepted",
+      "appliesToImplementation": true,
+      "note": "Referenced to confirm the prohibited boundary: this documentation task must not alter the accepted authentication implementation."
+    }
+  ],
+  "acceptanceCriteria": [
+    {
+      "id": "AC-01",
+      "description": "The documented factory validation command matches the implemented validate.sh mode and exits nonzero for invalid definitions.",
+      "verification": "static-validation",
+      "requirementRefs": ["R-001", "R-002"]
+    },
+    {
+      "id": "AC-02",
+      "description": "Every relative documentation link added by the task resolves to an existing repository path.",
+      "verification": "documentation-review",
+      "requirementRefs": ["R-002"]
+    },
+    {
+      "id": "AC-03",
+      "description": "Existing backend, frontend, database, migration, and end-to-end validation categories remain unchanged.",
+      "verification": "manual-review",
+      "requirementRefs": ["R-003"]
+    }
+  ],
+  "boundaries": {
+    "allowedPaths": ["docs/workflows/"],
+    "prohibitedPaths": [
+      "backend/app/",
+      "backend/migrations/",
+      "docs/decisions/",
+      ".github/workflows/",
+      "docker-compose.yml"
+    ],
+    "notes": "Documentation-only task. New contract examples are referenced, not edited. No application, authentication, migration, or deployment file may change."
+  },
+  "responsibleRole": "human",
+  "status": "ready-for-human-approval",
+  "requiredApprovals": [
+    {
+      "id": "AP-01",
+      "stage": "human-scope-approval",
+      "approver": "human",
+      "required": true,
+      "recorded": true,
+      "reference": "Phase 0.5b.1 human scope approval recorded in the requesting work order, 2026-10-24"
+    },
+    {
+      "id": "AP-02",
+      "stage": "human-final-approval",
+      "approver": "human",
+      "required": true,
+      "recorded": false,
+      "reference": null
+    }
+  ],
+  "handoffRefs": [
+    {
+      "handoffId": "HND-001",
+      "path": ".github/contracts/examples/LS-DOC-001/handoff-01-architect.json",
+      "role": "architect"
+    },
+    {
+      "handoffId": "HND-002",
+      "path": ".github/contracts/examples/LS-DOC-001/handoff-02-builder.json",
+      "role": "builder"
+    },
+    {
+      "handoffId": "HND-003",
+      "path": ".github/contracts/examples/LS-DOC-001/handoff-03-qa.json",
+      "role": "qa"
+    },
+    {
+      "handoffId": "HND-004",
+      "path": ".github/contracts/examples/LS-DOC-001/handoff-04-reviewer.json",
+      "role": "reviewer"
+    }
+  ],
+  "executionEvidence": {
+    "validations": [
+      {
+        "checkId": "factory-contract-validation",
+        "category": "static-validation",
+        "kind": "observed",
+        "command": "bash scripts/validate.sh --factory",
+        "exitCode": 0,
+        "outcome": "passed",
+        "executedAt": "2026-10-24T14:05:00Z",
+        "executor": "LoomSphere Builder (agent session)",
+        "evidenceRef": "Local terminal transcript captured during Phase 0.5b.1, 2026-10-24",
+        "summary": "Factory validation reported 6 check groups with zero errors."
+      },
+      {
+        "checkId": "backend-safe-tests",
+        "category": "pytest",
+        "kind": "not-run",
+        "outcome": "not-executed",
+        "summary": "Documentation-only change; the backend suite was not executed by the example QA record."
+      },
+      {
+        "checkId": "playwright-e2e",
+        "category": "playwright",
+        "outcome": "blocked",
+        "kind": "blocked",
+        "summary": "End-to-end validation requires a verified disposable database; isolation was not confirmed, so the run was refused."
+      }
+    ],
+    "continuousIntegration": {
+      "claim": "not-claimed",
+      "observedRunUrl": null
+    }
+  },
+  "risks": [
+    {
+      "id": "RSK-01",
+      "description": "Documentation could drift from the implemented validation modes after later phases.",
+      "severity": "medium",
+      "state": "accepted",
+      "owner": "human"
+    },
+    {
+      "id": "RSK-02",
+      "description": "Role names in older workflow documents still differ from the canonical agent names.",
+      "severity": "low",
+      "state": "open",
+      "owner": "architect"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "BLK-01",
+      "description": "Human final approval for merge has not been recorded for this task.",
+      "state": "open",
+      "owner": "human"
+    }
+  ],
+  "nextAction": {
+    "agent": "human",
+    "stage": "human-final-approval",
+    "rationale": "Reviewer evidence is complete and no blocking finding remains; only the human approval boundary is outstanding."
+  },
+  "metadata": {
+    "createdAt": "2026-10-24T09:10:00Z",
+    "updatedAt": "2026-10-24T14:20:00Z",
+    "createdBy": "architect",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic example that demonstrates the contract shape. Evidence references describe a real local session pattern but are not a substitute for the recorded CI run of a live task."
+}

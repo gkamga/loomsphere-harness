@@ -1,0 +1,89 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-105",
+  "predecessorHandoffId": "HND-104",
+  "reassessment": {
+    "iteration": 2,
+    "triggeredByHandoffId": "HND-104",
+    "basis": "The reviewer re-assessed its own block after the human gate returned no decision, and concluded that the missing evidence is producible by QA from the validator source rather than by the human."
+  },
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "reviewer",
+  "destinationAgent": "qa",
+  "taskStatusAfter": "blocked",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "review",
+      "description": "Re-read the validator to determine whether the enforced transition set can be compared without changing product code."
+    },
+    {
+      "id": "W-02",
+      "kind": "analysis",
+      "description": "Identified the specific evidence QA must produce and recorded why it cannot be produced by the reviewer."
+    }
+  ],
+  "filesReviewed": [
+    "handoff-04-reviewer.json",
+    ".github/contracts/README.md",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-02",
+      "status": "not-addressed",
+      "evidenceCheckRefs": []
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "transition-set-extraction",
+      "category": "other",
+      "kind": "blocked",
+      "outcome": "blocked",
+      "summary": "Blocked: extracting the transition set requires reading validator internals, which is QA's evidence-gathering step rather than a review conclusion."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "high",
+      "description": "AC-02 still has no observable evidence, and the missing artifact is a comparison transcript QA has not produced.",
+      "status": "open",
+      "blocking": true
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Should AC-02 be withdrawn, or must the transition set be exposed as data so it can be compared?",
+      "state": "pending",
+      "reference": null,
+      "blocking": true
+    }
+  ],
+  "recommendation": {
+    "verdict": "blocked",
+    "rationale": "The block is still open, but it belongs with QA because the missing evidence is a runtime comparison rather than a human scope decision.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "qa",
+    "stage": "validation",
+    "rationale": "QA must produce the comparison transcript before any role can conclude, so the block stays with the role that can gather it."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:18:00Z",
+    "producedBy": "reviewer",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002. It demonstrates the reviewer to qa transition and an agent-initiated block that stays inside the agent chain under a declared reassessment instead of being escalated past the agent that found it."
+}

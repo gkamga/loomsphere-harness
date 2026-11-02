@@ -1,0 +1,78 @@
+{
+  "contractVersion": "1.1.0",
+  "handoffId": "HND-001",
+  "taskRef": {
+    "taskId": "LS-DOC-001",
+    "path": ".github/contracts/examples/LS-DOC-001/task.json"
+  },
+  "sourceAgent": "architect",
+  "destinationAgent": "builder",
+  "taskStatusAfter": "approved",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "analysis",
+      "description": "Reviewed the existing validation entry point, README instructions, and the feature lifecycle document for conflicting terminology."
+    },
+    {
+      "id": "W-02",
+      "kind": "design",
+      "description": "Defined a documentation-only scope with explicit allowed and prohibited paths and three acceptance criteria."
+    }
+  ],
+  "filesReviewed": [
+    "README.md",
+    "docs/workflows/feature-lifecycle.md",
+    "scripts/validate.sh",
+    ".github/contracts/task-contract.schema.json"
+  ],
+  "filesModified": [],
+  "acceptanceCriteriaAddressed": [],
+  "validation": [
+    {
+      "checkId": "scope-analysis",
+      "category": "manual-review",
+      "kind": "asserted",
+      "outcome": "passed",
+      "summary": "Scope analysis was performed by reading repository documents; no executable check applies before implementation."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [
+    {
+      "id": "FND-01",
+      "severity": "low",
+      "description": "Older workflow documents use pre-canonical role names, so new documentation must state the canonical agent roles explicitly.",
+      "status": "open",
+      "blocking": false
+    }
+  ],
+  "humanDecisionsRequired": [
+    {
+      "id": "HD-01",
+      "question": "Is the documentation-only scope, with the listed prohibited paths, approved for implementation?",
+      "state": "recorded",
+      "reference": "Phase 0.5b.1 human scope approval recorded in the requesting work order, 2026-10-24",
+      "blocking": false
+    }
+  ],
+  "recommendation": {
+    "verdict": "accept",
+    "rationale": "The scope is bounded, verifiable with the existing read-only validator, and does not touch implementation or security files.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "builder",
+    "stage": "implementation",
+    "rationale": "Human scope approval is recorded, so the bounded documentation change can be implemented."
+  },
+  "metadata": {
+    "createdAt": "2026-10-24T09:10:00Z",
+    "producedBy": "architect",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-001. The recorded human approval reference is illustrative and grants no authority by itself."
+}

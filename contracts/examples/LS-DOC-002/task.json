@@ -1,0 +1,174 @@
+{
+  "contractVersion": "1.2.0",
+  "taskId": "LS-DOC-002",
+  "projectId": "loomsphere",
+  "title": "Document the 1.2.0 contract semantics",
+  "objective": "Record one bounded documentation task that exercises every 1.2.0 addition: a human scope gate inside an agent chain, an agent-initiated block that stays with the agent that must produce the missing evidence, and execution evidence whose exit status was not captured.",
+  "requirements": [
+    {
+      "id": "R-001",
+      "description": "Document the additive 1.2.0 vocabulary: predecessor references, reassessment declarations, and execution state.",
+      "source": ".github/contracts/README.md"
+    },
+    {
+      "id": "R-002",
+      "description": "Keep the documented transition set identical to the set the validator enforces.",
+      "source": "scripts/validate_factory.py"
+    }
+  ],
+  "adrReferences": [
+    {
+      "id": "ADR-002",
+      "path": "docs/decisions/adr-002-authentication.md",
+      "status": "accepted",
+      "appliesToImplementation": true,
+      "note": "Referenced to confirm the prohibited boundary: this documentation task must not alter the accepted authentication implementation."
+    }
+  ],
+  "acceptanceCriteria": [
+    {
+      "id": "AC-01",
+      "description": "The documented 1.1.0 to 1.2.0 change set matches the change actually present in both contract schemas.",
+      "verification": "cross-document-validation",
+      "requirementRefs": ["R-001"]
+    },
+    {
+      "id": "AC-02",
+      "description": "Every lifecycle transition listed in the documentation is permitted by the validator and no permitted transition is undocumented.",
+      "verification": "static-validation",
+      "requirementRefs": ["R-002"]
+    }
+  ],
+  "boundaries": {
+    "allowedPaths": ["docs/workflows/", ".github/contracts/"],
+    "prohibitedPaths": [
+      "backend/app/",
+      "backend/migrations/",
+      "docs/decisions/",
+      "frontend/app/projects/[projectId]/",
+      "docker-compose.yml"
+    ],
+    "notes": "Documentation-only task. The bracketed frontend path is listed to exercise the repository path pattern, and it is prohibited rather than allowed."
+  },
+  "responsibleRole": "human",
+  "status": "blocked",
+  "requiredApprovals": [
+    {
+      "id": "AP-01",
+      "stage": "human-scope-approval",
+      "approver": "human",
+      "required": true,
+      "recorded": true,
+      "reference": "Scope approval recorded in the requesting work order for this synthetic example, 2026-10-25"
+    },
+    {
+      "id": "AP-02",
+      "stage": "human-final-approval",
+      "approver": "human",
+      "required": true,
+      "recorded": false,
+      "reference": null
+    }
+  ],
+  "handoffRefs": [
+    {
+      "handoffId": "HND-101",
+      "path": "handoff-01-architect.json",
+      "role": "architect"
+    },
+    {
+      "handoffId": "HND-102",
+      "path": "handoff-02-builder.json",
+      "role": "builder"
+    },
+    {
+      "handoffId": "HND-103",
+      "path": "handoff-03-qa.json",
+      "role": "qa"
+    },
+    {
+      "handoffId": "HND-104",
+      "path": "handoff-04-reviewer.json",
+      "role": "reviewer"
+    },
+    {
+      "handoffId": "HND-105",
+      "path": "handoff-05-reviewer.json",
+      "role": "reviewer"
+    },
+    {
+      "handoffId": "HND-106",
+      "path": "handoff-06-qa.json",
+      "role": "qa"
+    }
+  ],
+  "executionEvidence": {
+    "validations": [
+      {
+        "checkId": "factory-contract-validation",
+        "category": "static-validation",
+        "kind": "observed",
+        "command": "bash scripts/validate.sh --factory",
+        "exitCode": 0,
+        "outcome": "passed",
+        "executedAt": "2026-10-25T02:10:00Z",
+        "executor": "LoomSphere QA (agent session)",
+        "evidenceRef": "Local terminal transcript for this synthetic example session, 2026-10-25",
+        "summary": "The validator reported the example and both record sets with zero errors."
+      },
+      {
+        "checkId": "playwright-e2e",
+        "category": "playwright",
+        "kind": "observed",
+        "command": "npx playwright test",
+        "executionState": "exit-not-captured",
+        "outcome": "inconclusive",
+        "outcomeRationale": "The suite ran and its output was retained, but the process was detached from the capturing shell so no exit status was recorded. A missing exit status is not evidence of success.",
+        "executedAt": "2026-10-25T02:12:00Z",
+        "executor": "LoomSphere QA (agent session)",
+        "evidenceRef": "Retained console output for this synthetic example session, 2026-10-25",
+        "summary": "Executed with output retained and exit status not captured."
+      },
+      {
+        "checkId": "backend-safe-tests",
+        "category": "pytest",
+        "kind": "not-run",
+        "outcome": "not-executed",
+        "summary": "Documentation-only change; the backend suite was not executed by this example."
+      }
+    ],
+    "continuousIntegration": {
+      "claim": "not-claimed",
+      "observedRunUrl": null
+    }
+  },
+  "risks": [
+    {
+      "id": "RSK-01",
+      "description": "A documentation example can drift from the schemas it describes after a later contract version.",
+      "severity": "medium",
+      "state": "accepted",
+      "owner": "human"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "BLK-01",
+      "description": "The evidence QA was asked to produce for AC-02 has not been produced, so the chain cannot advance to human final approval.",
+      "state": "open",
+      "owner": "qa"
+    }
+  ],
+  "nextAction": {
+    "agent": "human",
+    "stage": "review",
+    "rationale": "The chain ends with an agent-initiated block that names one open blocking finding and one pending blocking human decision; only the human can choose between them."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:00:00Z",
+    "updatedAt": "2026-10-25T02:20:00Z",
+    "createdBy": "architect",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic 1.2.0 example. Its six handoffs include a human gate inside an agent chain, a block that is escalated to the human, and a block that stays with an agent under a declared reassessment. Evidence references describe a local session pattern and are not a substitute for the recorded CI run of a live task."
+}

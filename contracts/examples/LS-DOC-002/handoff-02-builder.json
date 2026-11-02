@@ -1,0 +1,86 @@
+{
+  "contractVersion": "1.2.0",
+  "handoffId": "HND-102",
+  "predecessorHandoffId": "HND-101",
+  "taskRef": {
+    "taskId": "LS-DOC-002",
+    "path": "task.json"
+  },
+  "sourceAgent": "builder",
+  "destinationAgent": "qa",
+  "taskStatusAfter": "in-validation",
+  "workPerformed": [
+    {
+      "id": "W-01",
+      "kind": "documentation",
+      "description": "Wrote the migration note describing each additive 1.2.0 keyword and the rule it enables, without restating the 1.1.0 rules."
+    },
+    {
+      "id": "W-02",
+      "kind": "documentation",
+      "description": "Replaced the seven-transition list with the enforced set plus a table explaining the two additions."
+    }
+  ],
+  "filesReviewed": [
+    "handoff-01-architect.json",
+    ".github/contracts/task-contract.schema.json",
+    "scripts/validate_factory.py"
+  ],
+  "filesModified": [".github/contracts/README.md"],
+  "acceptanceCriteriaAddressed": [
+    {
+      "criterionRef": "AC-01",
+      "status": "addressed",
+      "evidenceCheckRefs": ["factory-contract-validation"]
+    },
+    {
+      "criterionRef": "AC-02",
+      "status": "partially-addressed",
+      "evidenceCheckRefs": []
+    }
+  ],
+  "validation": [
+    {
+      "checkId": "factory-contract-validation",
+      "category": "static-validation",
+      "kind": "observed",
+      "command": "bash scripts/validate.sh --factory",
+      "exitCode": 0,
+      "outcome": "passed",
+      "executedAt": "2026-10-25T02:06:00Z",
+      "executor": "LoomSphere Builder (agent session)",
+      "evidenceRef": "Local terminal transcript for this synthetic example session, 2026-10-25",
+      "summary": "Schema and example checks passed with zero errors before the documentation edit."
+    },
+    {
+      "checkId": "documented-transition-review",
+      "category": "documentation-review",
+      "kind": "asserted",
+      "outcome": "inconclusive",
+      "outcomeRationale": "No automated check compares the documented transition list with the enforced set, so the correspondence is asserted rather than observed.",
+      "summary": "The transition list was compared by reading both artifacts."
+    }
+  ],
+  "continuousIntegration": {
+    "claim": "not-claimed",
+    "observedRunUrl": null
+  },
+  "findings": [],
+  "humanDecisionsRequired": [],
+  "recommendation": {
+    "verdict": "accept",
+    "rationale": "The documentation change is complete and locally validated; no application behavior or protected file was touched.",
+    "approvalGranted": false
+  },
+  "nextAction": {
+    "agent": "qa",
+    "stage": "validation",
+    "rationale": "Independent verification should confirm the observed evidence and record the checks that were not run."
+  },
+  "metadata": {
+    "createdAt": "2026-10-25T02:07:00Z",
+    "producedBy": "builder",
+    "executionMode": "manual-handoff"
+  },
+  "x-example-note": "Synthetic handoff example for LS-DOC-002 that cites one sibling record by its record-set-relative name and one repository file by its repository-root-relative path."
+}

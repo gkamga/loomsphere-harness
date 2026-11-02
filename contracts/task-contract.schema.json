@@ -1,0 +1,910 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loomsphere.local/contracts/task-contract.schema.json",
+  "title": "LoomSphere task contract",
+  "description": "Machine-readable record of one unit of factory work: approved scope, constraints, evidence, and the next human or agent action. This is a document format, not an orchestration interface.",
+  "type": "object",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^x-[a-z0-9-]+$": {
+      "description": "Extension slot for local annotations. Never interpreted as workflow control."
+    }
+  },
+  "required": [
+    "contractVersion",
+    "taskId",
+    "projectId",
+    "title",
+    "objective",
+    "requirements",
+    "adrReferences",
+    "acceptanceCriteria",
+    "boundaries",
+    "responsibleRole",
+    "status",
+    "requiredApprovals",
+    "handoffRefs",
+    "executionEvidence",
+    "risks",
+    "blockers",
+    "nextAction",
+    "metadata"
+  ],
+  "properties": {
+    "contractVersion": {
+      "description": "Version of this contract format. Bump only with a migration note in .github/contracts/README.md. 1.1.0, 1.2.0, 1.3.0, and 1.4.0 are all accepted so that historical records stay readable; the validator applies the semantics of the version each record declares and never relabels a record.",
+      "enum": ["1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    },
+    "taskId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*-[A-Z0-9]+(-[A-Z0-9]+)*$",
+      "description": "Stable task identifier, for example LS-DOC-001. Must not be reused for different work."
+    },
+    "projectId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}$",
+      "description": "Project or product scope this task belongs to, for example loomsphere."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 120
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 20,
+      "description": "Outcome the task must achieve, stated so completion can be judged."
+    },
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "source"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^R-[0-9]{3}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "source": {
+            "type": "string",
+            "minLength": 3,
+            "description": "Repository-relative document path or tracked reference such as a PRD section."
+          }
+        }
+      }
+    },
+    "adrReferences": {
+      "type": "array",
+      "description": "Applicable architecture decisions. Only status=accepted constrains implementation.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "path", "status", "appliesToImplementation"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ADR-[0-9]{3}$"
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^docs/decisions/[A-Za-z0-9._-]+\\.md$"
+          },
+          "status": {
+            "enum": ["accepted", "proposed", "rejected", "superseded"]
+          },
+          "appliesToImplementation": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": "string",
+            "minLength": 3
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": ["proposed", "rejected", "superseded"]
+                }
+              },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": {
+                "appliesToImplementation": {
+                  "const": false
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "verification", "requirementRefs"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^AC-[0-9]{2,3}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "verification": {
+            "description": "cross-document-validation was added in 1.2.0 because a criterion can require agreement between records (task status, handoff chronology, approval state) which no single-record check can establish.",
+            "enum": [
+              "pytest",
+              "playwright",
+              "lint",
+              "build",
+              "static-validation",
+              "cross-document-validation",
+              "manual-review",
+              "documentation-review"
+            ]
+          },
+          "requirementRefs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^R-[0-9]{3}$"
+            }
+          }
+        }
+      }
+    },
+    "boundaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedPaths", "prohibitedPaths"],
+      "properties": {
+        "allowedPaths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/repoPathScope"
+          }
+        },
+        "prohibitedPaths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/repoPathScope"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "responsibleRole": {
+      "$ref": "#/$defs/agentOrHuman",
+      "description": "Role accountable for the next action, not for approvals. Must equal nextAction.agent."
+    },
+    "status": {
+      "$ref": "#/$defs/taskStatus"
+    },
+    "requiredApprovals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "stage", "approver", "required", "recorded", "reference"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^AP-[0-9]{2}$"
+          },
+          "stage": {
+            "$ref": "#/$defs/lifecycleStage"
+          },
+          "approver": {
+            "const": "human",
+            "description": "Approval authority is human-only by design. Agents cannot approve."
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "recorded": {
+            "type": "boolean"
+          },
+          "reference": {
+            "type": ["string", "null"],
+            "description": "Durable approval reference when recorded is true."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "recorded": {
+                  "const": true
+                }
+              },
+              "required": ["recorded"]
+            },
+            "then": {
+              "required": ["reference"],
+              "properties": {
+                "reference": {
+                  "type": "string",
+                  "minLength": 8
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "reference": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "handoffRefs": {
+      "type": "array",
+      "description": "Handoff records that describe work already performed for this task.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["handoffId", "path", "role"],
+        "properties": {
+          "handoffId": {
+            "type": "string",
+            "pattern": "^HND-[0-9]{3}$"
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^[^/].*\\.json$"
+          },
+          "role": {
+            "$ref": "#/$defs/agentRole"
+          }
+        }
+      }
+    },
+    "executionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validations", "continuousIntegration"],
+      "properties": {
+        "validations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidenceRecord"
+          }
+        },
+        "continuousIntegration": {
+          "$ref": "#/$defs/continuousIntegrationClaim"
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "severity", "state", "owner"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^RSK-[0-9]{2}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "severity": {
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "state": {
+            "enum": ["open", "accepted", "mitigated", "closed"]
+          },
+          "owner": {
+            "enum": ["architect", "builder", "qa", "reviewer", "human"]
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "state", "owner"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^BLK-[0-9]{2}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "state": {
+            "enum": ["open", "resolved"]
+          },
+          "owner": {
+            "enum": ["architect", "builder", "qa", "reviewer", "human"]
+          }
+        }
+      }
+    },
+    "nextAction": {
+      "$ref": "#/$defs/nextAction"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["createdAt", "updatedAt", "createdBy", "executionMode"],
+      "properties": {
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdBy": {
+          "enum": ["architect", "builder", "qa", "reviewer", "human"]
+        },
+        "executionMode": {
+          "const": "manual-handoff",
+          "description": "Records explicitly that no orchestrator transferred or executed this task."
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "1.2.0 vocabulary is additive: a 1.1.0 task may not use the execution-state vocabulary introduced for handoff validation records. Forbidding executionState here is what preserves the 1.1.0 rule that an observed validation carries a captured exitCode, because the shared evidenceRecord definition cannot read the parent record's contractVersion on its own.",
+      "if": {
+        "properties": {
+          "contractVersion": {
+            "const": "1.1.0"
+          }
+        },
+        "required": ["contractVersion"]
+      },
+      "then": {
+        "properties": {
+          "executionEvidence": {
+            "properties": {
+              "validations": {
+                "items": {
+                  "properties": {
+                    "executionState": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Final approval is a human action. A complete task must record it; every other status must leave it unrecorded.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "complete"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "requiredApprovals": {
+            "contains": {
+              "properties": {
+                "stage": {
+                  "const": "human-final-approval"
+                },
+                "recorded": {
+                  "const": true
+                }
+              },
+              "required": ["stage", "recorded"]
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "state": {
+                    "const": "open"
+                  }
+                },
+                "required": ["state"]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "requiredApprovals": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "stage": {
+                    "const": "human-final-approval"
+                  },
+                  "recorded": {
+                    "const": true
+                  }
+                },
+                "required": ["stage", "recorded"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "A task awaiting final human approval must carry an explicitly unrecorded human-final-approval entry.",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ready-for-human-approval"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "requiredApprovals": {
+            "contains": {
+              "properties": {
+                "stage": {
+                  "const": "human-final-approval"
+                },
+                "recorded": {
+                  "const": false
+                }
+              },
+              "required": ["stage", "recorded"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "agentRole": {
+      "enum": ["architect", "builder", "qa", "reviewer", "security-reviewer", "ux-reviewer"]
+    },
+    "agentOrHuman": {
+      "enum": [
+        "architect",
+        "builder",
+        "qa",
+        "reviewer",
+        "security-reviewer",
+        "ux-reviewer",
+        "human"
+      ]
+    },
+    "taskStatus": {
+      "description": "Shared task-status vocabulary. Unknown values are schema violations and are never treated as success.",
+      "enum": [
+        "draft",
+        "awaiting-human-scope-approval",
+        "approved",
+        "in-implementation",
+        "implemented",
+        "in-validation",
+        "validation-failed",
+        "in-review",
+        "changes-requested",
+        "ready-for-human-approval",
+        "complete",
+        "rejected",
+        "blocked"
+      ]
+    },
+    "lifecycleStage": {
+      "enum": [
+        "requirements",
+        "architecture",
+        "human-scope-approval",
+        "implementation",
+        "validation",
+        "review",
+        "human-final-approval",
+        "rework",
+        "closed"
+      ]
+    },
+    "repoPathScope": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._*?/\\[\\]-]+$",
+      "description": "Repository-relative path or glob. Absolute paths and parent traversal are rejected. Square brackets are allowed so that Next.js route segments such as frontend/app/projects/[projectId]/page.tsx can be named; they are literal characters, not glob syntax."
+    },
+    "repoFilePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/\\[\\]-]+$",
+      "description": "Repository-relative file path. Absolute paths and parent traversal are rejected. Square brackets are allowed so that Next.js route segments such as frontend/app/projects/[projectId]/page.tsx can be named."
+    },
+    "evidenceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One check result. `kind` records how the result was obtained; `outcome` records the semantic judgment. A process exit code is execution metadata, never proof that an acceptance criterion passed.",
+      "required": ["checkId", "category", "kind", "outcome", "summary"],
+      "properties": {
+        "checkId": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+        },
+        "category": {
+          "enum": [
+            "pytest",
+            "playwright",
+            "lint",
+            "build",
+            "static-validation",
+            "manual-review",
+            "documentation-review",
+            "other"
+          ]
+        },
+        "kind": {
+          "enum": ["observed", "asserted", "blocked", "not-run", "skipped"],
+          "description": "How the result was obtained. observed requires captured execution facts. asserted is an agent belief without captured execution. blocked/not-run/skipped carry no execution metadata."
+        },
+        "executionState": {
+          "enum": ["exited", "timed-out", "launch-failed", "exit-not-captured"],
+          "description": "Added in 1.2.0. What the process itself did, kept distinct from both the semantic outcome and the exit code. exited requires exitCode. exit-not-captured records that execution was attempted and output retained, but no exit status was captured; it never implies exit code 0."
+        },
+        "outcome": {
+          "enum": ["passed", "failed", "inconclusive", "blocked", "not-executed"],
+          "description": "Semantic result of the check, kept distinct from the process exit code. passed is never inferred from exitCode 0 alone; failed may coexist with exitCode 0 when the assertion itself failed."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 3
+        },
+        "exitCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "expectedExitCode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Exit code the check is expected to produce. Required to document a successful negative test whose expected exit code is nonzero."
+        },
+        "outcomeRationale": {
+          "type": "string",
+          "minLength": 10,
+          "description": "Why this outcome was assigned, including the signal that was asserted. Required when the outcome is failed/inconclusive or the exit code is nonzero."
+        },
+        "executedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "executor": {
+          "type": "string",
+          "minLength": 3
+        },
+        "evidenceRef": {
+          "type": "string",
+          "minLength": 3,
+          "description": "Where the captured output or transcript can be inspected."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 5
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "observed"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["command", "executedAt", "executor", "evidenceRef"],
+            "properties": {
+              "outcome": {
+                "enum": ["passed", "failed", "inconclusive"]
+              }
+            },
+            "anyOf": [
+              {
+                "description": "The process exited and its status was captured.",
+                "required": ["exitCode"]
+              },
+              {
+                "description": "Execution was attempted but did not produce a captured exit status. Added in 1.2.0; before that, such a check could only be recorded as asserted, which overstated the absence of execution.",
+                "required": ["executionState"],
+                "properties": {
+                  "executionState": {
+                    "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "executionState": {
+                "const": "exited"
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "required": ["exitCode"]
+          }
+        },
+        {
+          "description": "A process that timed out, failed to launch, or whose status was not captured has no exit code, so none may be recorded.",
+          "if": {
+            "properties": {
+              "executionState": {
+                "enum": ["timed-out", "launch-failed", "exit-not-captured"]
+              }
+            },
+            "required": ["executionState"]
+          },
+          "then": {
+            "properties": {
+              "exitCode": false,
+              "expectedExitCode": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "asserted"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": ["passed", "failed", "inconclusive"]
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executionState": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "blocked"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executionState": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["not-run", "skipped"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "not-executed"
+              },
+              "command": false,
+              "exitCode": false,
+              "expectedExitCode": false,
+              "executionState": false,
+              "executedAt": false,
+              "executor": false,
+              "evidenceRef": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "blocked"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-executed"
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": ["not-run", "skipped"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["expectedExitCode"]
+          },
+          "then": {
+            "required": ["exitCode"],
+            "properties": {
+              "kind": {
+                "const": "observed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "passed"
+              },
+              "exitCode": {
+                "not": {
+                  "const": 0
+                }
+              }
+            },
+            "required": ["outcome", "exitCode"]
+          },
+          "then": {
+            "required": ["expectedExitCode", "outcomeRationale"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": ["failed", "inconclusive"]
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "required": ["outcomeRationale"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "exitCode": {
+                "not": {
+                  "const": 0
+                }
+              }
+            },
+            "required": ["exitCode"]
+          },
+          "then": {
+            "required": ["outcomeRationale"]
+          }
+        }
+      ]
+    },
+    "continuousIntegrationClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "observedRunUrl"],
+      "description": "A CI claim is an assertion unless an observed run URL is recorded.",
+      "properties": {
+        "claim": {
+          "enum": ["not-claimed", "passed", "failed"]
+        },
+        "observedRunUrl": {
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "claim": {
+                "enum": ["passed", "failed"]
+              }
+            },
+            "required": ["claim"]
+          },
+          "then": {
+            "required": ["observedRunUrl"],
+            "properties": {
+              "observedRunUrl": {
+                "type": "string",
+                "pattern": "^https://github\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/actions/runs/[0-9]+$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "observedRunUrl": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nextAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "stage", "rationale"],
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/agentOrHuman"
+        },
+        "stage": {
+          "$ref": "#/$defs/lifecycleStage"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 10
+        }
+      }
+    }
+  }
+}
