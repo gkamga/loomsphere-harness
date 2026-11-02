@@ -1,0 +1,540 @@
+{
+  "agents": [
+    {
+      "core_role": true,
+      "file": "agents/loomsphere-architect.agent.md",
+      "name": "LoomSphere Architect",
+      "skills": [
+        "requirements-analysis",
+        "architecture-conformance",
+        "acceptance-test-design"
+      ],
+      "tools": [
+        "read",
+        "search"
+      ]
+    },
+    {
+      "core_role": true,
+      "file": "agents/loomsphere-builder.agent.md",
+      "name": "LoomSphere Builder",
+      "skills": [
+        "safe-implementation",
+        "safe-validation"
+      ],
+      "tools": [
+        "read",
+        "search",
+        "edit",
+        "execute",
+        "todo"
+      ]
+    },
+    {
+      "core_role": true,
+      "file": "agents/loomsphere-intake.agent.md",
+      "name": "LoomSphere Intake",
+      "skills": [
+        "requirements-analysis",
+        "intake-triage"
+      ],
+      "tools": [
+        "read",
+        "search"
+      ]
+    },
+    {
+      "core_role": true,
+      "file": "agents/loomsphere-qa.agent.md",
+      "name": "LoomSphere QA",
+      "skills": [
+        "requirements-audit",
+        "safe-validation",
+        "acceptance-test-design"
+      ],
+      "tools": [
+        "read",
+        "search",
+        "execute"
+      ]
+    },
+    {
+      "core_role": true,
+      "file": "agents/loomsphere-reviewer.agent.md",
+      "name": "LoomSphere Reviewer",
+      "skills": [
+        "engineering-review",
+        "architecture-conformance",
+        "requirements-audit"
+      ],
+      "tools": [
+        "read",
+        "search"
+      ]
+    },
+    {
+      "core_role": false,
+      "file": "agents/loomsphere-security-reviewer.agent.md",
+      "name": "LoomSphere Security Reviewer",
+      "skills": [
+        "security-review",
+        "engineering-review"
+      ],
+      "tools": [
+        "read",
+        "search"
+      ]
+    },
+    {
+      "core_role": false,
+      "file": "agents/loomsphere-ux-reviewer.agent.md",
+      "name": "LoomSphere UX/UI Reviewer",
+      "skills": [
+        "ux-ui-review",
+        "engineering-review"
+      ],
+      "tools": [
+        "read",
+        "search"
+      ]
+    }
+  ],
+  "assets": {
+    "agents/catalog/security.json": {
+      "bucket": "agents",
+      "bytes": 3562,
+      "sha256": "a71bde1be333e6b54dae4ec5492793bf644c345ed061a2aa3b4e80685995a159"
+    },
+    "agents/catalog/ux.json": {
+      "bucket": "agents",
+      "bytes": 2646,
+      "sha256": "5cc78c66d349ba19cb0aaafb6ebea1324a90e2d47419ade40822343db2f76d4a"
+    },
+    "agents/loomsphere-architect.agent.md": {
+      "bucket": "agents",
+      "bytes": 3321,
+      "sha256": "b79836bca627ca53f18e9d831ec2973ac2d803945fa1e3fc5d9ab8c94679a59d"
+    },
+    "agents/loomsphere-builder.agent.md": {
+      "bucket": "agents",
+      "bytes": 2434,
+      "sha256": "25929f9874113c56b5e472630194aaff676967ece0684808ad71755386bfde4e"
+    },
+    "agents/loomsphere-intake.agent.md": {
+      "bucket": "agents",
+      "bytes": 3914,
+      "sha256": "6b56b8b6d5f37bd54bb94f1f4a282052ad51970ec7e3ec06ddeb08c87ba76f56"
+    },
+    "agents/loomsphere-qa.agent.md": {
+      "bucket": "agents",
+      "bytes": 2669,
+      "sha256": "9fa3734d47d847415fb592a00201b3c9fdaf13869ba7d4356edabd07d55ed5c4"
+    },
+    "agents/loomsphere-reviewer.agent.md": {
+      "bucket": "agents",
+      "bytes": 2512,
+      "sha256": "bd06940425d545343ce850cb7ddcfe28a3ec5861fecc36a6bdcbcd59a7e311ea"
+    },
+    "agents/loomsphere-security-reviewer.agent.md": {
+      "bucket": "agents",
+      "bytes": 3434,
+      "sha256": "8d85bcae5c576fd60c02257a420bd9ca41557efb3e0dd370692a6eed5002a696"
+    },
+    "agents/loomsphere-ux-reviewer.agent.md": {
+      "bucket": "agents",
+      "bytes": 3487,
+      "sha256": "38a40a690e75b0a083a002ca445218966880b280d0ce2ee115b214e3c56aaf81"
+    },
+    "contracts/README.md": {
+      "bucket": "contracts",
+      "bytes": 29358,
+      "sha256": "64daa90ca44940729f3c51b994ac2c0dbfe18dd9b1aeafe3430c2a46ee3d7fec"
+    },
+    "contracts/agent-catalog.schema.json": {
+      "bucket": "contracts",
+      "bytes": 7896,
+      "sha256": "6951285387be0f214c49c787752b4ff1c24f44de85617ff18c2a4fb2b20fe6b0"
+    },
+    "contracts/examples/LS-DOC-001/handoff-01-architect.json": {
+      "bucket": "contracts",
+      "bytes": 2611,
+      "sha256": "e1c576d096cc266c7f500bbffa41a4b49d86a8be68402280ae29031dc9c4d7e7"
+    },
+    "contracts/examples/LS-DOC-001/handoff-02-builder.json": {
+      "bucket": "contracts",
+      "bytes": 3357,
+      "sha256": "6796fbd43793cf1c924dd70248d40b655a285c7556592b2a7b5b87d0c107cf3c"
+    },
+    "contracts/examples/LS-DOC-001/handoff-03-qa.json": {
+      "bucket": "contracts",
+      "bytes": 4775,
+      "sha256": "fd8935940ed244f687f134262cfdf9bcdf7e3aca0594ce918266b4a5743a3543"
+    },
+    "contracts/examples/LS-DOC-001/handoff-04-reviewer.json": {
+      "bucket": "contracts",
+      "bytes": 3856,
+      "sha256": "853998499a89def7a510ef312827fa6d162854191453c5d45f669731afa61bc4"
+    },
+    "contracts/examples/LS-DOC-001/task.json": {
+      "bucket": "contracts",
+      "bytes": 6015,
+      "sha256": "bb975b95ff2cd32a9eeee61dcb7402ebce49c376d4229f795ab71983912eeead"
+    },
+    "contracts/examples/LS-DOC-002/handoff-01-architect.json": {
+      "bucket": "contracts",
+      "bytes": 2454,
+      "sha256": "2e1b51deeb662f937441e9ba650453ae37a23859ce9b7b52ff0fdb36b947d10e"
+    },
+    "contracts/examples/LS-DOC-002/handoff-02-builder.json": {
+      "bucket": "contracts",
+      "bytes": 2985,
+      "sha256": "eb61a5f022c228857c6f80ce805840de9844b17fb0beaad254728aa2c4434a19"
+    },
+    "contracts/examples/LS-DOC-002/handoff-03-qa.json": {
+      "bucket": "contracts",
+      "bytes": 4268,
+      "sha256": "048fbf321605d9052d3782751b6c69f683ed75fb89100ba1829260000c3ab2fe"
+    },
+    "contracts/examples/LS-DOC-002/handoff-04-reviewer.json": {
+      "bucket": "contracts",
+      "bytes": 3384,
+      "sha256": "f893c13e4f5bae732aa639a35fd62b020882aef85613484a3b6e8b98f4603b2a"
+    },
+    "contracts/examples/LS-DOC-002/handoff-05-reviewer.json": {
+      "bucket": "contracts",
+      "bytes": 3040,
+      "sha256": "126d33ab44cafc86328ed006a90f9c4cf6fa808fbe19ea1d5db19e8e2f07a544"
+    },
+    "contracts/examples/LS-DOC-002/handoff-06-qa.json": {
+      "bucket": "contracts",
+      "bytes": 3707,
+      "sha256": "7154ebe7c00e46bc2d38c620e9594d3d970e189f9ef4d509f4f5d6c30e662867"
+    },
+    "contracts/examples/LS-DOC-002/task.json": {
+      "bucket": "contracts",
+      "bytes": 6244,
+      "sha256": "918b6ed926fa9b777759256bc18950dcf7a3a84ba3d87e5f1eaacd7e7f66c5e3"
+    },
+    "contracts/execution-evidence.schema.json": {
+      "bucket": "contracts",
+      "bytes": 13165,
+      "sha256": "18055c243687fa67d580b631a5fc593fea9bf13988fb045f95894da43381eb67"
+    },
+    "contracts/handoff-contract.schema.json": {
+      "bucket": "contracts",
+      "bytes": 29481,
+      "sha256": "f4f6a40ef07911ff45e5cbbd299b9ff216d1e1a4ce5a4e457cb98149e05dd52d"
+    },
+    "contracts/task-contract.schema.json": {
+      "bucket": "contracts",
+      "bytes": 26211,
+      "sha256": "948050671bd8baacf65230c1cd5add32245fd94f32a8d2472326317f2df40550"
+    },
+    "copilot-instructions.md": {
+      "bucket": "instructions",
+      "bytes": 4289,
+      "sha256": "e633f076511565b8afd23a55b08ded0353eee94ae3edfc46a5792c1edf1c7cba"
+    },
+    "hooks/README.md": {
+      "bucket": "hooks",
+      "bytes": 4626,
+      "sha256": "be2804a5c8e75f7af1ee7f462c8764a9afea40fa43cc98b5fd9364cfc21568e1"
+    },
+    "skills/acceptance-test-design/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 3293,
+      "sha256": "cfcda667882905e6600f8fe9fe944d1f6a2c1cda4298cfc2ac7f6215bbf5809e"
+    },
+    "skills/accessibility-testing/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 2491,
+      "sha256": "a507d845ef25cf7961c8307a369ff263923a789431050309053d6e7abba2f1b3"
+    },
+    "skills/architecture-conformance/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 1155,
+      "sha256": "6ed581cabf341b520b75446e404e6f57e6bfbbb866e370345dee48e8010bcfa0"
+    },
+    "skills/database-migration/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 2832,
+      "sha256": "c12659dbc498596c9aa382e415b5c4fb4eb18c151d6fe990e189eb8ef706bd86"
+    },
+    "skills/engineering-review/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 2075,
+      "sha256": "fdb334a6d5574a0ac26a3dd444fa1e407d0942756aa09c9945d07317e9924a40"
+    },
+    "skills/frontend-implementation/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 2719,
+      "sha256": "f42c7f4f3a621c92cc990bca91befd28eac132b947d204955d3cce963696dbf5"
+    },
+    "skills/intake-triage/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 3075,
+      "sha256": "9792cd770141fd986de77f919e38de1f7b788c6ee61267b8dc99418d62c3c671"
+    },
+    "skills/requirements-analysis/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 2183,
+      "sha256": "fea371d52313530578d3240d293061210122e6461d66af5a62cbc4be38bbd22a"
+    },
+    "skills/requirements-audit/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 3144,
+      "sha256": "95ec814dc0e0e5138d28235557bb0b720cd41b6bac649bc6ef3739aaf806e9e3"
+    },
+    "skills/safe-implementation/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 1975,
+      "sha256": "1dfc653462228d50cbcad9ab27fa3ae9809537f30a1ae509b23a5e2c8bea2eeb"
+    },
+    "skills/safe-validation/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 1985,
+      "sha256": "e63e765e67567c580b3a62c1fd248501a8ac346ef39adaf39b3427f56170a058"
+    },
+    "skills/security-review/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 3386,
+      "sha256": "882d077813384c3476d5550fc8d29377cf62c2f8861b6d41777819cb258342bb"
+    },
+    "skills/ux-ui-review/SKILL.md": {
+      "bucket": "skills",
+      "bytes": 3879,
+      "sha256": "29c8f17bc2ef3dc985fc799afac824a6eeafc91f3270202610b352d778fa0ef0"
+    }
+  },
+  "buckets": {
+    "agents": "agent definitions (personas) that a role executes",
+    "catalog": "review-specialist catalog entries",
+    "contracts": "task, handoff, evidence, and catalog JSON Schemas and examples",
+    "hooks": "lifecycle hook registry (data only)",
+    "instructions": "repository-level instructions for human and agent contributors",
+    "skills": "SKILL.md procedures a role may load"
+  },
+  "catalog": [
+    {
+      "file": "agents/catalog/security.json",
+      "name": "security",
+      "read_only": true,
+      "role": "security-reviewer",
+      "skills": [
+        "security-review",
+        "engineering-review"
+      ],
+      "stage": "security-review",
+      "tools": [
+        "read",
+        "search"
+      ]
+    },
+    {
+      "file": "agents/catalog/ux.json",
+      "name": "ux",
+      "read_only": true,
+      "role": "ux-reviewer",
+      "skills": [
+        "ux-ui-review",
+        "engineering-review"
+      ],
+      "stage": "ux-review",
+      "tools": [
+        "read",
+        "search"
+      ]
+    }
+  ],
+  "core_roles_named_in_runtime_code": [
+    "intake",
+    "architect",
+    "builder",
+    "qa",
+    "reviewer"
+  ],
+  "counts": {
+    "agents": 7,
+    "buckets": {
+      "agents": 9,
+      "contracts": 17,
+      "hooks": 1,
+      "instructions": 1,
+      "skills": 13
+    },
+    "bytes": 223893,
+    "catalog": 2,
+    "files": 41,
+    "hooks": 0,
+    "skills": 13
+  },
+  "hooks": [],
+  "manifest_version": 1,
+  "skills": [
+    {
+      "file": "skills/acceptance-test-design/SKILL.md",
+      "name": "acceptance-test-design",
+      "required": false,
+      "roles": [
+        "architect",
+        "qa"
+      ],
+      "stages": [
+        "architecture",
+        "validation"
+      ]
+    },
+    {
+      "file": "skills/accessibility-testing/SKILL.md",
+      "name": "accessibility-testing",
+      "required": false,
+      "roles": [
+        "qa",
+        "ux-reviewer"
+      ],
+      "stages": [
+        "validation",
+        "ux-review"
+      ]
+    },
+    {
+      "file": "skills/architecture-conformance/SKILL.md",
+      "name": "architecture-conformance",
+      "required": false,
+      "roles": [
+        "architect",
+        "reviewer"
+      ],
+      "stages": [
+        "architecture",
+        "review"
+      ]
+    },
+    {
+      "file": "skills/database-migration/SKILL.md",
+      "name": "database-migration",
+      "required": false,
+      "roles": [
+        "builder"
+      ],
+      "stages": [
+        "implementation"
+      ]
+    },
+    {
+      "file": "skills/engineering-review/SKILL.md",
+      "name": "engineering-review",
+      "required": false,
+      "roles": [
+        "reviewer",
+        "security-reviewer",
+        "ux-reviewer"
+      ],
+      "stages": [
+        "review",
+        "security-review",
+        "ux-review"
+      ]
+    },
+    {
+      "file": "skills/frontend-implementation/SKILL.md",
+      "name": "frontend-implementation",
+      "required": false,
+      "roles": [
+        "builder"
+      ],
+      "stages": [
+        "implementation"
+      ]
+    },
+    {
+      "file": "skills/intake-triage/SKILL.md",
+      "name": "intake-triage",
+      "required": false,
+      "roles": [
+        "intake"
+      ],
+      "stages": [
+        "intake"
+      ]
+    },
+    {
+      "file": "skills/requirements-analysis/SKILL.md",
+      "name": "requirements-analysis",
+      "required": false,
+      "roles": [
+        "architect",
+        "intake"
+      ],
+      "stages": [
+        "intake",
+        "architecture"
+      ]
+    },
+    {
+      "file": "skills/requirements-audit/SKILL.md",
+      "name": "requirements-audit",
+      "required": false,
+      "roles": [
+        "qa",
+        "reviewer"
+      ],
+      "stages": [
+        "validation",
+        "review"
+      ]
+    },
+    {
+      "file": "skills/safe-implementation/SKILL.md",
+      "name": "safe-implementation",
+      "required": false,
+      "roles": [
+        "builder"
+      ],
+      "stages": [
+        "implementation"
+      ]
+    },
+    {
+      "file": "skills/safe-validation/SKILL.md",
+      "name": "safe-validation",
+      "required": false,
+      "roles": [
+        "builder",
+        "qa"
+      ],
+      "stages": [
+        "implementation",
+        "validation"
+      ]
+    },
+    {
+      "file": "skills/security-review/SKILL.md",
+      "name": "security-review",
+      "required": false,
+      "roles": [
+        "security-reviewer"
+      ],
+      "stages": [
+        "security-review"
+      ]
+    },
+    {
+      "file": "skills/ux-ui-review/SKILL.md",
+      "name": "ux-ui-review",
+      "required": false,
+      "roles": [
+        "ux-reviewer"
+      ],
+      "stages": [
+        "ux-review"
+      ]
+    }
+  ],
+  "source": {
+    "commit": "a3d88d4f45e75480a52ca4b04776207d3c08fde2",
+    "prefix": ".github",
+    "repository": "gkamga/loomsphere"
+  },
+  "suite_digest": "d63e813839290391e0b3479f50856b33eff8e4f1ae530134bb0bbd5dddd85fc7"
+}
