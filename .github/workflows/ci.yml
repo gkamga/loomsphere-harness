@@ -32,7 +32,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   runtime:
-    name: Standalone runtime tests (Python ${{ matrix.python }})
+    name: Full test suite (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -56,8 +56,11 @@ jobs:
           python tools/validate_harness.py
       # No secret is needed: models are scripted, and the live acceptance test
       # skips itself unless LOOMSPHERE_ACCEPTANCE_API_KEY is set (never set in CI).
-      - name: Run the runtime tests
-        run: python -m unittest tests.test_runtime tests.test_runtime_hooks_routing -v
+      # The whole suite, so the workspace, sandbox, validation, and implementation
+      # loop boundaries are exercised on every supported interpreter, not only the
+      # one the validators use.
+      - name: Run the whole test suite
+        run: python -m unittest discover -s tests -v
       - name: Smoke-test the installed CLI
         run: loomsphere-harness --help
 
