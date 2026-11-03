@@ -7,12 +7,12 @@ first — every file here is Markdown with YAML front-matter or JSON validated
 against a JSON Schema — so it can be consumed by any repository, with or without
 the LoomSphere application.
 
-**Status: phase 2B (independent consumption and CI).** The declarative harness is
-here, byte-identical to the assets it was extracted from, self-validating in CI,
-and installable into any Git repository with [one script](docs/CONSUMING.md). The
-portable Python engine (catalog loader, skill selection, routing, hook evaluator,
-prompt composition, runners) still lives in the LoomSphere application and is a
-later phase. See [Scope and remaining work](#scope-and-remaining-work).
+**Status: phase 2C.1 (standalone Intake → Architect → human approval).** The
+declarative harness remains byte-verified and installable into any Git repository
+with [one script](docs/CONSUMING.md). This phase adds a Python package and CLI that
+reuse portable LoomSphere catalog, prompt, routing, hook, schema, and runner
+components ([docs/RUNTIME.md](docs/RUNTIME.md)). Builder/QA/Reviewer, the database
+queue, API, and authentication stay in the LoomSphere application.
 
 ## Layout
 
@@ -24,6 +24,8 @@ later phase. See [Scope and remaining work](#scope-and-remaining-work).
 ├─ contracts/              4 JSON Schemas + worked examples
 └─ copilot-instructions.md repository instructions for human and agent contributors
 docs/workflows/            lifecycle, execution-contract, and evidence documents the assets link to
+docs/RUNTIME.md            standalone runtime and CLI (phase 2C.1)
+src/loomsphere_harness/    the portable runtime package (pyproject.toml)
 docs/CONSUMING.md          install, pin, verify, update, and revert in another repository
 consumer-paths.json        the files a consuming repository owns that the assets link to
 harness.manifest.json      inventory: every asset, its digest, its role, suite and docs digests
@@ -47,10 +49,11 @@ which specialist review a change requires, which lifecycle hooks may refuse a
 transition, and which contract a handoff must satisfy.
 
 It **is not** authorization. Loading a skill grants no tool, and a persona is not
-a permission. The deterministic gates — human scope approval, delivery approval,
-the frozen route, the sandbox, the acceptance audit — are enforced by application
-code in the consuming repository, never by anything in this repository. A file
-here may be wrong, ignored, or overridden by a model update; a gate cannot be.
+a permission. The standalone CLI grants the model only read tools and stops at an
+explicit proposal-digest-bound human decision; it cannot start implementation.
+LoomSphere's scope approval, delivery approval, frozen route, sandbox, and
+acceptance audit remain enforced by the application. A file here may be wrong,
+ignored, or overridden by a model update; a gate cannot be.
 
 ## Consuming it
 
@@ -104,14 +107,27 @@ Delivered in phase 2B:
 - **Installation** with pinning, conflict detection, verification, update, and
   uninstall ([docs/CONSUMING.md](docs/CONSUMING.md)).
 
+Delivered in phase 2C.1:
+
+- **Portable runtime package and CLI** ([docs/RUNTIME.md](docs/RUNTIME.md)):
+  catalog and skill loading/selection, prompt composition, Intake and Architect
+  contracts, PydanticAI/OpenAI-compatible execution, portable hook loading and
+  evaluation, and deterministic specialist routing.
+- **Standalone workflow:** SQLite persistence and audit evidence, explicit
+  identity, repository, approval, and read-only execution-environment seams. The
+  only runnable stages are Intake and Architect; the workflow stops at human
+  approval or rejection of the exact proposal digest.
+- **LoomSphere consumption:** the application imports the shared portable policy
+  and data types while retaining its PostgreSQL-backed queue, authentication,
+  database hook records, API, and later lifecycle gates.
+
 Still deferred:
 
-1. **The Python engine.** `agent_catalog`, `skills`, `skill_selection`,
-   `routing`, `lifecycle_hooks`, `implementation_prompts`, `agent_runner`,
-   `sandbox`, and the contract validator remain in the application. Moving them
-   needs a harness-only settings object, a pure/durable split of the hook and
-   protected-verification modules, and a principal/persistence seam.
-2. **Application documents.** `acceptance-contract.md` and the historical legacy
-   reconciliation describe LoomSphere code and stay in the application.
-3. **Distribution.** No package is published. A consumer pins a commit or tag and
-   installs with the script.
+1. **Implementation stages (Phase 2C.2):** Builder, QA, Reviewer, sandbox
+   execution, protected verification, delivery, and the application’s existing
+   implementation queue. This milestone does not authorize or implement them.
+2. **Application-owned concerns:** database operations, API endpoints,
+   authentication, ownership, application scope approval, and hook payloads or
+   durable hook records that depend on those concerns.
+3. **Distribution:** no package is published; consumers pin a commit or tag and
+   install declarative assets with the script.

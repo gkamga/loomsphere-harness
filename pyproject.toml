@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loomsphere-harness"
+version = "0.1.0"
+description = "Portable LoomSphere harness runtime: Intake, Architect, and explicit human approval."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.11",
+    "pydantic-ai-slim[openai]>=2.64.0",
+    "pydantic-ai-harness>=0.64.0",
+]
+
+[project.optional-dependencies]
+# Used by the asset validators and the existing harness tests, not by the runtime.
+dev = [
+    "PyYAML==6.0.3",
+    "jsonschema==4.26.0",
+]
+
+[project.scripts]
+loomsphere-harness = "loomsphere_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
