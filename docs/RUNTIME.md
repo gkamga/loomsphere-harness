@@ -1,9 +1,20 @@
-# Standalone runtime (phase 2C.1)
+# Standalone runtime (phase 2C.2)
 
 `loomsphere-harness` is the portable runtime and a minimal CLI for one workflow:
-**Intake → Architect → explicit human approval.** It stops there. There is no
-Builder, QA, or Reviewer command or code path, and the state schema only accepts
-`intake` and `architect` runs.
+
+```
+Intake → Architect → recorded human approval → Builder → validation
+      → QA → Reviewer → recorded human acceptance
+```
+
+Every stage is a real command; nothing depends on a LoomSphere frontend, backend,
+or control-plane database. State is one SQLite file outside the target repository,
+and the only model call boundary is the `AgentRunner` seam. The loop stops at a
+human acceptance decision: it never mirrors a push, opens a pull request, or merges.
+
+Phase 2C.1 shipped Intake → Architect → approval. Phase 2C.2 adds the
+build/verify/review loop and delivery acceptance on top of the same runtime; the
+store is now schema v2 and migrates an existing v1 state file in place.
 
 ## Install
 
@@ -38,7 +49,31 @@ api_key_env = "LOOMSPHERE_MODEL_API_KEY"         # NAME of the env var holding t
 
 [state]
 # dir = "/path/outside/repo"   # default: ~/.local/share/loomsphere-harness/projects/<hash>
+
+[workspace]
+# root = "~/.local/state/loomsphere-harness/workspaces"
+# default: a "workspaces" directory beside the state file; never inside the repo
+
+[sandbox]                                    # required before any implementation run
+image = "python:3.12-slim"                   # must exist locally; pinned by sha256 id per run
+# runtime = "docker"                         # container runtime only: docker or podman
+# cpus = 2.0, memory_mb = 2048, pids_limit = 256, tmpfs_mb = 256
+# timeout_seconds = 300, startup_grace_seconds = 30
+# network = "none"                           # any other value is refused
+
+[validation]
+# allowlist = [["python", "-m", "pytest", "-q"]]   # narrows the built-in allowlist
+# timeout_seconds = 900, excerpt_chars = 4000
+
+[implementation]
+# max_iterations = 2                         # Builder attempts before the loop fails
 ```
+
+A `[sandbox]` table without `image` is refused, as is `runtime = "host"` and any
+`network` other than `none`: there is no host execution fallback and no internal
+network. Configuration sections are `harness`, `model`, `state`, `workspace`,
+`sandbox`, `validation`, `implementation`; anything else is refused rather than
+ignored.
 
 A key written in the file is rejected. Remote endpoints must be `https`; `http` is
 accepted only for `localhost`/loopback. Examples of `base_url`/`approved_hosts`:
@@ -60,12 +95,18 @@ loomsphere-harness --repo . run T-0001         # Intake, then Architect (read-on
 loomsphere-harness --repo . show T-0001        # proposal, criteria, digest
 loomsphere-harness --repo . approve T-0001 --digest <proposal sha256>
 loomsphere-harness --repo . reject  T-0001 --digest <sha256> --reason "..."
+loomsphere-harness --repo . implement T-0001   # Builder, validation, QA, Reviewer
+loomsphere-harness --repo . changes T-0001     # recorded change set of the deliverable
+loomsphere-harness --repo . evidence T-0001    # validation run and review evidence
+loomsphere-harness --repo . accept  T-0001 --digest <deliverable sha256> [--reason "..."]
+loomsphere-harness --repo . reject-delivery T-0001 --digest <sha256> --reason "..."
 loomsphere-harness --repo . status [T-0001]    # state, runs, model, prompt digests, tools
 loomsphere-harness --repo . audit  [T-0001]    # hash-chained audit trail, verified
 ```
 
 `--json` gives machine-readable output. Exit codes: `0` ok, `2` refused (error on
-stderr), `3` `run` did not reach `awaiting_approval`.
+stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
+`implement` → `awaiting_acceptance`, `changes`/`evidence` → no deliverable).
 
 ## What is enforced
 
@@ -88,6 +129,68 @@ stderr), `3` `run` did not reach `awaiting_approval`.
   requirement.
 - **Restart**: all state is SQLite. A run left `running` by a crash is marked
   `interrupted` on the next command and the stage can be re-run with `run`.
+- **Isolated worktree**: the Builder never runs in the developer's checkout. Each
+  task gets `task-<key>` at `workspace_root/task-<key>` on branch
+  `loomsphere/task-<key>`, created from the approved `HEAD`. The workspace root must
+  not overlap the target repository, and every git call is argument-listed, time
+  limited, and hook- and signature-free.
+- **Container-only validation**: the planned validation command runs in the
+  configured image, resolved to its `sha256:` image id *before* the run. Every
+  invocation carries `--rm`, `--network none`, a read-only root filesystem, a
+  tmpfs `/tmp`, dropped capabilities, `--security-opt no-new-privileges`, a
+  non-root user, CPU/memory/PID limits, and only the workspace mounted. The digest
+  of the tree is taken before and after; a changed tree fails the iteration. No
+  sandbox configuration means the command is refused (`sandbox-not-configured`),
+  never attempted on the host.
+- **Validation is planned, not requested**: the runtime picks the command from the
+  project's own files (`pyproject.toml`, `tests/`, `package.json`, …), constrained
+  by `[validation] allowlist`. A command outside the allowlist is refused before
+  anything runs; there is no model-supplied command.
+- **Deliverable**: the reviewed commit, changed files, diff excerpt, executed
+  validation evidence, QA and Reviewer reports, and the frozen acceptance contract
+  are hashed into one deliverable digest. A path outside the worktree, a secret
+  file, secret-shaped content, an oversized file, or too many files fails the
+  change set before delivery (`unauthorized-path`, `secret-path`, `secret-content`,
+  `file-too-large`, `too-many-files`).
+- **Acceptance** is a human decision bound to that exact deliverable digest: a
+  different digest, an undecided task, or a task that is not
+  `awaiting_acceptance` is refused (`digest-mismatch`, `not-awaiting-acceptance`).
+- **Output truncation** is reported, never silent: a run whose output hit the token
+  limit records `truncation` signals, its `finish_reason`, and the token counts, and
+  the stage fails rather than treating a partial response as complete.
+
+## The implementation loop
+
+`implement T-0001` requires an `approved` (or reworkable `changes_required`) task
+and a `[sandbox]` image; anything else is refused before a model call. One
+iteration is:
+
+1. **Builder** writes inside the task worktree and answers with a build report
+   (`summary`, `files`, `acceptance_criteria`, `tests_run`, `notes`).
+2. The runtime commits the worktree — a change that touches a path outside the
+   worktree, a secret file, or nothing at all fails the iteration
+   (`unauthorized-path`, `secret-path`, `no-changes`).
+3. **Validation** plans and executes the allowlisted command in the container and
+   records the command, status, exit code, duration, image, workspace digest, and
+   output digest.
+4. **QA** reports `passed` or `failed` with findings and a claim per approved
+   criterion. A `failed` verdict, a blocking finding, or a criterion the report
+   never mentions sends the iteration back to the Builder with feedback.
+5. **Reviewer** reports `accepted`, `changes-required`, or `rejected`. Accepted
+   freezes the deliverable and moves the task to `awaiting_acceptance`.
+
+Iteration statuses are `building`, `built`, `validating`, `qa_running`,
+`review_running`, `ready`, `changes_required`, and the terminal `failed`,
+`validation_failed`, `qa_failed`, `review_failed`. Failure reasons are
+`iterations-exhausted`, `invalid-build-report`, `invalid-qa-report`,
+`invalid-review-report`, `validation-failed`, `qa-blocked`,
+`review-changes-required`, `review-rejected`, and
+`acceptance-contract-unavailable`. Reaching the limit is not a crash: every
+attempt stays recorded, the task is left `changes_required`, and a human decides
+what happens next.
+
+Rework reuses the same `base_commit` and produces a new commit, so two attempts
+are always distinguishable in `status` and in the audit trail.
 
 ## Import surface for LoomSphere
 
@@ -102,6 +205,12 @@ Reused modules keep their LoomSphere names so the application can re-export them
 | `loomsphere_harness.schemas.{architect_proposal,intake,acceptance_contract}` | `schemas.*` |
 | `loomsphere_harness.lifecycle_hooks` (`load_registry`, `evaluate`, `evaluate_hook`, `registry_digest`, `LifecycleHookBlocked`) and `.schemas.lifecycle_hooks` | pure loader/evaluator half of `services.lifecycle_hooks`, `schemas.lifecycle_hooks` |
 | `loomsphere_harness.routing` (classification, `resolve_route`, route digests, change inspection) | `services.routing` (verbatim; DB-free) |
+| `loomsphere_harness.workspace` (`ensure_task_workspace`, `commit_worktree`, `inspect_change_set`, `workspace_digest`) | `services.agent_workspace` and `services.workspace_state` |
+| `loomsphere_harness.sandbox` (`SandboxPolicy`, `SandboxExecutor`, `ExecutionEvidence`) | `services.sandbox` |
+| `loomsphere_harness.validation` (`plan_validation`, `execute_validation`, `ValidationOutcome`) | `services.validation` |
+| `loomsphere_harness.reports` (`parse_build_report`, `parse_qa_report`, `parse_review_verdict`, `missing_criteria`) | `services.report_contracts` |
+| `loomsphere_harness.implementation_prompt` (`compose_builder_prompt`, `compose_qa_prompt`, `compose_reviewer_prompt`, `scope_block`) | `services.implementation_prompt` |
+| `loomsphere_harness.implementation.ImplementationStage` | the Builder/QA/Reviewer half of `services.implementation` |
 | `loomsphere_harness.harness_settings.bind_settings` | binds app settings for the catalog loader |
 
 `current_catalog()` in the package reads the bound settings; the app binds its own.
@@ -125,6 +234,12 @@ boundary (`workspace_path`, `writable`); the engine refuses a writable one, alwa
 invokes the runner with `read_only=True`, and the model holds only read tools.
 `AgentRunner` executes the model; the environment says *where* it may read.
 
+The loop adds two further seams: `ImplementationStage` receives the `Engine` (so a
+consumer can substitute the store, identity, repository, or runner), and
+`Engine(..., sandbox_executor=...)` replaces the container executor without
+touching the policy, the plan, or the recorded evidence shape. Tests use exactly
+these seams to exercise the real gates with a scripted model and a fake runtime.
+
 ## Hooks and routing
 
 **Lifecycle hooks.** The loader, the check evaluators, and the registry digest are
@@ -138,29 +253,35 @@ unusable registry fails closed (`hook-registry-*`) before any run starts. With n
 hook registered nothing is evaluated or recorded, so behaviour is as before.
 Application-owned and deliberately **not** extracted: payload construction from
 PostgreSQL rows, the `lifecycle_hook_executions` table, and the
-`before-review-progression` / `before-delivery` guards, which belong to
-Builder/QA/Reviewer and delivery stages that do not exist here.
+`before-review-progression` / `before-delivery` guards, which the application
+evaluates against its own delivery records. The standalone loop enforces the same
+outcome with its own gates (report contract validation, criterion coverage, the
+digest-bound delivery decision) rather than the application's hook payloads.
 
 **Routing.** `routing.py` (specialist specs, requirement classification, review
 route resolution and digests, change inspection) is vendored verbatim and importable
-for the application. It is **not wired into the CLI**: a review route is frozen from
-the approved proposal and exists to choose specialist reviews of a Builder result.
-Intake→Architect→approval has no change to route, so the standalone workflow only
-records Intake's specialist recommendations. Importing `routing` is safe without bound settings: the
-`SPECIALISTS`-style compatibility snapshots are computed lazily on first access and
-the functions resolve the catalog per call, so `bind_settings(...)` is needed only
-when they are used.
+for the application. It is **not wired into the loop**: a review route is frozen
+from the approved proposal and exists to choose specialist reviews of a Builder
+result. The standalone workflow runs one general Reviewer stage and only records
+Intake's specialist recommendations. Importing `routing` is safe without bound
+settings: the `SPECIALISTS`-style compatibility snapshots are computed lazily on
+first access and the functions resolve the catalog per call, so
+`bind_settings(...)` is needed only when they are used.
 
 ## Tests and acceptance
 
 ```sh
 pip install -e '.[dev]'
-python -m unittest discover -s tests          # runtime + existing harness tests
+python -m unittest discover -s tests          # 215 tests; runtime and harness assets
 # CI also runs this on Python 3.11, 3.13, and 3.14; it needs no secret.
 ```
 
-The runtime tests use a scripted model; they make no network call. A live run is
-opt-in and skipped without credentials:
+The tests make no network call and start no container. They exercise the real
+gates — worktree creation and screening, the sandbox command line and its digest
+binding, the validation plan, report extraction, the approval and delivery
+digests — and fake only two things: the model (`FunctionModel` with a scripted
+response) and the container runtime (an injected executor or `sandbox_executor`).
+A live run is opt-in and skipped without credentials:
 
 ```sh
 LOOMSPHERE_ACCEPTANCE_API_KEY=... \
@@ -168,3 +289,9 @@ LOOMSPHERE_ACCEPTANCE_MODEL=deepseek/deepseek-v4.1-flash-1017 \
   python -m unittest tests.test_runtime.LiveAcceptance
 # optional: LOOMSPHERE_ACCEPTANCE_BASE_URL (default https://openrouter.ai/api/v1)
 ```
+
+A live implementation run additionally needs a locally present sandbox image,
+because the runtime pins it by `sha256:` id before executing anything. The
+repository's asset validators (`tools/validate_assets.py`) report pre-existing
+example-contract errors for `scripts/validate_factory.py`; that path does not exist
+at this branch's base or here, and this milestone does not touch it.
