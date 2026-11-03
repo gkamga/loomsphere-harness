@@ -1,7 +1,10 @@
 """``loomsphere-harness`` command line: Intake -> Architect -> human approval.
 
-There is deliberately no Builder, QA, or Reviewer command. The commands are
-init, submit, run, show, approve, reject, status, and audit.
+Phase 2C.2 adds the implementation loop. ``implement`` runs Builder, validation, QA,
+and Reviewer inside a private worktree; ``changes`` and ``evidence`` show what was
+produced; ``accept`` and ``reject-delivery`` record the second human decision. Every
+approval and delivery decision requires the SHA-256 digest shown by the preceding
+read command, so a decision can never be recorded against something else.
 """
 
 from __future__ import annotations
@@ -16,19 +19,30 @@ from loomsphere_harness.assets import AssetIntegrityError
 from loomsphere_harness.config import ConfigError, load_config
 from loomsphere_harness.approval import ApprovalError
 from loomsphere_harness.engine import Engine, EngineError, state_path
+from loomsphere_harness.implementation_prompt import LoopPromptError
+from loomsphere_harness.reports import ReportError
 from loomsphere_harness.repository import GitRepository, OsUserIdentity, RepositoryError
+from loomsphere_harness.sandbox import SandboxError
+from loomsphere_harness.schemas.acceptance_contract import AcceptanceContractError
 from loomsphere_harness.store import SqliteStore, StoreError
+from loomsphere_harness.validation import ValidationPlanError
+from loomsphere_harness.workspace import WorkspaceError
 
-COMMANDS = ("init", "submit", "run", "show", "approve", "reject", "status", "audit")
+COMMANDS = (
+    "init", "submit", "run", "show", "approve", "reject", "implement", "changes",
+    "evidence", "accept", "reject-delivery", "status", "audit",
+)
 EXPECTED_ERRORS = (
     ConfigError, AssetIntegrityError, EngineError, StoreError, RepositoryError, ApprovalError,
+    WorkspaceError, SandboxError, ValidationPlanError, ReportError, LoopPromptError,
+    AcceptanceContractError,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="loomsphere-harness",
-        description="Standalone LoomSphere Intake -> Architect -> approval runtime.",
+        description="Standalone LoomSphere Intake -> Architect -> approval -> delivery runtime.",
     )
     parser.add_argument("--config", help="TOML configuration file")
     parser.add_argument("--repo", default=".", help="path inside the target Git repository")
@@ -53,6 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
     reject.add_argument("task")
     reject.add_argument("--digest", required=True)
     reject.add_argument("--reason", required=True)
+    implement = sub.add_parser(
+        "implement", help="build, validate, review an approved task (Builder, QA, Reviewer)")
+    implement.add_argument("task")
+    changes = sub.add_parser("changes", help="show the recorded change set of the deliverable")
+    changes.add_argument("task")
+    evidence = sub.add_parser("evidence", help="show the validation and review evidence")
+    evidence.add_argument("task")
+    accept = sub.add_parser("accept", help="accept the exact deliverable digest")
+    accept.add_argument("task")
+    accept.add_argument("--digest", required=True, help="deliverable SHA-256 shown by `changes`")
+    accept.add_argument("--reason")
+    reject_delivery = sub.add_parser(
+        "reject-delivery", help="reject the exact deliverable digest")
+    reject_delivery.add_argument("task")
+    reject_delivery.add_argument("--digest", required=True)
+    reject_delivery.add_argument("--reason", required=True)
     status = sub.add_parser("status", help="task state and execution evidence")
     status.add_argument("task", nargs="?")
     audit = sub.add_parser("audit", help="audit trail (verifies the hash chain)")
@@ -117,8 +147,123 @@ def render_task(view: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_iterations(view: dict[str, Any]) -> str:
+    """Task status plus every recorded iteration, newest evidence last."""
+
+    task = view["task"]
+    lines = [f"{task['id']}  {task['status']}  {task['title']}"]
+    implementation = view.get("implementation")
+    if implementation:
+        headline = f"implementation: {implementation.get('result')}"
+        if implementation.get("reason"):
+            headline += f" ({implementation['reason']})"
+        lines.append(headline)
+        if implementation.get("detail"):
+            lines.append(f"  {implementation['detail']}")
+    for item in view.get("iterations") or []:
+        lines += [
+            "",
+            f"iteration {item['number']}  {item['status']}"
+            + (f"  {item['base_commit'][:12]} -> {item['commit_sha'][:12]}"
+               if item.get("commit_sha") else ""),
+        ]
+        report = item.get("build_report") or {}
+        if report.get("summary"):
+            lines.append(f"  builder: {report['summary']}")
+            for entry in report.get("files") or []:
+                lines.append(f"    {entry.get('change', ''):<10} {entry.get('path', '')}")
+        validation = item.get("validation") or {}
+        if validation.get("command"):
+            lines.append(
+                f"  validation: {' '.join(validation['command'])} -> {validation.get('status')}"
+                f" (exit {validation.get('exit_code')})"
+            )
+        qa = item.get("qa_report") or {}
+        if qa.get("verdict"):
+            lines.append(f"  qa: {qa['verdict']} — {qa.get('summary', '')}")
+        review = item.get("review_report") or {}
+        if review.get("verdict"):
+            lines.append(f"  review: {review['verdict']} — {review.get('summary', '')}")
+        if item.get("failure_reason"):
+            lines.append(f"  failure: {item['failure_reason']} — {item.get('failure_detail') or ''}")
+    deliverable = view.get("deliverable")
+    if deliverable:
+        document = deliverable["document"]
+        lines += [
+            "",
+            f"Deliverable {deliverable['digest']}",
+            f"  commit {document['iteration']['commit']}  branch {document['iteration']['branch']}",
+            f"  changed files {len(document['changed_files'])}"
+            f"  criteria {len(document['acceptance_contract']['criteria'])}",
+        ]
+    acceptance = view.get("acceptance")
+    if acceptance:
+        lines.append(f"Delivery {acceptance['decision']} by {acceptance['actor']}")
+    return "\n".join(lines)
+
+
+def render_changes(view: dict[str, Any]) -> str:
+    """The generated change set, as it was frozen into the deliverable."""
+
+    deliverable = view.get("deliverable")
+    if not deliverable:
+        return f"{view['task']['id']}  {view['task']['status']}  no deliverable recorded"
+    document = deliverable["document"]
+    iteration = document["iteration"]
+    lines = [
+        f"Deliverable {deliverable['digest']}",
+        f"base {iteration['base_commit']}  head {iteration['commit']}  branch {iteration['branch']}",
+        f"workspace digest {iteration['workspace_digest']}",
+        "",
+        "Changed files:",
+        *(f"  {entry['change']:<10} {entry['path']}" for entry in document["changed_files"]),
+        "",
+        "Diff excerpt:",
+        document["diff_excerpt"],
+        "",
+        "Acceptance contract:",
+        *(f"  {item['id']}  {item['text']}" for item in document["acceptance_contract"]["criteria"]),
+    ]
+    return "\n".join(lines)
+
+
+def render_evidence(view: dict[str, Any]) -> str:
+    """The executed validation run and the recorded review evidence."""
+
+    deliverable = view.get("deliverable")
+    if not deliverable:
+        return f"{view['task']['id']}  {view['task']['status']}  no deliverable recorded"
+    document = deliverable["document"]
+    validation = document["validation"]
+    record = validation["record"]
+    lines = [
+        f"Deliverable {deliverable['digest']}",
+        "",
+        "Executed validation:",
+        f"  command {' '.join(record['command'])}",
+        f"  status {record['status']}  exit {record['exit_code']}  {record['duration_ms']} ms",
+        f"  image {record.get('sandbox_image')} ({record.get('sandbox_image_id')})",
+        f"  workspace digest {record['workspace_digest']}",
+        f"  output digest {record['output_digest']}",
+        "",
+        "Output excerpt:",
+        str(record.get("output") or "(empty)"),
+    ]
+    for label, key in (("QA", "qa"), ("Reviewer", "review")):
+        report = document[key]["report"]
+        lines += ["", f"{label} verdict: {report['verdict']} — {report['summary']}"]
+        for finding in report["findings"]:
+            lines.append(f"  [{finding['severity']}] {finding['description']}")
+        for claim in report["acceptance_criteria"]:
+            lines.append(f"  {claim['criterion_id']}  {claim['status']}  {claim.get('evidence', '')}")
+    return "\n".join(lines)
+
+
 def render_status(view: dict[str, Any]) -> str:
-    lines = [render_task({**view, "proposal": None, "intake": None, "approval": None}).splitlines()[0], "Runs:"]
+    lines = [
+        render_task({**view, "proposal": None, "intake": None, "approval": None}).splitlines()[0],
+        "Runs:",
+    ]
     for run in view["runs"]:
         usage = (run.get("events") or {}).get("usage") or {}
         lines.append(
@@ -129,6 +274,13 @@ def render_status(view: dict[str, Any]) -> str:
         activity = (run.get("events") or {}).get("tool_activity") or []
         if activity:
             lines.append("    tools: " + ", ".join(sorted({a["tool"] for a in activity})))
+        truncation = (run.get("events") or {}).get("truncation") or {}
+        if truncation:
+            lines.append(
+                "    truncated: signals=" + ",".join(truncation.get("signals") or [])
+                + f" finish_reason={truncation.get('finish_reason')}"
+                + f" tokens={truncation.get('output_tokens')}/{truncation.get('max_output_tokens')}"
+            )
     return "\n".join(lines)
 
 
@@ -159,6 +311,26 @@ def run_command(args: argparse.Namespace) -> int:
                     else engine.reject(args.task, proposal_digest=args.digest, reason=args.reason))
         _emit(args, decision, f"{decision['decision']} {args.task} "
               f"(proposal {decision['proposal_digest'][:12]}) by {decision['actor']}")
+    elif command == "implement":
+        view = engine.implement(args.task)
+        _emit(args, view, render_iterations(view))
+        return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
+    elif command in ("changes", "evidence"):
+        engine.recover()
+        view = engine.describe(args.task)
+        render = render_changes if command == "changes" else render_evidence
+        _emit(args, view, render(view))
+        return 0 if view.get("deliverable") else 3
+    elif command in ("accept", "reject-delivery"):
+        engine.recover()
+        decision = (
+            engine.accept_delivery(args.task, deliverable_digest=args.digest, reason=args.reason)
+            if command == "accept"
+            else engine.reject_delivery(
+                args.task, deliverable_digest=args.digest, reason=args.reason)
+        )
+        _emit(args, decision, f"{decision['decision']} {args.task} "
+              f"(deliverable {decision['deliverable_digest'][:12]}) by {decision['actor']}")
     elif command == "status":
         engine.recover()
         if args.task:

@@ -32,6 +32,7 @@ from loomsphere_harness.engine import EngineError, state_path  # noqa: E402
 from loomsphere_harness.pydantic_harness import (  # noqa: E402
     PydanticHarnessConfig, PydanticHarnessRunner, READ_TOOLS, tools_for,
 )
+from loomsphere_harness import store  # noqa: E402
 from loomsphere_harness.store import SqliteStore, StoreError  # noqa: E402
 
 
@@ -145,12 +146,10 @@ class WorkflowAndRestart(RuntimeCase):
 
 
 class Gates(RuntimeCase):
-    def test_no_builder_qa_or_reviewer_path(self) -> None:
-        self.assertEqual(set(cli.COMMANDS),
-                         {"init", "submit", "run", "show", "approve", "reject", "status", "audit"})
-        for name in ("builder", "qa", "reviewer"):
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                cli.build_parser().parse_args([name])
+    def test_only_declared_run_roles_are_stored(self) -> None:
+        # Schema v2 admits the implementation roles; anything outside the declared
+        # set must still be refused by the database itself.
+        self.assertEqual(store.RUN_ROLES, ("intake", "architect", "builder", "qa", "reviewer"))
         engine, task_id = self.submitted()
         db = sqlite3.connect(self.state)
         self.addCleanup(db.close)
@@ -158,7 +157,7 @@ class Gates(RuntimeCase):
         with self.assertRaises(sqlite3.IntegrityError):
             db.execute(
                 "INSERT INTO runs (id, task_id, role, status, started_at)"
-                " VALUES ('r', ?, 'builder', 'running', 'now')", (task_id,))
+                " VALUES ('r', ?, 'auditor', 'running', 'now')", (task_id,))
 
     def test_cannot_approve_before_a_proposal_exists(self) -> None:
         engine, task_id = self.submitted()

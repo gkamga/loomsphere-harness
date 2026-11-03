@@ -1,15 +1,16 @@
-"""Intake -> Architect -> explicit human approval, and nothing after it.
+"""The standalone workflow: Intake -> Architect -> approval -> delivery.
 
-This is the whole standalone workflow of phase 2C.1. It reuses the LoomSphere
-prompt composers, skill selection, catalog, schemas, and PydanticAI runner, and
-adds only what a portable runtime must own: configuration, SQLite persistence, a
-local identity, a Git repository provider, and the approval gate. There is no
-Builder, QA, or Reviewer stage here and no code path that starts one; the run table
-accepts only the ``intake`` and ``architect`` roles.
+Phase 2C.1 established Intake, Architect, and the explicit human approval gate.
+Phase 2C.2 adds the stages that turn an approval into reviewed software: Builder,
+executed validation, QA, Reviewer, and a second human decision on the deliverable.
+The loop itself lives in ``loomsphere_harness.implementation``; this module owns the
+configuration, persistence, identity, repository provider, prompt composition, and
+the single place where a model invocation is dispatched and recorded.
 
-Authority never comes from a model: the approver is the local identity, an approval
-must quote the SHA-256 digest of the exact stored proposal, and the model holds only
-read-only file tools.
+Authority never comes from a model: the approvers are the local identity, an
+approval must quote the SHA-256 digest of the exact stored proposal, a delivery
+decision must quote the digest of the exact frozen deliverable, and only the
+Builder role is granted a writable worktree.
 """
 
 from __future__ import annotations
@@ -17,13 +18,18 @@ from __future__ import annotations
 import dataclasses
 import os
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from pydantic import ValidationError
 
 from loomsphere_harness.agent_catalog import AgentCatalogError, load_catalog
-from loomsphere_harness.agent_runner import AgentExecutionError, AgentInvocation
+from loomsphere_harness.agent_runner import (
+    AgentExecutionError,
+    AgentInvocation,
+    AgentRunResult,
+)
 from loomsphere_harness.architect_prompt import (
     ArchitectPromptError,
     ComposedPrompt,
@@ -88,10 +94,41 @@ from loomsphere_harness.skills import SkillLoadError, declared_tools
 
 INTAKE = "intake"
 ARCHITECT = "architect"
-#: The only stages this runtime can execute.
-STAGES = (INTAKE, ARCHITECT)
+BUILDER = "builder"
+QA = "qa"
+REVIEWER = "reviewer"
+#: The stages this runtime executes, in workflow order.
+STAGES = (INTAKE, ARCHITECT, BUILDER, QA, REVIEWER)
+#: Stages a model performs during the implementation loop.
+IMPLEMENTATION_STAGES = (BUILDER, QA, REVIEWER)
 FAILURE_INVALID_INTAKE = "invalid-intake"
 FAILURE_INVALID_PROPOSAL = "invalid-proposal"
+
+
+@dataclass(frozen=True)
+class RoleOutcome:
+    """What one implementation-stage invocation produced.
+
+    ``error`` is a recorded, fail-closed outcome: the run row already carries the
+    failure, so the loop only has to decide what the iteration status becomes.
+    """
+
+    run_id: str
+    result: AgentRunResult | None = None
+    error: AgentExecutionError | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.result is not None
+
+    @property
+    def response_text(self) -> str:
+        return self.result.response_text if self.result is not None else ""
+
+    @property
+    def events(self) -> dict[str, object]:
+        return self.result.events if self.result is not None else {}
+
 
 
 class LocalReadOnlyEnvironment:
@@ -148,6 +185,7 @@ class Engine:
         runner_factory: Callable[[Any], AgentRunner] | None = None,
         approvals: ApprovalGate | None = None,
         environment: ExecutionEnvironment | None = None,
+        sandbox_executor: Any | None = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -162,6 +200,8 @@ class Engine:
             store=store, identity=identity, repository=repository)
         # Test seam: the default is the real PydanticAI adapter.
         self._runner_factory = runner_factory or PydanticHarnessRunner
+        # Test seam: the default is a container executor built from the settings.
+        self.sandbox_executor = sandbox_executor
 
     # -- setup ---------------------------------------------------------------
     def _assets(self) -> TrustedAssets:
@@ -174,6 +214,14 @@ class Engine:
             raise
         bind_settings(CatalogSettings(assets))
         return assets
+
+    @property
+    def workspace_root(self) -> Path:
+        """Where task worktrees live: configured, else beside the state file."""
+
+        if self.config.workspace_root is not None:
+            return self.config.workspace_root.expanduser().resolve()
+        return (self.store.path.parent / "workspaces").resolve()
 
     def initialize(self) -> dict[str, Any]:
         assets = self._assets()
@@ -331,6 +379,96 @@ class Engine:
         if outcome.blocked:
             raise LifecycleHookBlocked(event=event, hook=denying_hook(outcome), reason=outcome.reason)
 
+    # -- implementation stages ----------------------------------------------------
+    def persona_and_skills(
+        self, task: dict[str, Any], role: str
+    ) -> tuple[str, Path, SkillSelection]:
+        """Load the role persona and the skills the task facts select."""
+
+        assets = self._assets()
+        definition = assets.persona_path(role)
+        persona = load_persona_text(
+            definition,
+            role=role.capitalize(),
+            missing_code=f"{role.upper()}_PERSONA_MISSING",
+            empty_code=f"{role.upper()}_PERSONA_EMPTY",
+        )
+        facts = TaskFacts(task["title"], task["requirements"], task["acceptance_criteria"])
+        selection = select_role_skills(
+            facts, role=role, stage=STAGE_FOR_ROLE[role], definition_path=definition,
+            skills_root=assets.skills_root, tools=declared_tools(definition),
+        )
+        return persona, definition, selection
+
+    def invoke_role(
+        self,
+        *,
+        task: dict[str, Any],
+        role: str,
+        composed: ComposedPrompt,
+        selection: SkillSelection,
+        expect: tuple[str, ...],
+        running: str,
+        failed: str,
+        workspace_path: Path,
+        writable: bool,
+    ) -> RoleOutcome:
+        """Invoke one implementation role and record its run.
+
+        A failed invocation is recorded here and returned, never raised: the loop
+        owns the iteration's status. A lifecycle hook that blocks still raises,
+        because the run it guards must not be treated as ordinary evidence.
+        """
+
+        if role not in IMPLEMENTATION_STAGES:  # pragma: no cover - guarded by callers
+            raise EngineError("stage-not-supported", f"{role} is not an implementation stage.")
+        task_id = task["id"]
+        actor = self.identity.current().id
+        assets = self._assets()
+        try:
+            hooks = load_registry(assets.hooks_root)
+        except HookDefinitionError as error:
+            self.store.audit(task_id, actor, f"{role}.hook-registry-invalid", {"code": error.code})
+            raise EngineError(error.code, f"The lifecycle hook registry is unusable: {error}") from error
+        definition = assets.persona_path(role)
+        model_config = dataclasses.replace(
+            self.config.model, workspace_root=str(workspace_path)
+        )
+        model_name, runtime = runtime_identity(model_config)
+        invocation = AgentInvocation(
+            run_id=uuid.uuid4(),
+            workspace_path=workspace_path,
+            prompt=composed.text,
+            timeout_seconds=self.config.timeout_seconds,
+            read_only=not writable,
+            allowed_tools=declared_tools(definition),
+            role=role,
+        )
+        run_id = self.store.begin_run(
+            task_id=task_id, role=role, expect=expect, running_status=running, actor=actor,
+            evidence={
+                "prompt_digest": composed.digest, "persona_digest": composed.persona_digest,
+                "catalog_digest": load_catalog(str(assets.catalog_root), str(assets.agents_root),
+                                               str(assets.skills_root)).digest,
+                "suite_digest": assets.suite_digest, "skill_selection": selection.evidence(),
+                "model": model_name, "runtime": runtime,
+            },
+        )
+        snapshot = self.repository.snapshot()
+        try:
+            self._dispatch_hooks(BEFORE_AGENT_INVOCATION, hooks, task, task_id, run_id, role,
+                                 snapshot.commit, composed.digest, selection, actor)
+            result = self._runner_factory(model_config).run(invocation)
+            self._dispatch_hooks(AFTER_AGENT_COMPLETION, hooks, task, task_id, run_id, role,
+                                 snapshot.commit, composed.digest, selection, actor)
+        except AgentExecutionError as error:
+            self.store.fail_run(run_id=run_id, task_id=task_id, failed_status=failed,
+                                running_status=running, actor=actor, reason=error.reason,
+                                detail=error.detail, response_text=error.response_text,
+                                events=error.events)
+            return RoleOutcome(run_id=run_id, error=error)
+        return RoleOutcome(run_id=run_id, result=result)
+
     def _record_intake(self, task_id, run_id, running, failed, actor, result) -> None:
         try:
             assessment = parse_intake_assessment(result.response_text)
@@ -426,6 +564,42 @@ class Engine:
         self._task(task_id)
         return self.approvals.reject(task_id, proposal_digest=proposal_digest, reason=reason)
 
+    # -- implementation, review, and human acceptance -----------------------------
+    def implement(self, task_id: str) -> dict[str, Any]:
+        """Run the approved implementation loop: Builder, validation, QA, Reviewer."""
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        self.recover()
+        outcome = ImplementationStage(self).run(task_id)
+        return {"implementation": outcome, **self.describe(task_id)}
+
+    def accept_delivery(
+        self, task_id: str, *, deliverable_digest: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Record a human acceptance of the frozen deliverable."""
+
+        self.recover()
+        self._task(task_id)
+        return self.store.decide_delivery(
+            task_id=task_id, deliverable_digest=deliverable_digest, decision="accepted",
+            actor=self.identity.current().id, reason=reason,
+        )
+
+    def reject_delivery(
+        self, task_id: str, *, deliverable_digest: str, reason: str
+    ) -> dict[str, Any]:
+        """Record a human rejection of a deliverable with a required reason."""
+
+        if not reason.strip():
+            raise EngineError("reason-required", "A rejection needs a reason.")
+        self.recover()
+        self._task(task_id)
+        return self.store.decide_delivery(
+            task_id=task_id, deliverable_digest=deliverable_digest, decision="rejected",
+            actor=self.identity.current().id, reason=reason,
+        )
+
     # -- read model ----------------------------------------------------------------
     def _task(self, task_id: str) -> dict[str, Any]:
         task = self.store.task(task_id)
@@ -441,6 +615,9 @@ class Engine:
             "intake": self.store.intake(task_id),
             "proposal": proposal,
             "approval": self.store.approval(task_id),
+            "iterations": self.store.iterations(task_id),
+            "deliverable": self.store.deliverable(task_id),
+            "acceptance": self.store.acceptance(task_id),
             "runs": [
                 {k: v for k, v in run.items() if k != "response_text"}
                 for run in self.store.runs(task_id)
