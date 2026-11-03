@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import getpass
 import io
 import json
 import os
@@ -13,12 +14,14 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from runtime_support import (  # noqa: E402
-    HARNESS_ROOT, INTAKE_ASSESSMENT, PROPOSAL, RuntimeCase, model_config, scripted_model,
+    HARNESS_ROOT, INTAKE_ASSESSMENT, PROPOSAL, LIVE_ACCEPTANCE_CRITERIA,
+    LIVE_REQUIREMENT, LiveFastApiCase, RuntimeCase, model_config, scripted_model,
 )
 
 from loomsphere_harness import cli  # noqa: E402
@@ -380,11 +383,38 @@ class CommandLine(RuntimeCase):
         self.assertIn("not-awaiting-approval", err)
 
 
-@unittest.skipUnless(
-    os.environ.get("LOOMSPHERE_ACCEPTANCE_API_KEY") and os.environ.get("LOOMSPHERE_ACCEPTANCE_MODEL"),
-    "live acceptance needs LOOMSPHERE_ACCEPTANCE_API_KEY and LOOMSPHERE_ACCEPTANCE_MODEL",
+LIVE_ACCEPTANCE_ENABLED = bool(
+    os.environ.get("LOOMSPHERE_ACCEPTANCE_API_KEY")
+    and os.environ.get("LOOMSPHERE_ACCEPTANCE_MODEL")
 )
-class LiveAcceptance(RuntimeCase):
+LIVE_ACCEPTANCE_SKIP = (
+    "live acceptance needs LOOMSPHERE_ACCEPTANCE_API_KEY and LOOMSPHERE_ACCEPTANCE_MODEL"
+)
+#: The runtime default output budget (4096) is tuned for terse scripted and small
+#: models. A verbose hosted model narrates before it emits the fenced contract and
+#: was observed truncating its assessment mid-JSON, which the parser then reported
+#: as an unrelated contract error. This is a per-run resource limit in the live
+#: configuration only; it grants no tool, no path, and no approval authority.
+LIVE_MAX_OUTPUT_TOKENS = 16_000
+LIVE_TIMEOUT_SECONDS = 300
+
+
+def acceptance_model() -> PydanticHarnessConfig:
+    """The opt-in live model configuration, read only from the environment."""
+
+    base_url = os.environ.get("LOOMSPHERE_ACCEPTANCE_BASE_URL", "https://openrouter.ai/api/v1")
+    host = (urlsplit(base_url).hostname or "").lower()
+    return model_config(
+        base_url=base_url,
+        model_id=os.environ["LOOMSPHERE_ACCEPTANCE_MODEL"],
+        approved_hosts=(host,),
+        api_key=os.environ["LOOMSPHERE_ACCEPTANCE_API_KEY"],
+        max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
+    )
+
+
+@unittest.skipUnless(LIVE_ACCEPTANCE_ENABLED, LIVE_ACCEPTANCE_SKIP)
+class LiveAcceptance(LiveFastApiCase):
     """Runs the real Intake -> Architect flow against an OpenAI-compatible endpoint.
 
     Defaults to OpenRouter and the requested acceptance model; set
@@ -392,17 +422,162 @@ class LiveAcceptance(RuntimeCase):
     key is read from the environment and never written anywhere.
     """
 
+    def assert_awaiting_approval(self, view: dict) -> None:
+        """Fail with the persisted Intake findings, not just the status mismatch."""
+
+        if view["task"]["status"] == "awaiting_approval":
+            return
+        lines = [
+            f"task {view['task']['id']} ended in {view['task']['status']!r}; "
+            "expected 'awaiting_approval'"
+        ]
+        intake = view.get("intake")
+        if intake:
+            document = intake.get("document") or {}
+            blocking = [item for item in document.get("ambiguities", []) if item.get("blocking")]
+            lines.append(f"persisted intake digest: {intake.get('digest')}")
+            if blocking:
+                lines.append("blocking Intake questions recorded in the assessment:")
+                for item in blocking:
+                    lines.append(f"  - {item.get('question')}")
+                    if item.get("why_it_matters"):
+                        lines.append(f"    why it matters: {item['why_it_matters']}")
+            else:
+                lines.append("the persisted assessment recorded no blocking questions")
+        else:
+            lines.append("no intake assessment was persisted")
+        for run in view.get("runs", []):
+            if run.get("status") != "succeeded":
+                events = run.get("events") or {}
+                usage = events.get("usage") or {}
+                lines.append(
+                    f"run {run.get('role')}: {run.get('status')} "
+                    f"reason={run.get('failure_reason')} detail={run.get('failure_detail')}"
+                )
+                lines.append(
+                    "  usage: "
+                    f"requests={usage.get('requests')} "
+                    f"input_tokens={usage.get('input_tokens')} "
+                    f"output_tokens={usage.get('output_tokens')} "
+                    f"duration_ms={events.get('duration_ms')} "
+                    f"max_output_tokens={(events.get('limits') or {}).get('max_output_tokens')}"
+                )
+        self.fail("\n".join(lines))
+
     def test_live_intake_architect_and_approval(self) -> None:
-        from urllib.parse import urlsplit
-        base_url = os.environ.get("LOOMSPHERE_ACCEPTANCE_BASE_URL", "https://openrouter.ai/api/v1")
-        model = model_config(base_url=base_url, model_id=os.environ["LOOMSPHERE_ACCEPTANCE_MODEL"],
-                             approved_hosts=((urlsplit(base_url).hostname or "").lower(),),
-                             api_key=os.environ["LOOMSPHERE_ACCEPTANCE_API_KEY"])
-        engine, task_id = self.submitted(config=self.config(model))
+        engine, task_id = self.submitted_live(config=self.live_config(acceptance_model()))
         view = engine.run(task_id)
-        self.assertEqual(view["task"]["status"], "awaiting_approval", view["runs"])
-        engine.approve(task_id, proposal_digest=view["proposal"]["digest"])
-        self.assertEqual(self.engine().describe(task_id)["task"]["status"], "approved")
+        self.assert_awaiting_approval(view)
+
+        intake = view["intake"]
+        self.assertIsNotNone(intake, "Intake assessment was not persisted")
+        self.assertFalse(
+            [item for item in intake["document"]["ambiguities"] if item["blocking"]],
+            f"blocking questions: {intake['document']['ambiguities']}",
+        )
+        self.assertEqual([run["role"] for run in view["runs"]], ["intake", "architect"])
+        self.assertTrue(all(run["status"] == "succeeded" for run in view["runs"]), view["runs"])
+
+        proposal = view["proposal"]
+        self.assertIsNotNone(proposal, "Architect proposal was not persisted")
+        digest = proposal["digest"]
+        self.assertEqual(proposal["status"], "pending")
+
+        # Approval is bound to the digest of the exact stored proposal.
+        with self.assertRaises(StoreError) as wrong:
+            engine.approve(task_id, proposal_digest="0" * 64)
+        self.assertEqual(wrong.exception.code, "digest-mismatch")
+        self.assertEqual(engine.describe(task_id)["task"]["status"], "awaiting_approval")
+
+        decision = engine.approve(task_id, proposal_digest=digest)
+        self.assertEqual((decision["decision"], decision["proposal_digest"]), ("approved", digest))
+        self.assertEqual(decision["actor"], "alice")
+
+        # Restart evidence: a new engine, connection, and read model agree.
+        reopened = self.engine()
+        shown = reopened.describe(task_id)
+        self.assertEqual(shown["task"]["status"], "approved")
+        self.assertEqual(shown["proposal"]["digest"], digest)
+        self.assertEqual(shown["proposal"]["document"], proposal["document"])
+        self.assertEqual(shown["approval"]["proposal_digest"], digest)
+        self.assertEqual(shown["approval"]["decision"], "approved")
+        self.assertIn("proposal.approved",
+                      [event["event"] for event in reopened.store.audit_events(task_id)])
+        self.assertGreaterEqual(reopened.store.verify_audit_chain(), 6)
+
+
+@unittest.skipUnless(LIVE_ACCEPTANCE_ENABLED, LIVE_ACCEPTANCE_SKIP)
+class LiveCliApproval(LiveFastApiCase):
+    """Operator-driven live run through the real CLI.
+
+    Unlike ``LiveAcceptance``, which calls the engine API, this drives
+    init/submit/run/show/approve/status/audit exactly as an operator would and
+    records the approval under the local OS identity. It demonstrates explicit
+    human review rather than a test-actor approval.
+    """
+
+    def invoke(self, *argv: str) -> tuple[int, str, str]:
+        base_url = os.environ.get("LOOMSPHERE_ACCEPTANCE_BASE_URL", "https://openrouter.ai/api/v1")
+        host = (urlsplit(base_url).hostname or "").lower()
+        config = self.tmp / "live-config.toml"
+        config.write_text(
+            "[harness]\n"
+            f'root = "{HARNESS_ROOT}"\n'
+            "[model]\n"
+            'provider = "openai-compatible"\n'
+            f'base_url = "{base_url}"\n'
+            f'model_id = "{os.environ["LOOMSPHERE_ACCEPTANCE_MODEL"]}"\n'
+            f'approved_hosts = ["{host}"]\n'
+            'api_key_env = "LOOMSPHERE_ACCEPTANCE_API_KEY"\n'
+            f"timeout_seconds = {LIVE_TIMEOUT_SECONDS}\n"
+            f"max_output_tokens = {LIVE_MAX_OUTPUT_TOKENS}\n"
+            "[state]\n"
+            f'dir = "{self.state.parent}"\n',
+            encoding="utf-8",
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["--config", str(config), "--repo", str(self.repo), *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_operator_cli_review_and_approval(self) -> None:
+        code, out, _ = self.invoke("init")
+        self.assertEqual(code, 0, out)
+
+        requirements = self.tmp / "requirements.md"
+        acceptance = self.tmp / "acceptance.md"
+        requirements.write_text(LIVE_REQUIREMENT, encoding="utf-8")
+        acceptance.write_text(LIVE_ACCEPTANCE_CRITERIA, encoding="utf-8")
+        code, out, err = self.invoke(
+            "submit", "--title", "Add GET /hello to the FastAPI service",
+            "--requirements-file", str(requirements),
+            "--acceptance-file", str(acceptance),
+        )
+        self.assertEqual((code, out.strip()), (0, "submitted T-0001"), err)
+
+        # Exit code 3 means the task did not reach awaiting_approval; the rendered
+        # task then carries the exact blocking Intake questions.
+        code, out, err = self.invoke("run", "T-0001")
+        self.assertEqual(code, 0, out + err)
+
+        code, out, _ = self.invoke("--json", "show", "T-0001")
+        self.assertEqual(code, 0, out)
+        view = json.loads(out)
+        self.assertEqual(view["task"]["status"], "awaiting_approval")
+        digest = view["proposal"]["digest"]
+
+        code, out, err = self.invoke("approve", "T-0001", "--digest", digest)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("approved T-0001", out)
+        self.assertIn(getpass.getuser(), out)
+
+        code, out, _ = self.invoke("status", "T-0001")
+        self.assertEqual(code, 0, out)
+        self.assertIn("approved", out)
+
+        code, out, _ = self.invoke("audit", "T-0001")
+        self.assertEqual(code, 0, out)
+        self.assertIn("chain verified", out)
 
 
 if __name__ == "__main__":

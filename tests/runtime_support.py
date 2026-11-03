@@ -110,3 +110,105 @@ class RuntimeCase(unittest.TestCase):
         task = engine.submit(title="Hello", requirements="Add GET /hello.",
                              acceptance_criteria="GET /hello returns 200.")
         return engine, task["id"]
+
+
+#: The live acceptance requirement. It is deliberately complete: the entry point,
+#: the response contract, the preserved behaviour, the test approach, and the
+#: explicit exclusions are all stated, so a blocking Intake question would be a real
+#: finding rather than an artifact of an underspecified request.
+LIVE_REQUIREMENT = (
+    "Add a GET /hello endpoint to the existing FastAPI application. The endpoint "
+    'requires no parameters and returns HTTP 200 with JSON body {"message": '
+    '"Hello, world!"}. Use the existing application entry point, preserve existing '
+    "routes, and add a pytest test using FastAPI TestClient. No authentication, "
+    "database, frontend, external integrations, or deployment are required. The "
+    "project is disposable and local-only."
+)
+
+LIVE_ACCEPTANCE_CRITERIA = "\n".join((
+    "1. GET /hello returns HTTP 200.",
+    '2. Response JSON equals {"message": "Hello, world!"}.',
+    "3. Existing application routes remain unchanged.",
+    "4. Automated pytest verifies the endpoint response.",
+))
+
+#: A small, real FastAPI project with an explicit entry point, an existing route,
+#: and an existing test. It is disposable and never deployed.
+LIVE_FASTAPI_FILES = {
+    "README.md": """# Disposable FastAPI acceptance fixture
+
+This repository is a small, local-only FastAPI project used by the live acceptance
+test. It is disposable and never deployed.
+
+- Application entry point: `app/main.py`; the ASGI application object is `app`.
+- Existing route: `GET /health` returns `{"status": "ok"}`.
+- Existing test file: `tests/test_health.py`; run `pytest` from the repository root.
+""",
+    "requirements.txt": "fastapi\nuvicorn\npytest\nhttpx\n",
+    "app/__init__.py": '"""FastAPI acceptance fixture package."""\n',
+    "app/main.py": '''"""Explicit application entry point for the disposable acceptance fixture."""
+
+from fastapi import FastAPI
+
+app = FastAPI(title="LoomSphere acceptance fixture")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """An existing route that new work must preserve."""
+
+    return {"status": "ok"}
+''',
+    "tests/__init__.py": "",
+    "tests/test_health.py": '''"""Existing automated test for the fixture's only route."""
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health_route() -> None:
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+''',
+}
+
+
+class LiveFastApiCase(RuntimeCase):
+    """A disposable FastAPI project for the opt-in live acceptance tests.
+
+    ``RuntimeCase`` gives offline tests a README-only repository, which is enough
+    for a scripted model but underspecified for a real Intake assessment. This
+    fixture adds a real application entry point, an existing route, and an existing
+    test so the live request can be assessed without invented requirements.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        for relative, content in LIVE_FASTAPI_FILES.items():
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "fastapi fixture"],
+                       check=True)
+
+    def submitted_live(self, **engine_kwargs) -> tuple[Engine, str]:
+        engine = self.engine(**engine_kwargs)
+        engine.initialize()
+        task = engine.submit(
+            title="Add GET /hello to the FastAPI service",
+            requirements=LIVE_REQUIREMENT,
+            acceptance_criteria=LIVE_ACCEPTANCE_CRITERIA,
+        )
+        return engine, task["id"]
+
+    def live_config(self, model: PydanticHarnessConfig, *,
+                    timeout_seconds: int = 300) -> RuntimeConfig:
+        """The offline default (30s) is too short for real provider latency."""
+
+        return RuntimeConfig(harness_root=self.harness_root, state_dir=None,
+                             model=model, timeout_seconds=timeout_seconds)
