@@ -215,14 +215,49 @@ def _balanced_object(text: str) -> str | None:
     return None
 
 
-def extract_payload(text: str) -> dict[str, Any]:
-    candidates = [match.group(1) for match in FENCED_BLOCK_PATTERN.finditer(text)]
-    candidates.append(text)
-    balanced = _balanced_object(text)
-    if balanced is not None:
-        candidates.append(balanced)
+def _balanced_objects(text: str) -> list[str]:
+    """Every top-level balanced ``{...}`` span, in document order.
 
-    for candidate in reversed(candidates):
+    Scanning stops at the first brace that never closes. An inner fragment of a
+    damaged object is never offered as a candidate: accepting ``{"nested": 1}`` out
+    of ``{"outer": {"nested": 1}`` would hide the truncation instead of failing.
+    """
+
+    found: list[str] = []
+    index = 0
+    while True:
+        start = text.find("{", index)
+        if start == -1:
+            return found
+        span = _balanced_object(text[start:])
+        if span is None:
+            return found
+        found.append(span)
+        index = start + len(span)
+
+
+def payload_candidates(text: str) -> list[str]:
+    """The places a JSON payload may live, in the order they may be trusted.
+
+    The response contract asks for exactly one fenced ```json block, so a fenced
+    block is the agent's declared answer and is tried first, last block first.
+    Prose and inline spans are only fallbacks: a quoted JSON *example* in the
+    surrounding text must never override the payload the agent declared. The raw
+    response is the last resort, so a response that is nothing but an object still
+    parses. Ordering never weakens validation: a candidate must still parse and
+    still satisfy the contract, and no candidate at all fails closed.
+    """
+
+    fenced = [match.group(1) for match in FENCED_BLOCK_PATTERN.finditer(text)]
+    return [
+        *reversed(fenced),
+        *reversed(_balanced_objects(text)),
+        text,
+    ]
+
+
+def extract_payload(text: str) -> dict[str, Any]:
+    for candidate in payload_candidates(text):
         try:
             payload = json.loads(candidate)
         except json.JSONDecodeError:
@@ -310,6 +345,7 @@ __all__ = [
     "canonical_proposal",
     "extract_payload",
     "parse_architect_proposal",
+    "payload_candidates",
     "proposal_digest",
     "revision_coverage_error",
 ]
