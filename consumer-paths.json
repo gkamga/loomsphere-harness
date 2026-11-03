@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "description": "Files the harness assets name but a consuming repository owns. The harness never ships or installs these; it links to them because a skill or an agent tells the model to consult the consumer's own guidance. A bare harness checkout therefore cannot resolve them. tools/validate_harness.py resolves them against generated placeholders so the validator runs unmodified, and tests/test_consumer_paths.py fails if any asset depends on a path that is not declared here.",
+  "paths": [
+    {
+      "path": "README.md",
+      "referencedBy": [".github/copilot-instructions.md"],
+      "purpose": "The consuming repository's project overview.",
+      "ifAbsent": "The link in the installed instructions dangles; the instructions stay usable.",
+      "stub": "# Consumer README (placeholder generated for harness validation)\n"
+    },
+    {
+      "path": "docs/decisions/README.md",
+      "referencedBy": [
+        ".github/copilot-instructions.md",
+        ".github/contracts/README.md",
+        ".github/skills/acceptance-test-design/SKILL.md",
+        ".github/skills/architecture-conformance/SKILL.md",
+        ".github/skills/engineering-review/SKILL.md"
+      ],
+      "purpose": "The consuming repository's architecture decision record (ADR) governance.",
+      "ifAbsent": "Skills cite a missing governance document; set the equivalent policy in the consumer instructions.",
+      "stub": "# ADR governance (placeholder generated for harness validation)\n"
+    },
+    {
+      "path": "docs/decisions/adr-002-authentication.md",
+      "referencedBy": [".github/contracts/examples/LS-DOC-001/task.json", ".github/contracts/examples/LS-DOC-002/task.json"],
+      "purpose": "An accepted ADR that the worked contract examples cite. Only the examples depend on it.",
+      "ifAbsent": "Validating the bundled examples inside the consumer fails; the examples are reference material, not runtime input.",
+      "stub": "# ADR-002 (placeholder generated for harness validation)\n\n- **Status:** Accepted\n"
+    },
+    {
+      "path": "docs/architecture/execution-sandbox.md",
+      "referencedBy": [".github/skills/security-review/SKILL.md"],
+      "purpose": "The consuming repository's description of its execution sandbox.",
+      "ifAbsent": "The security-review skill cites a missing sandbox description.",
+      "stub": "# Execution sandbox (placeholder generated for harness validation)\n"
+    },
+    {
+      "path": "frontend/AGENTS.md",
+      "referencedBy": [".github/copilot-instructions.md", ".github/skills/ux-ui-review/SKILL.md"],
+      "purpose": "Frontend framework guidance owned by the consuming application.",
+      "ifAbsent": "Frontend guidance links dangle; a repository without a frontend can ignore them.",
+      "stub": "# Frontend guidance (placeholder generated for harness validation)\n"
+    },
+    {
+      "path": "scripts/validate.sh",
+      "referencedBy": [
+        ".github/skills/safe-implementation/SKILL.md",
+        ".github/skills/safe-validation/SKILL.md",
+        ".github/contracts/examples/LS-DOC-001/task.json"
+      ],
+      "purpose": "The consuming repository's single validation entry point that the safe-validation skill tells an agent to run.",
+      "ifAbsent": "The skills tell the agent to run a command that does not exist; provide an equivalent and say so in the consumer instructions.",
+      "stub": "#!/usr/bin/env bash\n# Placeholder generated for harness validation.\n"
+    },
+    {
+      "path": "scripts/validate_factory.py",
+      "referencedBy": [".github/contracts/examples/LS-DOC-001/handoff-03-qa.json", ".github/contracts/examples/LS-DOC-002/task.json"],
+      "purpose": "The validator the worked contract examples name in their records. Only the examples depend on it.",
+      "ifAbsent": "Validating the bundled examples inside the consumer fails; the examples are reference material.",
+      "stub": "# Placeholder generated for harness validation.\n"
+    }
+  ]
+}
