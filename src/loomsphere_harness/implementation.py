@@ -322,7 +322,7 @@ class ImplementationStage:
             )
 
         self.store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="qa.started",
+            iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
             fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": number},
         )
         qa_outcome = engine.invoke_role(
@@ -389,7 +389,7 @@ class ImplementationStage:
             )
 
         self.store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="review.started",
+            iteration_id=iteration_id, actor=actor, event="iteration.review-started",
             fields={"status": ITERATION_REVIEW_RUNNING}, detail={"iteration": number},
         )
         review_outcome = engine.invoke_role(
@@ -455,7 +455,7 @@ class ImplementationStage:
         engine = self.engine
         validation_config = engine.config.validation
         self.store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="validation.started",
+            iteration_id=iteration_id, actor=actor, event="iteration.validation-started",
             fields={"status": ITERATION_VALIDATING}, detail={"iteration_id": iteration_id},
         )
         try:

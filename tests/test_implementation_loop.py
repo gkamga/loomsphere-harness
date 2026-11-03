@@ -344,6 +344,24 @@ class ImplementationLoop(RuntimeCase):
         self.assertEqual(self.porcelain(self.repo), "")
         self.assertGreater(engine.store.verify_audit_chain(), 0)
 
+    def test_every_stage_start_is_recorded_once_under_one_name(self) -> None:
+        """A stage start must not appear twice, and iteration changes say so."""
+
+        engine, task_id, _ = self.approved_task()
+        engine.implement(task_id)
+
+        events = [event["event"] for event in engine.store.audit_events(task_id)]
+        for stage in ("intake", "architect", "builder", "qa", "reviewer"):
+            self.assertEqual(
+                events.count(f"{stage}.started"), 1,
+                f"{stage}.started should be recorded exactly once: {events}",
+            )
+        self.assertEqual(events.count("qa.started"), 1, events)
+        self.assertNotIn("review.started", events)
+        for transition in ("iteration.qa-started", "iteration.review-started",
+                           "iteration.validation-started"):
+            self.assertEqual(events.count(transition), 1, events)
+
     def test_the_delivery_decision_is_bound_to_the_deliverable_digest(self) -> None:
         engine, task_id, _ = self.approved_task()
         digest = engine.implement(task_id)["deliverable"]["digest"]

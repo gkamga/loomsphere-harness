@@ -192,6 +192,14 @@ what happens next.
 Rework reuses the same `base_commit` and produces a new commit, so two attempts
 are always distinguishable in `status` and in the audit trail.
 
+The trail names one event per fact: each stage start appears once as
+`intake.started`, `architect.started`, `builder.started`, `qa.started`, or
+`reviewer.started` (recorded by `store.begin_run`), its result as `*.recorded`, and
+each iteration transition as `iteration.built`, `iteration.validation-started`,
+`iteration.qa-started`, `iteration.review-started`, `iteration.ready`, or
+`iteration.failed`. A test asserts the start events appear exactly once, so the
+trail cannot drift into duplicate labels.
+
 ## Import surface for LoomSphere
 
 Reused modules keep their LoomSphere names so the application can re-export them:
@@ -272,7 +280,7 @@ first access and the functions resolve the catalog per call, so
 
 ```sh
 pip install -e '.[dev]'
-python -m unittest discover -s tests          # 215 tests; runtime and harness assets
+python -m unittest discover -s tests          # 216 tests; runtime and harness assets
 # CI also runs this on Python 3.11, 3.13, and 3.14; it needs no secret.
 ```
 
