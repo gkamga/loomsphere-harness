@@ -156,7 +156,7 @@ when they are used.
 ```sh
 pip install -e '.[dev]'
 python -m unittest discover -s tests          # runtime + existing harness tests
-# CI also runs this on Python 3.11 and 3.13; it needs no secret.
+# CI also runs this on Python 3.11, 3.13, and 3.14; it needs no secret.
 ```
 
 The runtime tests use a scripted model; they make no network call. A live run is
