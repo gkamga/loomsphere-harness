@@ -32,7 +32,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ASSET_ROOT = ROOT / ".github"
 MANIFEST_PATH = ROOT / "harness.manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+
+#: Directories under ``.github/`` that are this repository's own machinery, not a
+#: consumer asset: the harness CI workflow. They are neither digested into the
+#: suite nor installed, so adding or editing CI never changes the suite digest.
+EXCLUDED_ASSET_DIRS = ("workflows",)
+
+#: Harness documentation that sits beside ``.github/`` rather than inside it. The
+#: assets link to it with ``../../docs/...`` paths, so it keeps that relative
+#: position in a consumer. It is digested separately from the asset suite so a
+#: documentation edit does not change ``suite_digest``, which recorded runs cite.
+DOCS_ROOT = ROOT / "docs" / "workflows"
+CONSUMER_PATHS_FILE = "consumer-paths.json"
 
 BUCKETS = {
     "agents": "agent definitions (personas) that a role executes",
@@ -86,7 +98,10 @@ def _parse_frontmatter(text: str) -> dict[str, object]:
 
 def _collect() -> dict[str, object]:
     files = sorted(
-        path for path in ASSET_ROOT.rglob("*") if path.is_file()
+        path
+        for path in ASSET_ROOT.rglob("*")
+        if path.is_file()
+        and path.relative_to(ASSET_ROOT).parts[0] not in EXCLUDED_ASSET_DIRS
     )
     assets: dict[str, dict[str, object]] = {}
     for path in files:
@@ -161,6 +176,23 @@ def _collect() -> dict[str, object]:
         suite.update(str(assets[relative]["sha256"]).encode("ascii"))
         suite.update(b"\n")
 
+    docs: dict[str, dict[str, object]] = {}
+    companions = sorted(DOCS_ROOT.glob("*.md")) + [ROOT / CONSUMER_PATHS_FILE]
+    for path in companions:
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        docs[path.relative_to(ROOT).as_posix()] = {
+            "bytes": len(data),
+            "sha256": _sha256(data),
+        }
+    docs_suite = hashlib.sha256()
+    for relative in sorted(docs):
+        docs_suite.update(relative.encode("utf-8"))
+        docs_suite.update(b"\0")
+        docs_suite.update(str(docs[relative]["sha256"]).encode("ascii"))
+        docs_suite.update(b"\n")
+
     buckets: dict[str, int] = {}
     for entry in assets.values():
         buckets[entry["bucket"]] = buckets.get(entry["bucket"], 0) + 1
@@ -182,6 +214,8 @@ def _collect() -> dict[str, object]:
             "buckets": dict(sorted(buckets.items())),
         },
         "suite_digest": suite.hexdigest(),
+        "docs": docs,
+        "docs_digest": docs_suite.hexdigest(),
         "buckets": BUCKETS,
         "core_roles_named_in_runtime_code": list(CORE_ROLES),
     }

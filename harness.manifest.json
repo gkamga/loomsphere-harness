@@ -368,8 +368,27 @@
     "hooks": 0,
     "skills": 13
   },
+  "docs": {
+    "consumer-paths.json": {
+      "bytes": 3961,
+      "sha256": "9675d97d5df395fdad577c69312fe718f468d0d8d1fa8cdd91a33df1290aecc5"
+    },
+    "docs/workflows/agent-execution-contracts.md": {
+      "bytes": 21949,
+      "sha256": "7b962fc0783a5e669895b38d51251c42c47570fd968d48bf3369347b3d2aa78b"
+    },
+    "docs/workflows/execution-evidence.md": {
+      "bytes": 15820,
+      "sha256": "8c27ea03270fd02ef044ec95812f8f6e8c8721170fecdeadb9c5d10989127068"
+    },
+    "docs/workflows/feature-lifecycle.md": {
+      "bytes": 719,
+      "sha256": "64b222cc44543deca6b622cb63416de0469131a8bb76583aab9acac5252a463a"
+    }
+  },
+  "docs_digest": "8ee6b11a5dc06d4f1bb7df63e3160e92d22c320b01cd7f7af5683f596c88ccb0",
   "hooks": [],
-  "manifest_version": 1,
+  "manifest_version": 2,
   "skills": [
     {
       "file": "skills/acceptance-test-design/SKILL.md",
