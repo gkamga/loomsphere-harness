@@ -31,7 +31,7 @@ from loomsphere_harness.workspace import (
     validate_task_key,
     workspace_path_for,
 )
-from support import TempCase, make_consumer_repo
+from support import GIT_ENV, TempCase, make_consumer_repo
 
 
 class WorkspaceCase(TempCase):
@@ -200,7 +200,10 @@ class ChangeSetTests(WorkspaceCase):
         # commit_worktree always refuses an empty change, so this is the only way
         # a Builder could produce a reviewed commit with nothing in it.
         subprocess.run(
-            ["git", "-C", str(workspace.path), "commit", "--allow-empty", "-q", "-m", "empty"],
+            [
+                "git", "-C", str(workspace.path), *GIT_ENV,
+                "commit", "--allow-empty", "-q", "-m", "empty",
+            ],
             check=True,
         )
         empty = head_commit(workspace.path)
