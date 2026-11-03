@@ -1,0 +1,4 @@
+# The only third-party packages the harness validator imports. Versions match the
+# application's lock file so both repositories judge the assets with the same code.
+PyYAML==6.0.3
+jsonschema==4.26.0
