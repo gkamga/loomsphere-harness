@@ -384,9 +384,13 @@
     "docs/workflows/feature-lifecycle.md": {
       "bytes": 719,
       "sha256": "64b222cc44543deca6b622cb63416de0469131a8bb76583aab9acac5252a463a"
+    },
+    "docs/workflows/live-acceptance-2c2.md": {
+      "bytes": 4687,
+      "sha256": "d3b6a909251514c22d05ce94a5d69097a6260f4dcc831ab887c97c26008a54da"
     }
   },
-  "docs_digest": "8ee6b11a5dc06d4f1bb7df63e3160e92d22c320b01cd7f7af5683f596c88ccb0",
+  "docs_digest": "63afef70a53b5b170d8790a36606215425e141ff4a078fa37b6b095a46383d36",
   "hooks": [],
   "manifest_version": 2,
   "skills": [

@@ -574,6 +574,15 @@ class Engine:
         outcome = ImplementationStage(self).run(task_id)
         return {"implementation": outcome, **self.describe(task_id)}
 
+    def retry_review(self, task_id: str) -> dict[str, Any]:
+        """Re-run only the Reviewer after a report-format failure, under strict limits."""
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        self.recover()
+        outcome = ImplementationStage(self).retry_review(task_id)
+        return {"implementation": outcome, **self.describe(task_id)}
+
     def accept_delivery(
         self, task_id: str, *, deliverable_digest: str, reason: str | None = None
     ) -> dict[str, Any]:

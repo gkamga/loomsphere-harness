@@ -10,9 +10,12 @@ transition, and recorded artefact is the production one.
 
 from __future__ import annotations
 
+import shutil
+import sqlite3
 import subprocess
 import sys
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -104,6 +107,15 @@ REVIEW_REJECTED = {
     "follow_ups": [],
 }
 
+REVIEW_INFO_SEVERITY = {
+    **REVIEW_VERDICT,
+    "findings": [
+        {"severity": "info", "description": "A purely informational note.",
+         "evidence": "the diff"},
+    ],
+}
+REVIEW_REJECTED_INFO_SEVERITY = {**REVIEW_REJECTED, "findings": REVIEW_INFO_SEVERITY["findings"]}
+
 BUILT_FILES = {
     "tests/test_hello.py": (
         '"""Automated test for the /hello route."""\n\n\n'
@@ -182,7 +194,7 @@ def loop_model(
     return FunctionModel(respond)
 
 
-class ImplementationLoop(RuntimeCase):
+class LoopCase(RuntimeCase):
     def loop_engine(
         self,
         *,
@@ -285,6 +297,8 @@ class ImplementationLoop(RuntimeCase):
             check=True,
         ).stdout
 
+
+class ImplementationLoop(LoopCase):
     # -- the accepted path ----------------------------------------------------
     def test_an_approved_task_is_built_validated_reviewed_and_frozen(self) -> None:
         engine, task_id, calls = self.approved_task()
@@ -507,6 +521,184 @@ class ImplementationLoop(RuntimeCase):
         self.assertEqual(view["implementation"]["reason"], "unauthorized-path")
         self.assertEqual(view["task"]["status"], "implementation_failed")
         self.assertIsNone(view["deliverable"])
+
+
+class ReviewerFormatRecovery(LoopCase):
+    """Reviewer-only recovery after an ``invalid-review-report`` failure."""
+
+    def failed_review(self, **options):
+        engine, task_id, calls = self.approved_task(
+            review_verdicts=options.pop("review_verdicts", [REVIEW_INFO_SEVERITY, REVIEW_VERDICT]),
+            **options,
+        )
+        view = engine.implement(task_id)
+        self.assertEqual(view["implementation"]["reason"], "invalid-review-report")
+        self.assertEqual(view["task"]["status"], "review_failed")
+        return engine, task_id, calls
+
+    def corrupt(self, statement: str, *parameters: str) -> None:
+        """Damage recorded evidence the way a bug would; for these tests only."""
+
+        with closing(sqlite3.connect(self.state)) as db:
+            db.execute(statement, parameters)
+            db.commit()
+
+    def reviewer_runs(self, engine, task_id):
+        return [run for run in engine.store.runs(task_id) if run["role"] == "reviewer"]
+
+    def assertRefused(self, engine, task_id, code="review-retry-refused"):
+        runs_before = len(engine.store.runs(task_id))
+        audit_before = len(engine.store.audit_events(task_id))
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_review(task_id)
+        self.assertEqual(raised.exception.code, code)
+        self.assertEqual(len(engine.store.runs(task_id)), runs_before)
+        self.assertEqual(len(engine.store.audit_events(task_id)), audit_before)
+        self.assertEqual(engine._task(task_id)["status"], "review_failed")
+
+    def test_only_the_reviewer_runs_again_and_the_failed_run_is_kept(self) -> None:
+        engine, task_id, calls = self.failed_review()
+        failed = self.reviewer_runs(engine, task_id)[0]
+        containers_before = len([c for c in calls if c[1:2] == ["run"]])
+
+        view = engine.retry_review(task_id)
+
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        roles = [run["role"] for run in view["runs"]]
+        self.assertEqual(roles.count("builder"), 1)
+        self.assertEqual(roles.count("qa"), 1)
+        self.assertEqual(roles.count("reviewer"), 2)
+        self.assertEqual(len([c for c in calls if c[1:2] == ["run"]]), containers_before)
+        first, second = self.reviewer_runs(engine, task_id)
+        self.assertEqual(first, failed)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failure_reason"], "invalid-review-report")
+        self.assertEqual(second["status"], "succeeded")
+        self.assertEqual(len(view["iterations"]), 1)
+        self.assertEqual(view["iterations"][0]["status"], "ready")
+        self.assertEqual(view["iterations"][0]["reviewer_run_id"], second["id"])
+
+        events = [event["event"] for event in view["audit"]]
+        self.assertEqual(events.count("review.retry-authorised"), 1)
+        self.assertEqual(events.count("reviewer.started"), 2)
+        self.assertEqual(events.count("builder.started"), 1)
+        retry = next(e for e in view["audit"] if e["event"] == "review.retry-authorised")
+        self.assertEqual(retry["detail"]["failed_run_id"], failed["id"])
+        self.assertEqual(retry["detail"]["proposal_digest"], view["approval"]["proposal_digest"])
+        self.assertEqual(
+            retry["detail"]["commit"], view["iterations"][0]["commit_sha"]
+        )
+        self.assertGreater(engine.store.verify_audit_chain(), 0)
+
+    def test_recovery_still_stops_at_the_human_delivery_gate(self) -> None:
+        engine, task_id, _ = self.failed_review()
+
+        view = engine.retry_review(task_id)
+
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertIsNone(view["acceptance"])
+        digest = view["deliverable"]["digest"]
+        with self.assertRaises(StoreError):
+            engine.accept_delivery(task_id, deliverable_digest="0" * 64)
+        self.assertEqual(
+            engine.accept_delivery(task_id, deliverable_digest=digest)["decision"], "accepted"
+        )
+
+    def test_the_deliverable_never_claims_declared_selectors_were_executed(self) -> None:
+        engine, task_id, _ = self.failed_review()
+
+        coverage = engine.retry_review(task_id)["deliverable"]["document"]["verification_coverage"]
+
+        self.assertEqual(coverage["executed_command"], ["python", "-m", "pytest", "-q"])
+        self.assertTrue(coverage["criteria"])
+        self.assertTrue(all(not item["selector_executed"] for item in coverage["criteria"]))
+
+    def test_the_retry_is_limited_to_one_attempt(self) -> None:
+        engine, task_id, _ = self.failed_review(
+            review_verdicts=[REVIEW_INFO_SEVERITY, REVIEW_INFO_SEVERITY, REVIEW_VERDICT]
+        )
+
+        view = engine.retry_review(task_id)
+
+        self.assertEqual(view["implementation"]["reason"], "invalid-review-report")
+        self.assertEqual(view["task"]["status"], "review_failed")
+        self.assertEqual(len(self.reviewer_runs(engine, task_id)), 2)
+        self.assertRefused(engine, task_id, code="review-retry-exhausted")
+        self.assertEqual(len(self.reviewer_runs(engine, task_id)), 2)
+        self.assertIsNone(view["deliverable"])
+
+    def test_a_legitimate_rejection_is_never_retried(self) -> None:
+        engine, task_id, _ = self.approved_task(review_verdicts=[REVIEW_REJECTED, REVIEW_VERDICT])
+        engine.implement(task_id)
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_review(task_id)
+
+        self.assertEqual(raised.exception.code, "review-retry-refused")
+        self.assertEqual(len(self.reviewer_runs(engine, task_id)), 1)
+
+    def test_a_malformed_report_that_already_rejects_is_not_asked_again(self) -> None:
+        engine, task_id, _ = self.failed_review(
+            review_verdicts=[REVIEW_REJECTED_INFO_SEVERITY, REVIEW_VERDICT]
+        )
+
+        self.assertRefused(engine, task_id)
+
+    def test_a_task_that_is_not_review_failed_cannot_be_retried(self) -> None:
+        engine, task_id, _ = self.approved_task()
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_review(task_id)
+
+        self.assertEqual(raised.exception.code, "review-retry-refused")
+
+    def test_an_uncommitted_change_in_the_worktree_blocks_recovery(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        worktree = engine.workspace_root / f"task-{task_id.lower()}"
+        (worktree / "tests" / "test_hello.py").write_text("# tampered\n", encoding="utf-8")
+
+        self.assertRefused(engine, task_id)
+
+    def test_a_different_commit_in_the_worktree_blocks_recovery(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        worktree = engine.workspace_root / f"task-{task_id.lower()}"
+        (worktree / "tests" / "test_hello.py").write_text("# other\n", encoding="utf-8")
+        for arguments in (
+            ["add", "-A"],
+            ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "other"],
+        ):
+            subprocess.run(["git", "-C", str(worktree), *arguments], check=True)
+
+        self.assertRefused(engine, task_id)
+
+    def test_a_missing_worktree_blocks_recovery(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        worktree = engine.workspace_root / f"task-{task_id.lower()}"
+        shutil.rmtree(worktree)
+
+        self.assertRefused(engine, task_id)
+
+    def test_missing_or_failed_validation_evidence_blocks_recovery(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        # A test-only database: corrupt the recorded evidence the way a bug would.
+        self.corrupt("UPDATE iterations SET validation = NULL WHERE task_id = ?", task_id)
+
+        self.assertRefused(engine, task_id)
+
+    def test_a_qa_report_that_no_longer_matches_its_digest_blocks_recovery(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        self.corrupt("UPDATE iterations SET qa_digest = 'x' WHERE task_id = ?", task_id)
+
+        self.assertRefused(engine, task_id)
+
+    def test_a_reviewer_response_that_parses_is_not_a_format_failure(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        self.corrupt(
+            "UPDATE runs SET response_text = ? WHERE role = 'reviewer'", fenced(REVIEW_VERDICT)
+        )
+
+        self.assertRefused(engine, task_id)
 
 
 if __name__ == "__main__":  # pragma: no cover

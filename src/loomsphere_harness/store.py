@@ -27,6 +27,10 @@ GENESIS = "0" * 64
 #: Every role that can own a run row in schema v2.
 RUN_ROLES = ("intake", "architect", "builder", "qa", "reviewer")
 
+#: Audit event that records one authorised Reviewer-only retry. Counting these
+#: events is the durable retry limit; no schema column is needed.
+REVIEW_RETRY_EVENT = "review.retry-authorised"
+
 
 class StoreError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
@@ -751,6 +755,66 @@ class SqliteStore:
             self._audit(db, row["task_id"], actor, event,
                         {"iteration_id": iteration_id, **(detail or {}),
                          "fields": sorted(fields)})
+
+    def review_retries(self, task_id: str, iteration_id: str) -> int:
+        """How many Reviewer-only retries were authorised for one iteration."""
+
+        return sum(
+            1
+            for event in self.audit_events(task_id)
+            if event["event"] == REVIEW_RETRY_EVENT
+            and event["detail"].get("iteration_id") == iteration_id
+        )
+
+    def authorize_review_retry(
+        self, *, task_id: str, iteration_id: str, actor: str, limit: int,
+        detail: dict[str, Any],
+    ) -> int:
+        """Consume one Reviewer retry for a report-format failure, atomically.
+
+        The status check, the limit check, the append-only audit event, and the
+        iteration reopening commit together. The failed run row is never touched;
+        the retry's own run is appended afterwards by the normal stage claim.
+        Returns the number of retries now used.
+        """
+
+        with self._tx() as db:
+            task = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task is None:
+                raise StoreError("task-not-found", f"No task {task_id}.")
+            if task["status"] != "review_failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Task {task_id} is {task['status']}; expected review_failed.",
+                )
+            used = sum(
+                1
+                for row in db.execute(
+                    "SELECT detail FROM audit_events WHERE task_id = ? AND event = ?",
+                    (task_id, REVIEW_RETRY_EVENT),
+                ).fetchall()
+                if json.loads(row["detail"]).get("iteration_id") == iteration_id
+            )
+            if used >= limit:
+                raise StoreError(
+                    "review-retry-exhausted",
+                    f"Iteration {iteration_id} already used its {limit} Reviewer retry.",
+                )
+            cursor = db.execute(
+                "UPDATE iterations SET status = 'review_running', failure_reason = NULL,"
+                " failure_detail = NULL, updated_at = ? WHERE id = ? AND task_id = ?"
+                " AND status = 'review_failed'",
+                (now(), iteration_id, task_id),
+            )
+            if cursor.rowcount == 0:
+                raise StoreError(
+                    "invalid-transition", f"Iteration {iteration_id} is not review_failed."
+                )
+            self._audit(
+                db, task_id, actor, REVIEW_RETRY_EVENT,
+                {"iteration_id": iteration_id, "attempt": used + 1, "limit": limit, **detail},
+            )
+        return used + 1
 
     def iteration(self, task_id: str) -> dict[str, Any] | None:
         db = self._connect()

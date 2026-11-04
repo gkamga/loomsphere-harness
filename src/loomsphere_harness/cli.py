@@ -29,7 +29,7 @@ from loomsphere_harness.validation import ValidationPlanError
 from loomsphere_harness.workspace import WorkspaceError
 
 COMMANDS = (
-    "init", "submit", "run", "show", "approve", "reject", "implement", "changes",
+    "init", "submit", "run", "show", "approve", "reject", "implement", "retry-review", "changes",
     "evidence", "accept", "reject-delivery", "status", "audit",
 )
 EXPECTED_ERRORS = (
@@ -70,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     implement = sub.add_parser(
         "implement", help="build, validate, review an approved task (Builder, QA, Reviewer)")
     implement.add_argument("task")
+    retry_review = sub.add_parser(
+        "retry-review",
+        help="re-run only the Reviewer after an invalid-review-report failure (one retry)")
+    retry_review.add_argument("task")
     changes = sub.add_parser("changes", help="show the recorded change set of the deliverable")
     changes.add_argument("task")
     evidence = sub.add_parser("evidence", help="show the validation and review evidence")
@@ -249,6 +253,16 @@ def render_evidence(view: dict[str, Any]) -> str:
         "Output excerpt:",
         str(record.get("output") or "(empty)"),
     ]
+    coverage = document.get("verification_coverage")
+    if coverage:
+        lines += ["", "Verification coverage (declared vs executed):"]
+        for item in coverage["criteria"]:
+            declared = item["declared"]
+            lines.append(
+                f"  {item['id']}  declared {declared.get('kind')} {declared.get('selector') or ''}"
+                f"  selector executed: {'yes' if item['selector_executed'] else 'no'}"
+            )
+        lines.append(f"  {coverage['note']}")
     for label, key in (("QA", "qa"), ("Reviewer", "review")):
         report = document[key]["report"]
         lines += ["", f"{label} verdict: {report['verdict']} — {report['summary']}"]
@@ -313,6 +327,10 @@ def run_command(args: argparse.Namespace) -> int:
               f"(proposal {decision['proposal_digest'][:12]}) by {decision['actor']}")
     elif command == "implement":
         view = engine.implement(args.task)
+        _emit(args, view, render_iterations(view))
+        return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
+    elif command == "retry-review":
+        view = engine.retry_review(args.task)
         _emit(args, view, render_iterations(view))
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command in ("changes", "evidence"):

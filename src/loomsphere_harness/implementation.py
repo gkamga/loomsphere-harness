@@ -22,7 +22,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from typing import Any, Sequence
+from pathlib import Path
+from typing import Any, NoReturn, Sequence
 
 from loomsphere_harness.engine import (
     BUILDER,
@@ -50,6 +51,7 @@ from loomsphere_harness.reports import (
     parse_review_verdict,
     unmet_criteria,
 )
+from loomsphere_harness.schemas.architect_proposal import extract_payload
 from loomsphere_harness.schemas.acceptance_contract import (
     AcceptanceContract,
     AcceptanceContractError,
@@ -57,6 +59,7 @@ from loomsphere_harness.schemas.acceptance_contract import (
     contract_digest,
 )
 from loomsphere_harness.validation import (
+    VALIDATION_STATUS_SUCCEEDED,
     ValidationOutcome,
     ValidationPlanError,
     execute_validation,
@@ -65,11 +68,14 @@ from loomsphere_harness.validation import (
 from loomsphere_harness.workspace import (
     ChangeSet,
     DIFF_EXCERPT_CHARS,
+    TaskWorkspace,
     WorkspaceError,
     commit_worktree,
     diff_excerpt,
     ensure_task_workspace,
     inspect_change_set,
+    is_worktree,
+    workspace_path_for,
 )
 
 DELIVERABLE_SCHEMA_VERSION = "1.0.0"
@@ -83,6 +89,12 @@ REASON_QA_BLOCKED = "qa-blocked"
 REASON_REVIEW_BLOCKED = "review-changes-required"
 REASON_REVIEW_REJECTED = "review-rejected"
 REASON_CONTRACT_UNAVAILABLE = "acceptance-contract-unavailable"
+
+#: A Reviewer report-format failure may be retried this many times per iteration.
+MAX_REVIEW_RETRIES = 1
+REASON_REVIEW_RETRY_REFUSED = "review-retry-refused"
+#: Verdicts that already carry a Reviewer decision; they are never re-asked.
+ADVERSE_VERDICTS = ("rejected", "changes-required")
 
 COMMIT_MESSAGE = "loomsphere-harness: {task} iteration {number}"
 DETAIL_MAX_CHARS = 4_000
@@ -167,6 +179,227 @@ class ImplementationStage:
                 "a human must decide what happens next."
             ),
             expect=("changes_required",),
+        )
+
+    # -- Reviewer-only recovery ----------------------------------------------
+    def retry_review(self, task_id: str) -> dict[str, Any]:
+        """Re-run only the Reviewer after a report-format failure.
+
+        Builder, validation, and QA are not repeated: their recorded evidence is
+        re-verified against the approval, the worktree, and the stored runs, and the
+        retry is refused when anything is missing, stale, or inconsistent. The failed
+        run is never rewritten; a new Reviewer run and new audit events are appended.
+        """
+
+        engine = self.engine
+        store = self.store
+        refuse = self._refuse
+        task = engine._task(task_id)
+        if task["status"] != "review_failed":
+            refuse(f"Task {task_id} is {task['status']}; only review_failed can be retried.")
+        iteration = store.iteration(task_id)
+        if iteration is None or iteration["status"] != ITERATION_REVIEW_FAILED:
+            refuse("The latest iteration is not a failed review.")
+        iteration_id = iteration["id"]
+        if iteration.get("failure_reason") != REASON_INVALID_REVIEW_REPORT:
+            refuse(
+                f"The review failed with {iteration.get('failure_reason')!r}; only an "
+                f"{REASON_INVALID_REVIEW_REPORT!r} format failure is retryable."
+            )
+        if store.deliverable(task_id) is not None or store.acceptance(task_id) is not None:
+            refuse("A deliverable or delivery decision already exists.")
+        if store.review_retries(task_id, iteration_id) >= MAX_REVIEW_RETRIES:
+            raise EngineError(
+                "review-retry-exhausted",
+                f"Iteration {iteration_id} already used its {MAX_REVIEW_RETRIES} Reviewer retry.",
+            )
+
+        runs = {run["id"]: run for run in store.runs(task_id)}
+        failed_run = self._format_failed_review_run(task_id, iteration, runs)
+
+        # The approval must still bind the exact proposal the contract comes from.
+        proposal = store.proposal(task_id)
+        approval = store.approval(task_id)
+        if proposal is None or approval is None:
+            refuse("The approved proposal or its approval is missing.")
+        if (
+            approval["decision"] != "approved"
+            or proposal["status"] != "approved"
+            or approval["proposal_id"] != proposal["id"]
+            or approval["proposal_digest"] != proposal["digest"]
+            or _document_digest(proposal["document"]) != proposal["digest"]
+        ):
+            refuse("The original approval no longer matches the stored proposal.")
+        if approval.get("repo_commit") not in (None, task["repo_commit"]) or (
+            iteration["base_commit"] != task["repo_commit"]
+        ):
+            refuse("The approved repository commit does not match the iteration base.")
+        contract, criteria_lines = self._contract(task_id)
+
+        # Builder and QA evidence must still be the runs the iteration recorded.
+        report = self._recorded_report(
+            runs, iteration.get("builder_run_id"), "builder", parse_build_report,
+            iteration.get("build_digest"),
+        )
+        qa = self._recorded_report(
+            runs, iteration.get("qa_run_id"), "qa", parse_qa_report, iteration.get("qa_digest")
+        )
+        if qa.verdict != "passed" or qa.blocking_findings or self._criteria_problems(
+            qa.acceptance_criteria, contract
+        ):
+            refuse("The recorded QA evidence does not support a Reviewer run.")
+
+        validation = self._recorded_validation(iteration)
+
+        # The worktree must still hold exactly the validated, QA-checked commit.
+        path = workspace_path_for(engine.workspace_root, task_id)
+        recorded = iteration.get("workspace_path")
+        if (
+            not is_worktree(path)
+            or not recorded
+            or Path(recorded).resolve() != path.resolve()
+        ):
+            refuse("The task worktree is missing or is not the recorded workspace.")
+        try:
+            changeset = inspect_change_set(
+                path, base_commit=iteration["base_commit"],
+                reviewed_commit=str(iteration.get("commit_sha")),
+                reported_paths=set(report.paths),
+            )
+        except WorkspaceError as error:
+            refuse(f"The worktree no longer matches the recorded change set ({error.code}).")
+        if (
+            changeset.workspace_digest != iteration.get("workspace_digest")
+            or validation.workspace_digest != iteration.get("workspace_digest")
+            or diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS) != iteration.get("diff_excerpt")
+        ):
+            refuse("The worktree content differs from the validated and reviewed change set.")
+
+        task = engine._task(task_id)
+        try:
+            review_prompt, selection = self._review_prompt(
+                task, report=report, qa=qa, diff=changeset.diff, command=validation.command,
+                exit_code=validation.exit_code, criteria_lines=criteria_lines,
+            )
+        except LoopPromptError as error:
+            raise EngineError(error.code, error.message) from error
+
+        actor = engine.identity.current().id
+        attempt = store.authorize_review_retry(
+            task_id=task_id, iteration_id=iteration_id, actor=actor,
+            limit=MAX_REVIEW_RETRIES,
+            detail={
+                "failed_run_id": failed_run["id"],
+                "failure_reason": REASON_INVALID_REVIEW_REPORT,
+                "failure_detail": str(failed_run.get("failure_detail") or "")[:500],
+                "proposal_digest": proposal["digest"],
+                "contract_digest": contract_digest(contract),
+                "commit": changeset.head_commit,
+                "workspace_digest": changeset.workspace_digest,
+                "validation_output_digest": validation.output_digest,
+                "builder_run_id": iteration["builder_run_id"],
+                "qa_run_id": iteration["qa_run_id"],
+            },
+        )
+        review_outcome = engine.invoke_role(
+            task=task, role=REVIEWER, composed=review_prompt, selection=selection,
+            expect=("review_failed",), running="review_running",
+            failed="review_failed", workspace_path=path, writable=False,
+        )
+        outcome = self._finish_review(
+            task_id=task_id, iteration_id=iteration_id, contract=contract,
+            review_outcome=review_outcome, changeset=changeset, report=report, qa=qa,
+            validation=validation, workspace=TaskWorkspace(
+                path=path, branch=str(iteration.get("branch")), commit=changeset.head_commit,
+                base_commit=iteration["base_commit"],
+            ),
+        )
+        if outcome["result"] == "ready":
+            published = self._publish(task, iteration, contract, outcome)
+            return {"result": "delivered", "iteration_id": iteration_id,
+                    "retry_attempt": attempt, "reviewer_run_id": review_outcome.run_id,
+                    **published}
+        return {**outcome, "retry_attempt": attempt}
+
+    @staticmethod
+    def _refuse(message: str) -> NoReturn:
+        raise EngineError(REASON_REVIEW_RETRY_REFUSED, message)
+
+    def _format_failed_review_run(
+        self, task_id: str, iteration: dict[str, Any], runs: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        """The failed Reviewer run, proven to be a report-format failure.
+
+        The stored response is parsed again: a response that now parses was not a
+        format failure, and one that states an adverse verdict is a real decision.
+        Neither is ever re-asked in the hope of a better answer.
+        """
+
+        reviewers = [run for run in runs.values() if run["role"] == REVIEWER]
+        qa_run = runs.get(iteration.get("qa_run_id") or "")
+        if not reviewers or qa_run is None:
+            self._refuse("The failed Reviewer run or the QA run is missing.")
+        failed = max(reviewers, key=lambda run: run["started_at"])
+        if (
+            failed["status"] != "failed"
+            or failed.get("failure_reason") != REASON_INVALID_REVIEW_REPORT
+            or failed["started_at"] < qa_run["started_at"]
+            or iteration.get("reviewer_run_id") is not None
+        ):
+            self._refuse("The latest Reviewer run is not a recorded report-format failure.")
+        text = failed.get("response_text") or ""
+        try:
+            parse_review_verdict(text)
+        except ReportError:
+            pass
+        else:
+            self._refuse("The failed Reviewer response is a valid report; it is not a format failure.")
+        try:
+            verdict = str(extract_payload(text).get("verdict", "")).strip().lower()
+        except Exception:  # noqa: BLE001 - an unreadable response carries no verdict
+            verdict = ""
+        if verdict in ADVERSE_VERDICTS:
+            self._refuse(f"The malformed report already states the verdict {verdict!r}.")
+        return failed
+
+    def _recorded_report(
+        self, runs: dict[str, dict[str, Any]], run_id: str | None, role: str, parser: Any,
+        expected_digest: str | None,
+    ) -> Any:
+        run = runs.get(run_id or "")
+        if run is None or run["role"] != role or run["status"] != "succeeded":
+            self._refuse(f"The recorded {role} run is missing or did not succeed.")
+        try:
+            report = parser(run.get("response_text") or "")
+        except ReportError:
+            self._refuse(f"The recorded {role} response no longer parses.")
+        if not expected_digest or report.digest != expected_digest:
+            self._refuse(f"The recorded {role} report does not match its stored digest.")
+        return report
+
+    def _recorded_validation(self, iteration: dict[str, Any]) -> ValidationOutcome:
+        record = iteration.get("validation")
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != VALIDATION_STATUS_SUCCEEDED
+            or record.get("exit_code") != 0
+            or iteration.get("validation_exit_code") != 0
+            or not record.get("command")
+            or not record.get("output_digest")
+        ):
+            self._refuse("The recorded validation evidence is missing or did not succeed.")
+        return ValidationOutcome(
+            command=tuple(record["command"]),
+            status=record["status"],
+            exit_code=record["exit_code"],
+            duration_ms=int(record.get("duration_ms") or 0),
+            output="",
+            output_digest=record["output_digest"],
+            workspace_digest=str(record.get("workspace_digest") or ""),
+            failure_reason=record.get("failure_reason"),
+            sandbox_image=record.get("sandbox_image"),
+            sandbox_image_id=record.get("sandbox_image_id"),
+            execution=dict(record.get("execution") or {}),
         )
 
     # -- one iteration -------------------------------------------------------
@@ -364,23 +597,11 @@ class ImplementationStage:
 
         # 6. Reviewer: the last automated decision before the human gate.
         task = engine._task(task_id)
-        persona, _, selection = engine.persona_and_skills(task, REVIEWER)
         try:
-            review_prompt = compose_reviewer_prompt(
-                persona=persona,
-                task_title=task["title"],
-                requirements=task["requirements"],
-                acceptance_criteria=task["acceptance_criteria"],
-                task_identifier=task_id,
-                implementation_summary=report.summary,
-                diff_excerpt=diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
-                validation_command=validation.command,
-                validation_exit_code=validation.exit_code,
-                qa_verdict=qa.verdict,
-                qa_summary=qa.summary,
-                qa_findings=[finding.description for finding in qa.findings],
-                approved_criteria=criteria_lines,
-                skills=selection.documents,
+            review_prompt, selection = self._review_prompt(
+                task, report=report, qa=qa, diff=changeset.diff,
+                command=validation.command, exit_code=validation.exit_code,
+                criteria_lines=criteria_lines,
             )
         except LoopPromptError as error:
             return self._record_failure(
@@ -397,6 +618,60 @@ class ImplementationStage:
             expect=("qa_running",), running="review_running",
             failed="review_failed", workspace_path=workspace.path, writable=False,
         )
+        return self._finish_review(
+            task_id=task_id, iteration_id=iteration_id, contract=contract,
+            review_outcome=review_outcome, changeset=changeset, report=report, qa=qa,
+            validation=validation, workspace=workspace,
+        )
+
+    def _review_prompt(
+        self,
+        task: dict[str, Any],
+        *,
+        report: BuildReport,
+        qa: QaReport,
+        diff: str,
+        command: Sequence[str],
+        exit_code: int | None,
+        criteria_lines: Sequence[str],
+    ) -> tuple[Any, Any]:
+        """Compose the Reviewer prompt from recorded evidence only."""
+
+        persona, _, selection = self.engine.persona_and_skills(task, REVIEWER)
+        prompt = compose_reviewer_prompt(
+            persona=persona,
+            task_title=task["title"],
+            requirements=task["requirements"],
+            acceptance_criteria=task["acceptance_criteria"],
+            task_identifier=task["id"],
+            implementation_summary=report.summary,
+            diff_excerpt=diff_excerpt(diff, DIFF_EXCERPT_CHARS),
+            validation_command=command,
+            validation_exit_code=exit_code,
+            qa_verdict=qa.verdict,
+            qa_summary=qa.summary,
+            qa_findings=[finding.description for finding in qa.findings],
+            approved_criteria=criteria_lines,
+            skills=selection.documents,
+        )
+        return prompt, selection
+
+    def _finish_review(
+        self,
+        *,
+        task_id: str,
+        iteration_id: str,
+        contract: AcceptanceContract,
+        review_outcome: RoleOutcome,
+        changeset: ChangeSet,
+        report: BuildReport,
+        qa: QaReport,
+        validation: ValidationOutcome,
+        workspace: Any,
+    ) -> dict[str, Any]:
+        """Judge one Reviewer invocation: shared by the loop and the format retry."""
+
+        actor = self.engine.identity.current().id
         if not review_outcome.succeeded:
             return self._failed_run(review_outcome, task_id, iteration_id, running="qa_running")
 
@@ -596,6 +871,7 @@ class ImplementationStage:
                 "digest": contract_digest(contract),
                 "criteria": [item.model_dump(mode="json") for item in contract.criteria],
             },
+            "verification_coverage": self._verification_coverage(contract, validation),
             "builder": {
                 "report": dataclasses.asdict(report),
                 "digest": report.digest,
@@ -623,6 +899,34 @@ class ImplementationStage:
             document=document, actor=actor,
         )
         return {"digest": digest}
+
+    @staticmethod
+    def _verification_coverage(
+        contract: AcceptanceContract, validation: ValidationOutcome
+    ) -> dict[str, Any]:
+        """What the harness actually executed, never what the proposal declared.
+
+        The approved contract may name pytest selectors, but the runtime executes
+        only the allowlisted validation command and never maps a declared selector
+        onto it, so a declared selector is never reported as executed.
+        """
+
+        return {
+            "executed_command": list(validation.command),
+            "executed_exit_code": validation.exit_code,
+            "criteria": [
+                {
+                    "id": item.id,
+                    "declared": item.verification.model_dump(mode="json"),
+                    "selector_executed": False,
+                }
+                for item in contract.criteria
+            ],
+            "note": (
+                "Declared selectors are not executed individually; only the executed "
+                "command above ran."
+            ),
+        }
 
     # -- failure and rework --------------------------------------------------
     def _fail_run(
@@ -713,6 +1017,8 @@ class ImplementationStage:
 __all__ = [
     "DELIVERABLE_SCHEMA_VERSION",
     "ImplementationStage",
+    "MAX_REVIEW_RETRIES",
+    "REASON_REVIEW_RETRY_REFUSED",
     "REASON_CONTRACT_UNAVAILABLE",
     "REASON_INVALID_BUILD_REPORT",
     "REASON_INVALID_QA_REPORT",

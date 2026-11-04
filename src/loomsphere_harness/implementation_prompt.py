@@ -40,6 +40,14 @@ Reply with exactly one fenced json block and nothing after it:
 `criterion_id` must repeat the approved identifier exactly. Report every approved
 criterion. A criterion you leave out is treated as omitted and blocks delivery."""
 
+SEVERITY_GUIDE = """\
+`severity` is exactly one of these three values; any other value, including
+`info`, `low`, `warning`, or `critical`, makes the whole report invalid:
+- `blocking`: a defect that makes the change unsafe or unacceptable as it stands.
+- `major`: a significant defect or unmet expectation that must be fixed first.
+- `minor`: a non-blocking observation, improvement, or purely informational note.
+Report an informational note as `minor`, never as `info`."""
+
 QA_CONTRACT = """\
 Reply with exactly one fenced json block and nothing after it:
 ```json
@@ -60,7 +68,8 @@ Reply with exactly one fenced json block and nothing after it:
   "residual_risks": ["risk that is not a blocking defect"]
 }
 ```
-`verdict` must be `passed` or `failed`; `severity` must be `blocking`, `major`, or `minor`.
+`verdict` must be `passed` or `failed`.
+""" + SEVERITY_GUIDE + """
 `status` must be one of `met`, `unmet`, or `unknown`.
 `criterion_id` must repeat the approved identifier exactly.
 Use `failed` when any acceptance criterion is unmet or any blocking finding exists."""
@@ -86,6 +95,7 @@ Reply with exactly one fenced json block and nothing after it:
 }
 ```
 `verdict` must be `accepted`, `changes-required`, or `rejected`.
+""" + SEVERITY_GUIDE + """
 `status` must be one of `met`, `unmet`, or `unknown`.
 `criterion_id` must repeat the approved identifier exactly. An approved criterion
 that is absent from your report is treated as omitted by the delivery gate.
@@ -359,6 +369,7 @@ __all__ = [
     "QA_RULES",
     "REVIEWER_CONTRACT",
     "REVIEWER_RULES",
+    "SEVERITY_GUIDE",
     "compose_builder_prompt",
     "compose_qa_prompt",
     "compose_reviewer_prompt",
