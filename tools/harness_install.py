@@ -114,14 +114,52 @@ class Source:
 
     def _extract(self) -> None:
         archive = git(self.repo, "archive", "--format=tar", self.commit).stdout
+        self._extract_archive(archive)
+
+    def _extract_archive(self, archive: bytes) -> None:
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-            for member in tar.getmembers():
-                if member.issym() or member.islnk():
-                    raise Integrity(f"harness commit contains a link: {member.name}")
-                name = Path(member.name)
-                if name.is_absolute() or ".." in name.parts:
-                    raise Integrity(f"unsafe path in harness archive: {member.name}")
-            tar.extractall(self.tree)
+            # Validate the whole archive first so a bad entry extracts nothing.
+            members = [(member, destination) for member, destination in self._validate(tar)]
+            for member, destination in members:
+                try:
+                    self._write(tar, member, destination)
+                except OSError as error:
+                    raise Integrity(f"cannot extract {member.name!r}: {error}") from error
+
+    #: Only ordinary files and directories may be extracted. ``isreg()`` is not
+    #: used because it also accepts contiguous and GNU sparse variants.
+    SAFE_TYPES = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+
+    def _validate(self, tar: "tarfile.TarFile"):
+        """Yield each member with its resolved destination, refusing anything unsafe."""
+
+        root = self.tree.resolve()
+        for member in tar.getmembers():
+            if member.issym() or member.islnk():
+                raise Integrity(f"harness commit contains a link: {member.name}")
+            if member.type not in self.SAFE_TYPES:
+                raise Integrity(f"unsupported entry type in harness archive: {member.name}")
+            name = Path(member.name)
+            if name.is_absolute() or ".." in name.parts:
+                raise Integrity(f"unsafe path in harness archive: {member.name}")
+            destination = (root / name).resolve()
+            if destination != root and root not in destination.parents:
+                raise Integrity(f"archive entry escapes the extraction directory: {member.name}")
+            if not member.isdir() and destination == root:
+                raise Integrity(f"archive entry has no usable name: {member.name!r}")
+            yield member, destination
+
+    def _write(self, tar: "tarfile.TarFile", member: "tarfile.TarInfo", destination: Path) -> None:
+        if member.isdir():
+            destination.mkdir(parents=True, exist_ok=True)
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = tar.extractfile(member)
+        if source is None:
+            raise Integrity(f"cannot read archive entry: {member.name}")
+        with source, open(destination, "wb") as handle:
+            shutil.copyfileobj(source, handle)
+        os.chmod(destination, (member.mode & 0o777) or 0o644)
 
     def _load_manifest(self) -> dict:
         path = self.tree / "harness.manifest.json"

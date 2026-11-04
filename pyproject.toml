@@ -1,18 +1,40 @@
 [build-system]
-requires = ["setuptools>=69"]
+# PEP 639 support (`license` as an SPDX expression and `license-files`) needs
+# setuptools 77 or newer.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "loomsphere-harness"
 version = "0.1.0"
-description = "Portable LoomSphere harness runtime: Intake, Architect, and explicit human approval."
+description = "Standalone LoomSphere engineering harness runtime: Intake, Architect, digest-bound approval, Builder, sandboxed validation, QA, Reviewer, and delivery acceptance."
 readme = "README.md"
 requires-python = ">=3.11"
+keywords = ["ai-agents", "engineering-harness", "code-review", "sandbox", "approval-gate"]
+# The owner selected Apache License 2.0 on 2026-11-03; the provenance audit is
+# in docs/LICENSING-PROVENANCE.md. `license` is an SPDX expression (PEP 639).
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "pydantic>=2.11",
     "pydantic-ai-slim[openai]>=2.64.0",
     "pydantic-ai-harness>=0.64.0",
 ]
+
+[project.urls]
+Documentation = "https://github.com/gkamga/loomsphere-harness/blob/main/docs/QUICKSTART.md"
+Repository = "https://github.com/gkamga/loomsphere-harness"
+Changelog = "https://github.com/gkamga/loomsphere-harness/blob/main/docs/RELEASE-0.1.0.md"
 
 [project.optional-dependencies]
 # Used by the asset validators and the existing harness tests, not by the runtime.

@@ -1,7 +1,7 @@
 # Consuming the harness from another repository
 
-This guide installs the declarative harness assets into any Git repository. It
-needs Python 3.9+ and Git. It does not need the LoomSphere application.
+This guide installs the **declarative harness assets** into any Git repository.
+It needs Python 3.9+ and Git. It does not need the LoomSphere application.
 
 **What you get:** agent definitions, skills, a hook registry, contract schemas
 with worked examples, and the workflow documents they link to, as plain files in
@@ -9,7 +9,15 @@ your repository.
 
 **What you do not get:** an autonomous engine. Nothing here runs an agent,
 selects a skill, composes a prompt, evaluates a hook, enforces an approval, or
-sandboxes anything. See [Not provided until the Python engine](#not-provided-until-the-python-engine).
+sandboxes anything. The assets constrain whatever tool loads them; they cannot
+enforce a gate on their own.
+
+If you want the runtime that *does* enforce those gates — Intake, Architect,
+digest-bound human approval, Builder, container-only validation, QA, Reviewer,
+and delivery acceptance — install the CLI instead and follow
+[docs/QUICKSTART.md](QUICKSTART.md). The two modes are independent: you can use
+either, or install the assets for Copilot and run the CLI from a separate trusted
+checkout.
 
 ## 1. Pin a version
 
@@ -20,9 +28,13 @@ reviewed content is not what arrives:
 ```sh
 git clone https://github.com/gkamga/loomsphere-harness.git
 cd loomsphere-harness
-git rev-parse <tag-or-sha>                        # the commit you reviewed
+git rev-parse <40-character commit SHA>           # or v0.1.0 once that tag exists
 python3 -c "import json;print(json.load(open('harness.manifest.json'))['suite_digest'])"
 ```
+
+At this release candidate no tag is published yet, so use the full commit SHA
+(`git rev-parse HEAD` on the reviewed commit). A tag and a commit SHA are
+interchangeable here; a branch name is not.
 
 ## 2. Install
 
@@ -152,10 +164,40 @@ set in a plain checkout.
 Regenerate with `python3 tools/build_manifest.py` after a reviewed change; CI runs
 `--check`.
 
-## Not provided until the Python engine
+## Declarative assets versus the enforcing runtime
 
-These need the later engine phase and are **not** part of this repository today:
-catalog loading and routing, skill selection, prompt composition, lifecycle hook
-evaluation, agent runners, the execution sandbox, approval and acceptance-audit
-enforcement, and the persistence they rely on. Installing the assets gives a model
-the text; only an enforcing runtime can make a gate binding.
+The assets and the runtime answer different questions.
+
+| | Declarative assets (this guide) | Standalone runtime ([QUICKSTART.md](QUICKSTART.md)) |
+| --- | --- | --- |
+| What is installed | Markdown and JSON files | A Python package and the `loomsphere-harness` CLI |
+| Who enforces a gate | The consuming repository or tool | The runtime itself |
+| Model tools | Whatever the tool grants | Intake/Architect: read-only; Builder: isolated worktree |
+| Approval | None installed | Proposal digest and deliverable digest, recorded |
+| Execution sandbox | None | Container only, `--network none`, read-only root |
+| Persistence | None | One SQLite file outside the target repository |
+| Works without the LoomSphere application | Yes | Yes |
+
+Catalog loading, skill selection, prompt composition, lifecycle hook evaluation,
+agent runners, the sandbox, approval, and the audit trail all exist in the runtime.
+Installing only the assets gives a model the text; running the CLI makes the gates
+binding. The runtime reads the assets from a **separate trusted checkout**, never
+from the repository it is working on.
+
+## License and security
+
+Installing the assets copies text into your repository, so the terms matter.
+
+- The harness is licensed under the Apache License 2.0; see
+  [../LICENSE](../LICENSE) and the redistribution audit in
+  [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md).
+- Installed assets stay under that license; they do not relicense your repository.
+- The installed text is **guidance for a model**, not an enforced control — see
+  the table above. Review
+  [SECURITY-MODEL.md](SECURITY-MODEL.md) before pointing any agent at a
+  repository you do not trust.
+- Vulnerability reports and the disclosure process are described in
+  [../SECURITY.md](../SECURITY.md).
+- `tools/harness_install.py` validates the whole archive before writing anything
+  and refuses absolute paths, parent-directory traversal, links, device and FIFO
+  entries, and any entry whose destination escapes the extraction directory.
