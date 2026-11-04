@@ -28,13 +28,13 @@ reviewed content is not what arrives:
 ```sh
 git clone https://github.com/gkamga/loomsphere-harness.git
 cd loomsphere-harness
-git rev-parse v0.1.0                              # the tag you reviewed, or a full SHA
+git rev-parse <40-character commit SHA>           # or v0.1.0 once that tag exists
 python3 -c "import json;print(json.load(open('harness.manifest.json'))['suite_digest'])"
 ```
 
-If no tag is published yet, use the full commit SHA (`git rev-parse HEAD` on the
-reviewed commit). A tag and a commit SHA are interchangeable here; a branch name
-is not.
+At this release candidate no tag is published yet, so use the full commit SHA
+(`git rev-parse HEAD` on the reviewed commit). A tag and a commit SHA are
+interchangeable here; a branch name is not.
 
 ## 2. Install
 
@@ -183,3 +183,21 @@ agent runners, the sandbox, approval, and the audit trail all exist in the runti
 Installing only the assets gives a model the text; running the CLI makes the gates
 binding. The runtime reads the assets from a **separate trusted checkout**, never
 from the repository it is working on.
+
+## License and security
+
+Installing the assets copies text into your repository, so the terms matter.
+
+- The harness is licensed under the Apache License 2.0; see
+  [../LICENSE](../LICENSE) and the redistribution audit in
+  [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md).
+- Installed assets stay under that license; they do not relicense your repository.
+- The installed text is **guidance for a model**, not an enforced control — see
+  the table above. Review
+  [SECURITY-MODEL.md](SECURITY-MODEL.md) before pointing any agent at a
+  repository you do not trust.
+- Vulnerability reports and the disclosure process are described in
+  [../SECURITY.md](../SECURITY.md).
+- `tools/harness_install.py` validates the whole archive before writing anything
+  and refuses absolute paths, parent-directory traversal, links, device and FIFO
+  entries, and any entry whose destination escapes the extraction directory.

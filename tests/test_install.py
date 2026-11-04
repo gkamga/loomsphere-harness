@@ -1,9 +1,15 @@
 import json
+import io
+import sys
+import tarfile
 import unittest
 
 from support import (
     ROOT, TempCase, commit_all, git, make_consumer_repo, make_harness_repo, run_installer, run_tool,
 )
+
+sys.path.insert(0, str(ROOT / "tools"))
+import harness_install  # noqa: E402  (the installer is a script, not a package)
 
 INSTRUCTIONS = ".github/copilot-instructions.md"
 
@@ -216,6 +222,95 @@ class InstallTests(TempCase):
         self.assertFalse((self.consumer / ".github/skills").exists())
         found = run_installer("discover", "--target", self.consumer)
         self.assertNotEqual(found.returncode, 0, "agents without their skills must be reported")
+
+
+class ArchiveExtractionTests(TempCase):
+    """The installer extracts a Git archive; every hostile entry type must be refused."""
+
+    def setUp(self):
+        super().setUp()
+        self.tree = self.tmp / "tree"
+        self.tree.mkdir()
+        self.source = harness_install.Source.__new__(harness_install.Source)
+        self.source.tree = self.tree
+
+    @staticmethod
+    def entry(name, kind=tarfile.REGTYPE, linkname="", mode=0o644):
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.linkname = linkname
+        info.mode = mode
+        return info
+
+    def extract(self, *entries):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            for info, data in entries:
+                if data is not None:
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                else:
+                    tar.addfile(info)
+        self.source._extract_archive(buffer.getvalue())
+
+    def assert_refused(self, message, *entries):
+        before = set(self.tree.rglob("*"))
+        with self.assertRaises(harness_install.Integrity) as caught:
+            self.extract(*entries)
+        self.assertIn(message, str(caught.exception))
+        self.assertEqual(set(self.tree.rglob("*")), before, "a refused archive must extract nothing")
+
+    def test_a_clean_archive_is_extracted_with_its_modes(self):
+        self.extract(
+            (self.entry("pkg", tarfile.DIRTYPE, mode=0o755), None),
+            (self.entry("pkg/mod.py", mode=0o755), b"x = 1\n"),
+            (self.entry("README.md"), b"# readme\n"),
+        )
+        self.assertEqual((self.tree / "pkg/mod.py").read_bytes(), b"x = 1\n")
+        self.assertEqual((self.tree / "README.md").read_bytes(), b"# readme\n")
+        self.assertTrue((self.tree / "pkg/mod.py").stat().st_mode & 0o111, "the executable bit is kept")
+
+    def test_absolute_paths_are_refused(self):
+        self.assert_refused("unsafe path", (self.entry("/etc/passwd"), b"root\n"))
+
+    def test_parent_traversal_is_refused(self):
+        self.assert_refused("unsafe path", (self.entry("../../escape.txt"), b"escaped\n"))
+        self.assert_refused("unsafe path", (self.entry("pkg/../escape.txt"), b"escaped\n"))
+
+    def test_symbolic_and_hard_links_are_refused(self):
+        self.assert_refused("contains a link", (self.entry("link", tarfile.SYMTYPE, "/etc/passwd"), None))
+        self.assert_refused("contains a link", (self.entry("link", tarfile.LNKTYPE, "README.md"), None))
+
+    def test_special_files_are_refused(self):
+        fifo = self.entry("pipe")
+        fifo.type = tarfile.FIFOTYPE
+        device = self.entry("dev")
+        device.type = tarfile.CHRTYPE
+        device.devmajor = 1
+        device.devminor = 3
+        sparse = self.entry("sparse")
+        sparse.type = tarfile.GNUTYPE_SPARSE
+        for info in (fifo, device, sparse):
+            with self.subTest(kind=info.type):
+                self.assert_refused("unsupported entry type", (info, None))
+
+    def test_an_entry_escaping_a_symlinked_directory_is_refused(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.tree / "link").symlink_to(outside, target_is_directory=True)
+        self.assert_refused("escapes the extraction directory", (self.entry("link/escaped.txt"), b"escaped\n"))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_install_refuses_a_commit_containing_a_symlink(self):
+        harness = make_harness_repo(self.tmp)
+        (harness / "link").symlink_to("/etc/passwd")
+        commit = commit_all(harness, "add a link")
+        consumer = make_consumer_repo(self.tmp)
+        done = run_installer("install", "--target", consumer, "--source", harness, "--ref", commit)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("contains a link", done.stderr)
+        self.assertFalse((consumer / ".harness-lock.json").exists())
+        self.assertEqual(git(consumer, "status", "--porcelain"), "")
 
 
 if __name__ == "__main__":

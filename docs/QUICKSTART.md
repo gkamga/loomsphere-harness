@@ -51,14 +51,15 @@ git clone https://github.com/gkamga/loomsphere-harness.git ~/src/loomsphere-harn
 cd ~/src/loomsphere-harness
 
 git fetch --tags
-git tag --list                     # v0.1.0, if the release tag exists
-git checkout v0.1.0                # or a full commit SHA
-git rev-parse HEAD                 # record this SHA
+git tag --list                     # empty until a release tag is published
+git checkout <40-character commit SHA you reviewed>
+git rev-parse HEAD                 # record this SHA; it must match what you reviewed
 ```
 
-If no tag is published yet, check out the full commit SHA you reviewed. Do not
-build from a moving branch: the runtime records the asset suite digest, and the
-assets must be the bytes you reviewed.
+At this release candidate no tag and no GitHub Release exist yet, so a tag is
+not a baseline you can rely on: pin the full commit SHA. Do not build from a
+moving branch: the runtime records the asset suite digest, and the assets must be
+the bytes you reviewed.
 
 `~/src/loomsphere-harness` is your **trusted checkout**. The runtime reads agents,
 skills, hooks, and contracts only from there, verifies every file against
@@ -227,7 +228,9 @@ loomsphere-harness --repo . init
 # state /Users/you/.local/share/loomsphere-harness/projects/<hash>/state.sqlite
 ```
 
-Write the two inputs as files:
+Write the two inputs as files. Acceptance criteria are free text, but a
+criterion only gets machine verification when it can be bound to an existing
+pytest test: name the test in the criterion so the mapping is unambiguous.
 
 ```sh
 cat > req.md <<'EOF'
@@ -235,8 +238,10 @@ Add a GET /hello endpoint that returns {"message": "hello"}.
 EOF
 
 cat > acceptance.md <<'EOF'
-- GET /hello returns HTTP 200 with JSON body {"message": "hello"}
-- An automated test covers the endpoint
+- AC: GET /hello returns HTTP 200 with JSON body {"message": "hello"}.
+  Verified by pytest test `tests/test_hello.py::test_hello_returns_json`.
+- AC: The endpoint is covered by an automated test.
+  Verified by the same selector `tests/test_hello.py::test_hello_returns_json`.
 EOF
 
 loomsphere-harness --repo . submit --title "Add /hello" \
@@ -244,6 +249,11 @@ loomsphere-harness --repo . submit --title "Add /hello" \
   --acceptance-file acceptance.md
 # submitted T-0001
 ```
+
+A criterion with no machine check is proposed as `unverified`. An `unverified`
+**mandatory** criterion fails acceptance (`acceptance-obligation-unverified`), so
+write criteria you can actually execute, or state plainly in the proposal review
+(step 8) that a criterion is manual and why.
 
 Then run the read-only analysis stages:
 
@@ -412,6 +422,19 @@ shows the recorded refusal reason.
 - It does not push, open a pull request, or merge.
 - It does not run anything on the host: implementation validation is container
   only.
-- It does not supply a license. Licensing is an open human decision.
+- It does not run model-based QA or the Reviewer inside the container. Those are
+  model calls made by the runtime process; only validation of generated code is
+  containerized.
+- It does not implement `protected-pytest` acceptance verification. A protected
+  artifact cannot be verified in this runtime, so such a criterion stays
+  unsatisfied rather than passing by default.
 - It does not answer Intake clarification questions in-flight; submit a clarified
   requirement.
+
+## License
+
+LoomSphere Harness is licensed under the Apache License 2.0; see
+[../LICENSE](../LICENSE) and the redistribution audit in
+[LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md). Security expectations and the
+disclosure process are in [../SECURITY.md](../SECURITY.md) and
+[SECURITY-MODEL.md](SECURITY-MODEL.md).

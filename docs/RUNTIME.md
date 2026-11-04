@@ -168,6 +168,13 @@ stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
   of the tree is taken before and after; a changed tree fails the iteration. No
   sandbox configuration means the command is refused (`sandbox-not-configured`),
   never attempted on the host.
+- **The container runs validation only.** QA and the Reviewer are model calls made
+  by the runtime process itself; they are not processes inside the container. The
+  container's job is to execute generated code and approved test selectors, and
+  that is the only thing it isolates. Model traffic leaves the host as ordinary
+  HTTPS to the provider you configured. See
+  [SECURITY-MODEL.md](SECURITY-MODEL.md) for the boundaries this does and does not
+  provide.
 - **Validation is planned, not requested**: the runtime picks the command from the
   project's own files (`pyproject.toml`, `tests/`, `package.json`, …), constrained
   by `[validation] allowlist`. A command outside the allowlist is refused before
@@ -203,7 +210,9 @@ iteration is:
    or source/image evidence that does not match the main validation run block
    readiness. Mandatory `unverified` and unsupported protected selectors remain
    explicit and also block readiness; optional obligations are recorded without
-   being labeled verified.
+   being labeled verified. `protected-pytest` is **not implemented in this
+   runtime**: a protected-artifact selector resolves to `unsupported` with the
+   recorded obstacle, so it can neither pass nor be silently skipped.
 4. **QA** reports `passed` or `failed` with findings and a claim per approved
    criterion. A `failed` verdict, a blocking finding, or a criterion the report
    never mentions sends the iteration back to the Builder with feedback.
@@ -314,7 +323,7 @@ first access and the functions resolve the catalog per call, so
 
 ```sh
 pip install -e '.[dev]'
-python -m unittest discover -s tests          # 244 tests at v0.1.0: runtime and harness assets
+python -m unittest discover -s tests          # 251 tests at v0.1.0: runtime and harness assets
 # CI also runs this on Python 3.11, 3.13, and 3.14; it needs no secret.
 ```
 

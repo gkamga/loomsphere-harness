@@ -7,7 +7,10 @@ first — every file here is Markdown with YAML front-matter or JSON validated
 against a JSON Schema — so it can be consumed by any repository, with or without
 the LoomSphere application.
 
-**Status: v0.1.0 — the complete standalone workflow is available.**
+**Status: v0.1.0 release candidate — the complete standalone workflow is available
+in this repository, but no tag or GitHub Release exists yet.** Until one does,
+treat the contents as a candidate and install from a commit SHA; see
+[docs/RELEASE-0.1.0.md](docs/RELEASE-0.1.0.md).
 
 ```
 Intake → Architect → recorded human approval → Builder
@@ -104,6 +107,20 @@ python3 tools/validate_harness.py            # unmodified validator, consumer sh
 python3 -m unittest discover -s tests        # validation semantics + consumption
 ```
 
+## License and security
+
+Apache License 2.0 — see [LICENSE](LICENSE). The authorship and provenance audit
+that cleared the repository for redistribution is
+[docs/LICENSING-PROVENANCE.md](docs/LICENSING-PROVENANCE.md). No `NOTICE` file is
+required or included: the repository redistributes no third-party material, and
+the declared dependencies keep their own upstream licenses (all permissive).
+
+What this harness does and does not protect you from — trust boundaries, model
+data exposure, generated-code execution, container isolation limits, credential
+handling, and the approval and acceptance controls — is in
+[docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). How to report a vulnerability is
+in [SECURITY.md](SECURITY.md).
+
 ## Scope and remaining work
 
 Delivered in phase 1: the four asset trees, extracted with their Git history,
@@ -143,17 +160,20 @@ Delivered in phase 2C.2 (this release):
 - **Implementation loop** (`implement`): Builder writes only inside an isolated
   `task-<key>` worktree, the runtime commits and screens the change set, a
   container runs the planned validation command with `--network none` and a
-  read-only root filesystem, then QA and Reviewer report against the approved
-  criteria. Rework iterates on the same base commit up to
+  read-only root filesystem, and QA and the Reviewer then report against the
+  approved criteria as separate model calls by the runtime — they are not
+  processes inside that container. Rework iterates on the same base commit up to
   `[implementation] max_iterations`.
 - **Delivery acceptance** (`changes`, `evidence`, `accept`, `reject-delivery`):
   the reviewed commit, changed files, validation evidence, QA and Reviewer
   reports, and the frozen acceptance contract are hashed into one deliverable
   digest, and the second human decision is bound to that digest.
-- **Protected verification:** every approved `pytest` acceptance selector is
+- **Acceptance verification:** every approved `pytest` acceptance selector is
   executed exactly as approved, with collection checks, source and image
   digests, and explicit `unverified` handling. A mandatory criterion without
-  matching evidence fails closed.
+  matching evidence fails closed. `protected-pytest` is not implemented in this
+  runtime; such a criterion resolves to `unsupported` and blocks acceptance
+  rather than passing by default.
 - **Store schema v2:** an existing v1 SQLite state file migrates in place.
 - **Reviewer retry** (`retry-review`): one retry of only the Reviewer after an
   `invalid-review-report` failure.
@@ -163,8 +183,10 @@ Not delivered, and not implied by this release:
 1. **Packaging and publication:** no PyPI publication and no Git tag. Install
    from a commit or checkout, or build a wheel locally. See
    [docs/RELEASE-0.1.0.md](docs/RELEASE-0.1.0.md).
-2. **Licensing:** no license file is committed. Choosing one is a human decision
-   that this release does not make.
+2. **Security posture:** the harness is documented, not audited. There is no
+   third-party security review and no coordinated-disclosure programme, and
+   [SECURITY.md](SECURITY.md) records why no private reporting channel is offered
+   yet.
 3. **Application-owned concerns:** database operations, API endpoints,
    authentication, ownership, application scope approval, the application's
    implementation queue, and hook payloads or durable hook records that depend on

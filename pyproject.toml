@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=69"]
+# PEP 639 support (`license` as an SPDX expression and `license-files`) needs
+# setuptools 77 or newer.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,11 +11,12 @@ description = "Standalone LoomSphere engineering harness runtime: Intake, Archit
 readme = "README.md"
 requires-python = ">=3.11"
 keywords = ["ai-agents", "engineering-harness", "code-review", "sandbox", "approval-gate"]
-# No `license` field: selecting a license is a human decision that this release
-# does not make. Add exactly one `license`/`license-files` declaration once a
-# LICENSE file is approved. See docs/RELEASE-0.1.0.md.
+# The owner selected Apache License 2.0 on 2026-11-03; the provenance audit is
+# in docs/LICENSING-PROVENANCE.md. `license` is an SPDX expression (PEP 639).
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

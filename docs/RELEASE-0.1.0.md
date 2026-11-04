@@ -1,21 +1,28 @@
 # Release 0.1.0 — developer distribution
 
-## Status: prepared, not published
+## Status: release candidate, not published
 
-This document is the release candidate record for `v0.1.0`. It was written during
-release preparation and records what the code does, how to install it, and which
-decisions remain with a human owner.
+This document is the release candidate record for `v0.1.0`. It records what the
+code does, how to install it, what was actually executed while preparing it, and
+which decisions remain with a human owner. The repository is a **release
+candidate**: the workflow is complete and validated, but no tag and no GitHub
+Release exist yet, so nothing here is a published distribution.
 
-Deliberately **not** done here:
+Deliberately **not** done while preparing this candidate:
 
 - No Git tag was created.
 - No GitHub release was published.
 - Nothing was uploaded to PyPI.
-- No license was chosen.
 - No branch was merged.
 
-The version string `0.1.0` appears only in `pyproject.toml`. Neither a local tag
-nor a remote tag named `v0.1.0` existed when this document was written.
+A license **was** selected and applied (Apache License 2.0, see
+[../LICENSE](../LICENSE) and [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md)),
+and security documentation **was** added ([../SECURITY.md](../SECURITY.md),
+[SECURITY-MODEL.md](SECURITY-MODEL.md)). One item inside that policy stays open:
+the repository owner must enable GitHub private vulnerability reporting before a
+private channel exists; until then `SECURITY.md` states plainly that there is
+none. The version string `0.1.0` appears in `pyproject.toml` and in the wheel
+name; no tag named `v0.1.0` exists locally or on the remote.
 
 ## What this release contains
 
@@ -33,14 +40,20 @@ Delivered capabilities:
 | --- | --- |
 | Intake and Architect stages | Run against your configured model provider; Intake can stop with a blocking clarification. |
 | Digest-bound approval | `approve` and `accept` require the exact digest printed by `show`; a stale digest is refused. |
-| Implementation loop | Builder proposes a commit; validation and review run inside the container. |
-| Container-only validation | No host fallback. Docker or Podman, `--network none`, read-only root filesystem, dropped capabilities, non-root user, resource limits, only the task worktree mounted, image pinned by `sha256:` id before execution. |
-| Protected verification | A mandatory acceptance criterion without digest-bound, image-bound selector evidence fails the run. |
+| Implementation loop | Builder proposes a commit inside an isolated worktree; validation runs in the container; QA and the Reviewer are separate model calls made by the runtime process, **not** processes inside the container. |
+| Container-only validation | No host fallback. Docker or Podman, `--network none`, read-only root filesystem, dropped capabilities, non-root user, resource limits, only the task worktree mounted, image pinned by `sha256:` id before execution. The container runs generated code and approved selectors; nothing else. |
+| Acceptance verification | `pytest` selectors are executed exactly as approved and bound to the before/after source digests and the image id; a mandatory criterion without that evidence fails the run, and a mandatory `unverified` criterion fails closed. |
 | QA and Reviewer | Reviewer reports are validated; `retry-review` re-runs only the Reviewer. |
 | Delivery acceptance | `accept --digest` closes the task. The runtime never pushes, opens a pull request, or merges. |
 | Tamper-evident record | A hash-chained audit trail, a per-task worktree digest before and after execution, and a recorded refusal reason for every rejected command. |
 | Persistence | SQLite store, schema v2, stored outside the target repository. A v1 store migrates in place. |
 | Trusted assets | Manifest v2 covering 41 assets, with a suite digest recorded on every approved run. |
+| Licensing | Apache License 2.0 in `LICENSE`; `License-Expression: Apache-2.0` and `License-File: LICENSE` in the wheel metadata; the redistribution audit is [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md). No `NOTICE` file is required by section 4(d). |
+| Installer hardening | `tools/harness_install.py` validates a whole archive before writing anything and refuses absolute paths, parent-directory traversal, symbolic and hard links, device/FIFO/sparse entries, and destinations that escape the extraction root. |
+
+`protected-pytest` is **not implemented in this runtime**. A protected-artifact
+criterion resolves to `unsupported` with the recorded obstacle and blocks
+readiness; it cannot pass by default.
 
 ## Two ways to consume the harness
 
@@ -97,72 +110,84 @@ resolve. Install from a checkout or from a locally built wheel.
 Follow `docs/QUICKSTART.md` for the full path from an empty config to a delivered
 task. `docs/RUNTIME.md` is the configuration and CLI reference.
 
-## What was verified while preparing this release
+## What was verified while preparing this candidate
 
-Everything below was executed locally on macOS with Python 3.11.11, 3.13.1, and
-3.14.2 and Docker 29.7.2; no Podman was present. Nothing is reported as passing
-that was not run.
+Everything below was executed locally on macOS (arm64) with Python 3.11.11,
+3.13.1, and 3.14.2, the installer check on Python 3.9.22, and Docker 29.7.2; no
+Podman was present. Nothing is reported as passing that was not run.
 
 | Check | Command | Observed result |
 | --- | --- | --- |
 | Wheel build | `python -m build --wheel --outdir /tmp/lsh-wheel` | `loomsphere_harness-0.1.0-py3-none-any.whl` built |
-| Wheel install, clean venv | `pip install /tmp/lsh-wheel/…whl` then `pip check` | `No broken requirements found.` |
-| CLI entry point | `loomsphere-harness --help` | 14 subcommands listed |
-| Fresh `git clone` install | `pip install -e '.[dev]'` in a new venv | exit 0, CLI resolves |
-| Full suite, Python 3.11 | `python -m unittest discover -s tests -q` | `Ran 244 tests`, `OK (skipped=2)` |
-| Full suite, Python 3.13 | same | `Ran 244 tests`, `OK (skipped=2)` |
-| Full suite, Python 3.14 | same | `Ran 244 tests`, `OK (skipped=2)` |
-| Full suite, fresh clone | same, from the clone | `Ran 244 tests`, `OK (skipped=2)` |
+| Wheel license metadata | inspect `dist-info/METADATA` | `Metadata-Version: 2.4`, `License-Expression: Apache-2.0`, `License-File: LICENSE` |
+| Wheel license payload | inspect the archive | `dist-info/licenses/LICENSE`, 201 lines / 11357 bytes, listed in `RECORD` with a sha256 |
+| Wheel install, clean venv | install the wheel, then `uv pip check` | `All installed packages are compatible` |
+| CLI entry point | `loomsphere-harness --help` | entry point resolves, 14 subcommands listed |
+| Full suite, Python 3.11 | `python -m unittest discover -s tests -q` | `Ran 251 tests`, `OK (skipped=2)` |
+| Full suite, Python 3.13 | same | `Ran 251 tests`, `OK (skipped=2)` |
+| Full suite, Python 3.14 | same | `Ran 251 tests`, `OK (skipped=2)` |
+| Installer job, Python 3.9 | `python -m unittest discover -s tests -p 'test_install.py' -q` | `Ran 25 tests`, `OK` — includes 7 archive-extraction security tests |
 | Manifest integrity | `python tools/build_manifest.py --check` | `manifest OK: 41 files, suite d63e813839290391e0b3479f50856b33eff8e4f1ae530134bb0bbd5dddd85fc7` |
 | Asset validation | `python tools/validate_harness.py` | `10 check groups, 0 error(s), 0 warning(s)` |
-| Declarative dry run | `harness_install.py install … --dry-run` | listed the files it would write, wrote nothing |
-| Declarative install | `harness_install.py install --ref <sha> --source <checkout>` | `installed 44 files from <sha> (suite d63e8138…)` |
-| Declarative verify | `harness_install.py verify --strict --source <checkout>` | `verify OK: 44 files match <sha>` |
+| Declarative install | `harness_install.py install --ref <sha> --source <checkout>` | `installed 44 files from 5217c86d… (suite d63e8138…)` |
+| Declarative verify | `harness_install.py verify --strict --source <checkout>` | `verify OK: 44 files match 5217c86d…` |
 | Asset discovery | `harness_install.py discover --json` | agents, skills, and hooks enumerated |
-| Sandbox image | `docker build -t loomsphere-pytest:python3.12 docker/pytest-sandbox` | built, id `sha256:024910f96cf9cb958cf3c35f547e4bf2b096ba9a1a278de840e83165f52b29e0` |
-| Happy-path init | `loomsphere-harness --config … init` | `verified 41 assets`, state written outside the target repo |
-| Inline credential refused | config with `[model] api_key = "…"` | `config-secret-in-file`, exit 2 |
-| Harness root inside target refused | `init` with `harness.root` = target | `harness-root-inside-target`, exit 2 |
-| Sandbox network refused | `sandbox.network = "bridge"` | `config-invalid`, exit 2 |
-| CI on the pull request | GitHub Actions, run 41767493994 | all five checks passed: suite on 3.11, 3.13, 3.14; installer on the oldest supported Python; manifest, assets, contracts, links, and consumption |
+| Declarative uninstall | `harness_install.py uninstall` | `uninstalled; original files restored`; target `git status` clean |
+| Sandbox validation smoke | `docker run` with the runtime's exact flags, `pytest -q` inside | `2 passed`; image id `sha256:024910f96cf9cb958cf3c35f547e4bf2b096ba9a1a278de840e83165f52b29e0` |
+| CI | GitHub Actions on the pull request | five jobs — suite on 3.11/3.13/3.14, installer on the oldest supported Python, and manifest/assets/contracts/links/consumption — recorded on the PR checks for the head commit |
 
-Disposable repositories, a synthetic non-functional API key, and a nonexistent
-provider host were used. No live model call was made, so model-backed stages
-(Intake, Architect, Builder, QA, Reviewer) are exercised by the test suite with
-fakes only; a live end-to-end run remains an operator exercise against a real
-provider.
+Disposable repositories, no live model call, and a synthetic `pytest` fixture were
+used. No model provider was contacted, so model-backed stages (Intake, Architect,
+Builder, QA, Reviewer) are exercised by the test suite with fakes only; a live
+end-to-end run remains an operator exercise against a real provider.
+
+CI results are deliberately not transcribed here as a run id. This document is
+committed to the branch it describes, so any run id written into it would name a
+commit that is no longer the head. The authoritative record is the PR check list
+for the final commit.
 
 ### Not verified here
 
-- Podman was not installed, so only the Docker path was executed. The runtime
-  treats Podman as an alternative container engine; that branch is covered by the
-  test suite, not by a live run.
+- Podman was not installed, so only the Docker path was executed live. The
+  runtime treats Podman as an alternative container engine; that branch is
+  covered by the test suite, not by a live run.
 - No live model provider was contacted.
-- CI has run once against the pull request that introduces this document, and
-  passed. A later change to anything under `.github/` that is covered by the suite
-  digest should be re-validated before the tag is created.
+- No live run of `protected-pytest`: the verification route is unimplemented in
+  this runtime and reports `unsupported`.
+- GitHub private vulnerability reporting is **disabled** on the repository
+  (`GET /repos/gkamga/loomsphere-harness/private-vulnerability-reporting` returns
+  `{"enabled": false}`), so no private disclosure channel exists yet.
 
 ## Decisions a human must make before publishing
 
-These are recorded as open, not as defaults.
+Recorded so that neither list is mistaken for an implicit default.
 
-1. **License.** No `LICENSE` file exists and `pyproject.toml` deliberately has no
-   `license` field. Selecting a license is a legal decision with consequences for
-   downstream reuse; it was not made here. Until it is, the repository is
-   all-rights-reserved by default in most jurisdictions, which contradicts the
-   intent of a developer distribution.
-2. **Security documentation.** There is no `SECURITY.md` and no disclosure
-   process. A tool that runs a language model against your repository and
-   executes generated changes in a container needs a stated policy for reporting
-   vulnerabilities and a stated threat model. Decide the policy, then add the
-   document; do not invent one in a release commit.
+Resolved for this candidate:
+
+1. **License — resolved.** Apache License 2.0 is applied in `LICENSE`, declared in
+   `pyproject.toml` as an SPDX expression with `license-files`, and carried into
+   the wheel metadata. The redistribution audit that supports it is
+   [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md) and found no unresolved
+   file-level blocker. No `NOTICE` file is included: no third-party material is
+   redistributed and no existing notice needed carrying forward, so section 4(d)
+   imposes no obligation.
+2. **Security documentation — resolved, one owner action outstanding.**
+   [../SECURITY.md](../SECURITY.md) states the supported versions, the disclosure
+   process, and what a report should contain;
+   [SECURITY-MODEL.md](SECURITY-MODEL.md) describes the implemented trust
+   boundaries and their limits. GitHub private vulnerability reporting is still
+   disabled on this repository. **The owner must enable it** under Settings →
+   Code security and analysis. Until that happens `SECURITY.md` says there is no
+   verified private channel; the document must be updated when it is enabled.
+
+Still open:
+
 3. **Publication channel.** Whether to publish to PyPI, and under which name, is
-   undecided. Nothing was uploaded. If a wheel is published later, the version
-   and the manifest suite digest must be re-verified against the tagged commit
-   first.
+   undecided. Nothing was uploaded. If a wheel is published later, rebuild it from
+   the tagged commit and re-check its metadata and suite digest first.
 4. **Tag and release.** `v0.1.0` exists as a version string only. Creating the tag
-   and the GitHub release is a human action performed after this PR is reviewed
-   and merged.
+   and the GitHub release is a human action performed after this change is
+   reviewed and merged.
 
 ## Upgrade notes
 
@@ -178,10 +203,26 @@ These are recorded as open, not as defaults.
   existing installation to the 0.1.0 commit; conflicting local edits are backed
   up and must be authorized explicitly.
 
-## Known observation
+## Installer archive extraction
 
-`tools/harness_install.py` extracts its source tarball with `tar.extractall()`
-and no `filter` argument, which raises a `DeprecationWarning` on Python 3.12+ and
-will change default behaviour in 3.14. It did not affect the installs verified
-above. Passing an explicit filter is a small, separate change and was left out of
-this documentation-focused release.
+The declarative installer reads `git archive <commit>` and unpacks it itself. It no
+longer calls `tar.extractall()`: the original implementation relied on an
+implicitly trusted archive and raised a `DeprecationWarning` on Python 3.12+.
+It now validates **every** member before writing **any** of them, and refuses:
+
+- absolute paths and any entry containing `..`;
+- symbolic links and hard links;
+- device nodes, FIFOs, and other non-regular, non-directory types;
+- an entry whose resolved destination leaves the extraction root, including an
+  entry that traverses a directory created by an earlier member.
+
+The implementation uses only the `tarfile` API available on every supported
+interpreter down to Python 3.9, so it needs no `filter=` argument and behaves the
+same on 3.9 and 3.14. Modes are preserved, with `0o644` as the fallback for an
+entry that declares none. Seven regression tests cover a clean archive plus each
+refusal, one of them end to end through `harness_install.py install`; they run in
+the Python 3.9 installer job as well as on the newer interpreters.
+
+This changed nothing else: path resolution, the manifest verification performed
+before extraction, conflict handling, locking, and uninstall are untouched, and
+the install/verify/uninstall results above were produced by the hardened code.
