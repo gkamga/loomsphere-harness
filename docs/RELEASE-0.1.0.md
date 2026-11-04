@@ -18,11 +18,11 @@ Deliberately **not** done while preparing this candidate:
 A license **was** selected and applied (Apache License 2.0, see
 [../LICENSE](../LICENSE) and [LICENSING-PROVENANCE.md](LICENSING-PROVENANCE.md)),
 and security documentation **was** added ([../SECURITY.md](../SECURITY.md),
-[SECURITY-MODEL.md](SECURITY-MODEL.md)). One item inside that policy stays open:
-the repository owner must enable GitHub private vulnerability reporting before a
-private channel exists; until then `SECURITY.md` states plainly that there is
-none. The version string `0.1.0` appears in `pyproject.toml` and in the wheel
-name; no tag named `v0.1.0` exists locally or on the remote.
+[SECURITY-MODEL.md](SECURITY-MODEL.md)). GitHub private vulnerability reporting
+was enabled by the repository owner, so the security-reporting prerequisite is
+satisfied: `SECURITY.md` now publishes the private advisory link. The version
+string `0.1.0` appears in `pyproject.toml` and in the wheel name; no tag named
+`v0.1.0` exists locally or on the remote.
 
 ## What this release contains
 
@@ -129,6 +129,7 @@ Podman was present. Nothing is reported as passing that was not run.
 | Installer job, Python 3.9 | `python -m unittest discover -s tests -p 'test_install.py' -q` | `Ran 25 tests`, `OK` — includes 7 archive-extraction security tests |
 | Manifest integrity | `python tools/build_manifest.py --check` | `manifest OK: 41 files, suite d63e813839290391e0b3479f50856b33eff8e4f1ae530134bb0bbd5dddd85fc7` |
 | Asset validation | `python tools/validate_harness.py` | `10 check groups, 0 error(s), 0 warning(s)` |
+| Private vulnerability reporting | `gh api repos/gkamga/loomsphere-harness/private-vulnerability-reporting` | `{"enabled": true}` — the advisory link is published in `SECURITY.md` |
 | Declarative install | `harness_install.py install --ref <sha> --source <checkout>` | `installed 44 files from 5217c86d… (suite d63e8138…)` |
 | Declarative verify | `harness_install.py verify --strict --source <checkout>` | `verify OK: 44 files match 5217c86d…` |
 | Asset discovery | `harness_install.py discover --json` | agents, skills, and hooks enumerated |
@@ -154,9 +155,6 @@ for the final commit.
 - No live model provider was contacted.
 - No live run of `protected-pytest`: the verification route is unimplemented in
   this runtime and reports `unsupported`.
-- GitHub private vulnerability reporting is **disabled** on the repository
-  (`GET /repos/gkamga/loomsphere-harness/private-vulnerability-reporting` returns
-  `{"enabled": false}`), so no private disclosure channel exists yet.
 
 ## Decisions a human must make before publishing
 
@@ -171,14 +169,13 @@ Resolved for this candidate:
    file-level blocker. No `NOTICE` file is included: no third-party material is
    redistributed and no existing notice needed carrying forward, so section 4(d)
    imposes no obligation.
-2. **Security documentation — resolved, one owner action outstanding.**
+2. **Security documentation — resolved.**
    [../SECURITY.md](../SECURITY.md) states the supported versions, the disclosure
    process, and what a report should contain;
    [SECURITY-MODEL.md](SECURITY-MODEL.md) describes the implemented trust
-   boundaries and their limits. GitHub private vulnerability reporting is still
-   disabled on this repository. **The owner must enable it** under Settings →
-   Code security and analysis. Until that happens `SECURITY.md` says there is no
-   verified private channel; the document must be updated when it is enabled.
+   boundaries and their limits. GitHub private vulnerability reporting is enabled
+   on this repository (verified with the GitHub API), and `SECURITY.md` publishes
+   the private advisory link.
 
 Still open:
 

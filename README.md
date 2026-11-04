@@ -184,9 +184,9 @@ Not delivered, and not implied by this release:
    from a commit or checkout, or build a wheel locally. See
    [docs/RELEASE-0.1.0.md](docs/RELEASE-0.1.0.md).
 2. **Security posture:** the harness is documented, not audited. There is no
-   third-party security review and no coordinated-disclosure programme, and
-   [SECURITY.md](SECURITY.md) records why no private reporting channel is offered
-   yet.
+   third-party security review and no coordinated-disclosure programme, though
+   [SECURITY.md](SECURITY.md) publishes the private reporting channel and the
+   supported-version policy.
 3. **Application-owned concerns:** database operations, API endpoints,
    authentication, ownership, application scope approval, the application's
    implementation queue, and hook payloads or durable hook records that depend on

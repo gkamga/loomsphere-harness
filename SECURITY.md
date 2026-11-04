@@ -18,35 +18,25 @@ security-response service-level commitment.
 
 ## Reporting a vulnerability
 
-**There is no verified private reporting channel at this commit.** GitHub Private
-Vulnerability Reporting is disabled for this repository (checked with the GitHub
-API: `private-vulnerability-reporting` returns `{"enabled":false}`). This
-document does not publish an email address or claim a private channel exists,
-because neither would be a channel anyone monitors.
+**Report privately through GitHub Private Vulnerability Reporting.** The
+channel is enabled for this repository (verified with the GitHub API:
+`GET /repos/gkamga/loomsphere-harness/private-vulnerability-reporting` returns
+`{"enabled": true}`). Open a draft advisory here:
+
+<https://github.com/gkamga/loomsphere-harness/security/advisories/new>
+
+The advisory is visible only to you and the repository maintainers until it is
+published, so exploit details may be included there.
 
 **Do not open a public GitHub issue, discussion, or pull request that contains
 exploit details, proof-of-concept code, or secrets.** That includes reports about
 the sandbox boundary, the installer's archive extraction, the approval or
-acceptance gates, and credential handling.
-
-### Required action by the repository owner
-
-Enabling private reporting is a repository administration change that an agent
-cannot make:
-
-1. Open the repository on GitHub → **Settings** → **Code security and analysis**.
-2. Enable **Private vulnerability reporting**.
-3. Replace the paragraph above with the enabled channel, and add the advisory
-   link `https://github.com/gkamga/loomsphere-harness/security/advisories/new`.
-
-Until step 2 is done, a researcher who finds a security defect should withhold
-the details and state only, in a public issue with no technical content, that
-they have a report to deliver and need a private channel. Non-sensitive
-hardening suggestions and ordinary bugs are welcome as public issues.
+acceptance gates, and credential handling. Non-sensitive hardening suggestions
+and ordinary bugs are welcome as public issues.
 
 ### What a report should contain
 
-Once a private channel exists, a useful report includes:
+A useful report includes:
 
 - the affected version, commit SHA, and the file or subsystem involved;
 - the configuration needed to reproduce it, with secrets and API keys removed;
