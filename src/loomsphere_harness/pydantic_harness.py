@@ -57,6 +57,13 @@ RESULT_PREVIEW_CHARS = 320
 #: Smaller models call tools that do not exist (for example a shell). Each such
 #: call is refused; a few retries let the model recover without widening any grant.
 TOOL_RETRIES = 5
+#: A provider reporting this finish reason stopped at the token ceiling rather
+#: than because it had finished. It is authoritative: the text is incomplete.
+TRUNCATING_FINISH_REASONS = frozenset({"length"})
+#: Raised as the failure reason so a truncated run is never reported as a bad
+#: contract. Reporting it as ``invalid-intake`` hid the real cause.
+REASON_RESPONSE_TRUNCATED = "response-truncated"
+TRUNCATION_EXCERPT_CHARS = 400
 
 INSTRUCTIONS = (
     "You are a LoomSphere agent. Work only through the provided file tools, which "
@@ -358,6 +365,21 @@ class PydanticHarnessRunner:
             "tool_activity": _tool_activity(result.all_messages()),
         }
         response = str(result.output or "").strip()
+        truncation = truncation_evidence(
+            finish_reason=finish_reason(result),
+            output_tokens=usage.output_tokens,
+            max_output_tokens=config.max_output_tokens,
+            response=response,
+        )
+        if truncation is not None:
+            # Reported before the empty check: a run cut off at the first token is
+            # truncated, not empty, and the two need different remediation.
+            raise _RunFailure(
+                REASON_RESPONSE_TRUNCATED,
+                truncation_detail(truncation, response=response),
+                events={**events, "truncation": truncation},
+                response_text=response or None,
+            )
         if not response:
             raise _RunFailure(
                 "empty-response",
@@ -365,6 +387,101 @@ class PydanticHarnessRunner:
                 events=events,
             )
         return AgentRunResult(response_text=response, exit_code=0, events=events)
+
+
+def finish_reason(result: object) -> str | None:
+    """The provider's stop reason for the run's final model response."""
+
+    direct = getattr(getattr(result, "response", None), "finish_reason", None)
+    if isinstance(direct, str):
+        return direct
+    messages = getattr(result, "all_messages", None)
+    if not callable(messages):
+        return None
+    for message in reversed(list(messages())):
+        candidate = getattr(message, "finish_reason", None)
+        if isinstance(candidate, str):
+            return candidate
+    return None
+
+
+def looks_incomplete(text: str) -> bool:
+    """Whether a response stops mid-structure, by fence count or bracket balance.
+
+    Used only as corroboration: an unfinished response is not by itself proof of
+    truncation, because the model may simply have answered badly.
+    """
+
+    if text.count("```") % 2:
+        return True
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "{[":
+            depth += 1
+        elif character in "}]":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0 or in_string
+
+
+def truncation_evidence(
+    *,
+    finish_reason: str | None,
+    output_tokens: int | None,
+    max_output_tokens: int | None,
+    response: str,
+) -> dict[str, object] | None:
+    """Describe an output-token truncation, or ``None`` when the run finished.
+
+    A provider ``length`` finish reason is authoritative. Reaching the configured
+    output ceiling only counts when the text also stops mid-structure, so a run
+    that used its whole budget and finished cleanly is still accepted.
+    """
+
+    signals: list[str] = []
+    if finish_reason in TRUNCATING_FINISH_REASONS:
+        signals.append("finish-reason-length")
+    at_ceiling = bool(max_output_tokens) and (output_tokens or 0) >= int(max_output_tokens or 0)
+    incomplete = looks_incomplete(response)
+    if at_ceiling and (incomplete or finish_reason is None):
+        signals.append("output-token-ceiling")
+    if not signals:
+        return None
+    if incomplete:
+        signals.append("incomplete-payload")
+    return {
+        "signals": signals,
+        "finish_reason": finish_reason,
+        "output_tokens": output_tokens,
+        "max_output_tokens": max_output_tokens,
+        "response_chars": len(response),
+        "response_excerpt": response[-TRUNCATION_EXCERPT_CHARS:],
+    }
+
+
+def truncation_detail(evidence: dict[str, object], *, response: str) -> str:
+    signals = ", ".join(str(signal) for signal in evidence.get("signals", ()))
+    return (
+        "The model's response was truncated before it finished "
+        f"({signals or 'truncated'}; {len(response)} characters, finish reason "
+        f"{evidence.get('finish_reason')!r}, output tokens "
+        f"{evidence.get('output_tokens')} of {evidence.get('max_output_tokens')}). "
+        "The incomplete text was not parsed as a contract. Raise "
+        "model.max_output_tokens or shorten the required response."
+    )
 
 
 class _RunFailure(Exception):

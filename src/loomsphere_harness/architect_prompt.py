@@ -91,9 +91,8 @@ make the run fail:
       "approach": "how the change satisfies it",
       "mandatory": true,
       "verification": {
-        "kind": "protected-pytest",
-        "artifact": "trusted-artifact-key",
-        "selector": "test_case"
+        "kind": "pytest",
+        "selector": "tests/test_file.py::test_case"
       }
     }
   ],
@@ -103,9 +102,10 @@ make the run fail:
   "validation_strategy": ["validation step"],
   "open_questions": ["question that must be answered by a human"]
 }
-Use ``pytest`` with a bounded repository selector only when the requirement
-permits Builder-authored verification. Use ``protected-pytest`` with a trusted
-artifact key and node selector when independent verification is required.
+Verification kinds available in this runtime: ``pytest`` (a bounded repository
+selector the Builder is expected to add or that already exists) and ``unverified``
+(no independent check is possible). No protected-artifact registry exists here, so
+never emit ``protected-pytest``, an ``artifact`` key, a version, or a digest.
 """
 
 
