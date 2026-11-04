@@ -124,6 +124,7 @@ that was not run.
 | Inline credential refused | config with `[model] api_key = "…"` | `config-secret-in-file`, exit 2 |
 | Harness root inside target refused | `init` with `harness.root` = target | `harness-root-inside-target`, exit 2 |
 | Sandbox network refused | `sandbox.network = "bridge"` | `config-invalid`, exit 2 |
+| CI on the pull request | GitHub Actions, run 41767493994 | all five checks passed: suite on 3.11, 3.13, 3.14; installer on the oldest supported Python; manifest, assets, contracts, links, and consumption |
 
 Disposable repositories, a synthetic non-functional API key, and a nonexistent
 provider host were used. No live model call was made, so model-backed stages
@@ -137,9 +138,9 @@ provider.
   treats Podman as an alternative container engine; that branch is covered by the
   test suite, not by a live run.
 - No live model provider was contacted.
-- CI itself has not run against this branch yet. The three-version matrix above was
-  reproduced locally with managed CPython builds; the CI run is the authoritative
-  record and should be read from the pull request.
+- CI has run once against the pull request that introduces this document, and
+  passed. A later change to anything under `.github/` that is covered by the suite
+  digest should be re-validated before the tag is created.
 
 ## Decisions a human must make before publishing
 
