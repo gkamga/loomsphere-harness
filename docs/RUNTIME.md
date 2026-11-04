@@ -1,4 +1,4 @@
-# Standalone runtime (phase 2C.2)
+# Standalone runtime (v0.1.0)
 
 `loomsphere-harness` is the portable runtime and a minimal CLI for one workflow:
 
@@ -18,11 +18,19 @@ store is now schema v2 and migrates an existing v1 state file in place.
 
 ## Install
 
+Requirements: Python 3.11+, Git, and Docker or Podman for `implement`. The model
+is your own provider; there is no bundled endpoint, model, or credential.
+
 ```sh
-python3.11+ -m venv .venv && . .venv/bin/activate
-pip install -e .            # Python >= 3.11
+python3 -m venv .venv && . .venv/bin/activate
+pip install .               # from this checkout; Python >= 3.11
+# or a locally built wheel: pip install dist/loomsphere_harness-0.1.0-py3-none-any.whl
 loomsphere-harness --help   # or: python -m loomsphere_harness
 ```
+
+`pip install -e .` works for development. The package is **not** published to
+PyPI, so `pip install loomsphere-harness` will not resolve; install from a
+checkout or from a wheel built with `python -m build`.
 
 Dependencies: `pydantic>=2.11`, `pydantic-ai-slim[openai]>=2.64.0`,
 `pydantic-ai-harness>=0.64.0` (dev extra: `PyYAML`, `jsonschema`, for the asset validators).
@@ -110,6 +118,7 @@ loomsphere-harness --repo . show T-0001        # proposal, criteria, digest
 loomsphere-harness --repo . approve T-0001 --digest <proposal sha256>
 loomsphere-harness --repo . reject  T-0001 --digest <sha256> --reason "..."
 loomsphere-harness --repo . implement T-0001   # Builder, validation, QA, Reviewer
+loomsphere-harness --repo . retry-review T-0001 # one Reviewer-only retry
 loomsphere-harness --repo . changes T-0001     # recorded change set of the deliverable
 loomsphere-harness --repo . evidence T-0001    # validation run and review evidence
 loomsphere-harness --repo . accept  T-0001 --digest <deliverable sha256> [--reason "..."]
@@ -117,6 +126,9 @@ loomsphere-harness --repo . reject-delivery T-0001 --digest <sha256> --reason ".
 loomsphere-harness --repo . status [T-0001]    # state, runs, model, prompt digests, tools
 loomsphere-harness --repo . audit  [T-0001]    # hash-chained audit trail, verified
 ```
+
+`init` requires `[harness] root`; it verifies the asset set there and binds the
+repository to it. The runtime never reads assets from inside the target repo.
 
 `--json` gives machine-readable output. Exit codes: `0` ok, `2` refused (error on
 stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
@@ -302,7 +314,7 @@ first access and the functions resolve the catalog per call, so
 
 ```sh
 pip install -e '.[dev]'
-python -m unittest discover -s tests          # 216 tests; runtime and harness assets
+python -m unittest discover -s tests          # 244 tests at v0.1.0: runtime and harness assets
 # CI also runs this on Python 3.11, 3.13, and 3.14; it needs no secret.
 ```
 
@@ -322,6 +334,9 @@ LOOMSPHERE_ACCEPTANCE_MODEL=deepseek/deepseek-v4.1-flash-1017 \
 
 A live implementation run additionally needs a locally present sandbox image,
 because the runtime pins it by `sha256:` id before executing anything. The
-repository's asset validators (`tools/validate_assets.py`) report pre-existing
-example-contract errors for `scripts/validate_factory.py`; that path does not exist
-at this branch's base or here, and this milestone does not touch it.
+repository's asset validators also pass in a plain checkout:
+
+```sh
+python tools/build_manifest.py --check     # 41 assets, suite digest unchanged
+python tools/validate_harness.py           # 10 check groups, 0 errors, 0 warnings
+```
