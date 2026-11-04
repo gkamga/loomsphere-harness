@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from loomsphere_harness.config import DEFAULT_VALIDATION_ALLOWLIST, SandboxConfig, ValidationConfig
+from loomsphere_harness.schemas.acceptance_contract import build_contract
 from loomsphere_harness.sandbox import (
     REASON_IMAGE_UNAVAILABLE,
     REASON_LAUNCH_FAILED,
@@ -30,14 +31,18 @@ from loomsphere_harness.sandbox import (
 )
 from loomsphere_harness.validation import (
     REASON_NOT_ALLOWLISTED,
+    REASON_PYTEST_SELECTOR_NOT_FOUND,
+    REASON_PYTEST_UNAVAILABLE,
     REASON_SANDBOX_UNAVAILABLE,
     REASON_TIMED_OUT,
     REASON_WORKSPACE_CHANGED,
     ValidationPlan,
     ValidationPlanError,
     execute_validation,
+    execute_acceptance_verifications,
     plan_validation,
 )
+from loomsphere_harness.workspace import workspace_digest
 from support import TempCase, git, make_consumer_repo
 
 IMAGE = "python:3.12-slim"
@@ -427,6 +432,131 @@ class ValidationExecutionTests(TempCase):
 
         self.assertEqual(caught.exception.code, REASON_NOT_ALLOWLISTED)
         self.assertEqual(runtime.calls, [])
+
+
+class AcceptanceVerificationTests(TempCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.workspace = make_consumer_repo(self.tmp)
+
+    def verify(self, runtime, *, selector="tests/test_contract.py::test_required", **overrides):
+        executor = SandboxExecutor(
+            policy(), runtime="docker", startup_grace_seconds=5, runner=runtime
+        )
+        contract = build_contract(
+            [
+                {
+                    "criterion": "The required behavior is correct.",
+                    "verification": {"kind": "pytest", "selector": selector},
+                }
+            ]
+        )
+        expected = {
+            "timeout_seconds": 60,
+            "sandbox": SandboxConfig(image=IMAGE),
+            "executor": executor,
+            "expected_source_digest": workspace_digest(self.workspace),
+            "expected_image_id": IMAGE_ID,
+        }
+        expected.update(overrides)
+        return execute_acceptance_verifications(
+            contract, self.workspace, **expected
+        )
+
+    def runtime(self, *, version_code=0, collection_code=0, test_code=0, output="ok\n"):
+        calls: list[list[str]] = []
+
+        def runner(arguments, **kwargs):
+            args = [str(item) for item in arguments]
+            calls.append(args)
+            if args[1:3] == ["image", "inspect"]:
+                return completed(IMAGE_ID)
+            command = args[args.index(IMAGE) + 1 :]
+            if "--version" in command:
+                return completed(output, returncode=version_code)
+            if "--collect-only" in command:
+                return completed(output, returncode=collection_code)
+            return completed(output, returncode=test_code)
+
+        return runner, calls
+
+    def test_the_exact_selector_is_collected_and_executed_with_bound_evidence(self) -> None:
+        runner, calls = self.runtime()
+        selector = "tests/test_contract.py::test_required"
+
+        coverage = self.verify(runner, selector=selector)
+
+        result = coverage["criteria"][0]
+        self.assertEqual(coverage["environment_check"]["status"], "succeeded")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["selector_exists"])
+        self.assertTrue(result["selector_executed"])
+        self.assertEqual(
+            result["collection"]["command"],
+            ["python", "-m", "pytest", "--collect-only", "-q", selector],
+        )
+        self.assertEqual(
+            result["execution"]["command"],
+            ["python", "-m", "pytest", "-q", selector],
+        )
+        for evidence in (
+            coverage["environment_check"],
+            result["collection"],
+            result["execution"],
+        ):
+            self.assertEqual(evidence["source_digest"], workspace_digest(self.workspace))
+            self.assertEqual(evidence["source_digest_after"], evidence["source_digest"])
+            self.assertEqual(evidence["sandbox_image_id"], IMAGE_ID)
+        sandbox_runs = [call for call in calls if call[1:2] == ["run"]]
+        self.assertEqual(len(sandbox_runs), 3)
+        self.assertTrue(all(call[call.index("--network") + 1] == "none" for call in sandbox_runs))
+
+    def test_a_missing_selector_is_not_counted_as_executed(self) -> None:
+        runner, calls = self.runtime(
+            collection_code=4,
+            output="ERROR: file or directory not found: tests/test_missing.py::test_required",
+        )
+
+        coverage = self.verify(
+            runner, selector="tests/test_missing.py::test_required"
+        )
+
+        result = coverage["criteria"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["selector_exists"])
+        self.assertFalse(result["selector_executed"])
+        self.assertEqual(result["failure_reason"], REASON_PYTEST_SELECTOR_NOT_FOUND)
+        self.assertEqual(
+            len([call for call in calls if call[1:2] == ["run"]]),
+            2,
+        )
+
+    def test_an_image_without_pytest_reports_the_environment_obstacle(self) -> None:
+        runner, calls = self.runtime(
+            version_code=1, output="No module named pytest"
+        )
+
+        coverage = self.verify(runner)
+
+        result = coverage["criteria"][0]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["failure_reason"], REASON_PYTEST_UNAVAILABLE)
+        self.assertFalse(result["selector_executed"])
+        self.assertIn("No module named pytest", result["obstacle"])
+        self.assertEqual(
+            len([call for call in calls if call[1:2] == ["run"]]),
+            1,
+        )
+
+    def test_a_different_image_identity_cannot_satisfy_the_obligation(self) -> None:
+        runner, _ = self.runtime()
+
+        coverage = self.verify(runner, expected_image_id="sha256:" + "d" * 64)
+
+        result = coverage["criteria"][0]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["failure_reason"], "acceptance-evidence-mismatch")
+        self.assertFalse(result["selector_executed"])
 
 
 if __name__ == "__main__":

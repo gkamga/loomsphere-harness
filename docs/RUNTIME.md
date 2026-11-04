@@ -55,7 +55,7 @@ api_key_env = "LOOMSPHERE_MODEL_API_KEY"         # NAME of the env var holding t
 # default: a "workspaces" directory beside the state file; never inside the repo
 
 [sandbox]                                    # required before any implementation run
-image = "python:3.12-slim"                   # must exist locally; pinned by sha256 id per run
+image = "loomsphere-pytest:python3.12"         # must exist locally; pinned by sha256 id per run
 # runtime = "docker"                         # container runtime only: docker or podman
 # cpus = 2.0, memory_mb = 2048, pids_limit = 256, tmpfs_mb = 256
 # timeout_seconds = 300, startup_grace_seconds = 30
@@ -68,6 +68,20 @@ image = "python:3.12-slim"                   # must exist locally; pinned by sha
 [implementation]
 # max_iterations = 2                         # Builder attempts before the loop fails
 ```
+
+For Python acceptance selectors, configure a local image with pytest already
+installed. The repository provides one:
+
+```
+docker build -t loomsphere-pytest:python3.12 docker/pytest-sandbox
+```
+
+The image build is the only step that needs package access. Implementation-time
+validation runs with `--network none`; the runtime never installs pytest or
+substitutes a different test command. It probes pytest in the configured image,
+collects each approved selector, then executes that exact selector in the same
+read-only, digest-checked sandbox. The resulting evidence records the selector
+existence, execution status and exit code, source digest, and resolved image id.
 
 A `[sandbox]` table without `image` is refused, as is `runtime = "host"` and any
 `network` other than `none`: there is no host execution fallback and no internal
@@ -172,7 +186,12 @@ iteration is:
    (`unauthorized-path`, `secret-path`, `no-changes`).
 3. **Validation** plans and executes the allowlisted command in the container and
    records the command, status, exit code, duration, image, workspace digest, and
-   output digest.
+   output digest. It also executes every declared `pytest` acceptance selector
+   exactly as approved, after checking collection. Missing selectors, failed runs,
+   or source/image evidence that does not match the main validation run block
+   readiness. Mandatory `unverified` and unsupported protected selectors remain
+   explicit and also block readiness; optional obligations are recorded without
+   being labeled verified.
 4. **QA** reports `passed` or `failed` with findings and a claim per approved
    criterion. A `failed` verdict, a blocking finding, or a criterion the report
    never mentions sends the iteration back to the Builder with feedback.
@@ -185,9 +204,12 @@ Iteration statuses are `building`, `built`, `validating`, `qa_running`,
 `iterations-exhausted`, `invalid-build-report`, `invalid-qa-report`,
 `invalid-review-report`, `validation-failed`, `qa-blocked`,
 `review-changes-required`, `review-rejected`, and
-`acceptance-contract-unavailable`. Reaching the limit is not a crash: every
-attempt stays recorded, the task is left `changes_required`, and a human decides
-what happens next.
+`acceptance-contract-unavailable`. A mandatory criterion without successful,
+source- and image-bound selector evidence fails as
+`acceptance-verification-incomplete`; a mandatory `unverified` criterion also
+fails closed. Reaching the iteration limit is not a crash: every attempt stays
+recorded, the task is left `changes_required`, and a human decides what happens
+next.
 
 Rework reuses the same `base_commit` and produces a new commit, so two attempts
 are always distinguishable in `status` and in the audit trail.

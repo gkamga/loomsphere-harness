@@ -62,6 +62,7 @@ from loomsphere_harness.validation import (
     VALIDATION_STATUS_SUCCEEDED,
     ValidationOutcome,
     ValidationPlanError,
+    execute_acceptance_verifications,
     execute_validation,
     plan_validation,
 )
@@ -85,6 +86,7 @@ REASON_INVALID_BUILD_REPORT = "invalid-build-report"
 REASON_INVALID_QA_REPORT = "invalid-qa-report"
 REASON_INVALID_REVIEW_REPORT = "invalid-review-report"
 REASON_VALIDATION_FAILED = "validation-failed"
+REASON_ACCEPTANCE_VERIFICATION_INCOMPLETE = "acceptance-verification-incomplete"
 REASON_QA_BLOCKED = "qa-blocked"
 REASON_REVIEW_BLOCKED = "review-changes-required"
 REASON_REVIEW_REJECTED = "review-rejected"
@@ -249,7 +251,7 @@ class ImplementationStage:
         ):
             refuse("The recorded QA evidence does not support a Reviewer run.")
 
-        validation = self._recorded_validation(iteration)
+        validation = self._recorded_validation(iteration, contract)
 
         # The worktree must still hold exactly the validated, QA-checked commit.
         path = workspace_path_for(engine.workspace_root, task_id)
@@ -377,7 +379,9 @@ class ImplementationStage:
             self._refuse(f"The recorded {role} report does not match its stored digest.")
         return report
 
-    def _recorded_validation(self, iteration: dict[str, Any]) -> ValidationOutcome:
+    def _recorded_validation(
+        self, iteration: dict[str, Any], contract: AcceptanceContract
+    ) -> ValidationOutcome:
         record = iteration.get("validation")
         if (
             not isinstance(record, dict)
@@ -388,6 +392,99 @@ class ImplementationStage:
             or not record.get("output_digest")
         ):
             self._refuse("The recorded validation evidence is missing or did not succeed.")
+        coverage = record.get("verification_coverage")
+        coverage_criteria = coverage.get("criteria") if isinstance(coverage, dict) else None
+        if not isinstance(coverage_criteria, list):
+            self._refuse("The recorded acceptance verification evidence is missing.")
+        by_id = {
+            item.get("id"): item
+            for item in coverage_criteria
+            if isinstance(item, dict)
+        }
+        if len(coverage_criteria) != len(contract.criteria) or len(by_id) != len(
+            contract.criteria
+        ):
+            self._refuse("The recorded acceptance verification set is incomplete.")
+        expected_source = record.get("workspace_digest")
+        expected_image = record.get("sandbox_image_id")
+        if (
+            not isinstance(expected_source, str)
+            or not isinstance(expected_image, str)
+            or not expected_image.startswith("sha256:")
+        ):
+            self._refuse("The recorded validation is not bound to a source and image.")
+        if any(item.verification.kind == "pytest" for item in contract.criteria):
+            environment = coverage.get("environment_check")
+            if (
+                not isinstance(environment, dict)
+                or environment.get("command")
+                != ["python", "-m", "pytest", "--version"]
+                or environment.get("status") != VALIDATION_STATUS_SUCCEEDED
+                or environment.get("source_digest") != expected_source
+                or environment.get("source_digest_after") != expected_source
+                or environment.get("sandbox_image_id") != expected_image
+            ):
+                self._refuse(
+                    "The recorded pytest environment check does not match the "
+                    "validated source and sandbox image."
+                )
+        for criterion in contract.criteria:
+            evidence = by_id.get(criterion.id)
+            if (
+                evidence is None
+                or evidence.get("declared") != criterion.verification.model_dump(mode="json")
+                or evidence.get("mandatory") != criterion.mandatory
+            ):
+                self._refuse(
+                    f"The recorded acceptance verification for {criterion.id} is missing "
+                    "or does not match the approved contract."
+                )
+            if not criterion.mandatory:
+                continue
+            if evidence.get("status") != VALIDATION_STATUS_SUCCEEDED:
+                self._refuse(
+                    f"The mandatory acceptance verification for {criterion.id} "
+                    f"did not succeed ({evidence.get('failure_reason') or evidence.get('status')})."
+                )
+            if criterion.verification.kind != "pytest":
+                self._refuse(
+                    f"The mandatory acceptance verification for {criterion.id} has no "
+                    "supported machine execution route."
+                )
+            selector = criterion.verification.selector
+            expected_command = ["python", "-m", "pytest", "-q", selector]
+            expected_collection = [
+                "python", "-m", "pytest", "--collect-only", "-q", selector
+            ]
+            execution = evidence.get("execution")
+            collection = evidence.get("collection")
+            if (
+                evidence.get("selector_exists") is not True
+                or evidence.get("selector_executed") is not True
+                or not isinstance(execution, dict)
+                or execution.get("command") != expected_command
+                or execution.get("status") != VALIDATION_STATUS_SUCCEEDED
+                or execution.get("exit_code") != 0
+                or execution.get("source_digest") != expected_source
+                or execution.get("source_digest_after") != expected_source
+                or execution.get("sandbox_image_id") != expected_image
+                or execution.get("sandbox_image") != record.get("sandbox_image")
+                or not execution.get("output_digest")
+                or not isinstance(collection, dict)
+                or collection.get("command") != expected_collection
+                or collection.get("status") != VALIDATION_STATUS_SUCCEEDED
+                or collection.get("exit_code") != 0
+                or collection.get("source_digest") != expected_source
+                or collection.get("source_digest_after") != expected_source
+                or collection.get("sandbox_image_id") != expected_image
+                or collection.get("sandbox_image") != record.get("sandbox_image")
+                or not collection.get("output_digest")
+            ):
+                self._refuse(
+                    f"The mandatory acceptance verification evidence for {criterion.id} "
+                    "does not bind a successful exact-selector run to the validated source "
+                    "and sandbox image."
+                )
         return ValidationOutcome(
             command=tuple(record["command"]),
             status=record["status"],
@@ -400,6 +497,7 @@ class ImplementationStage:
             sandbox_image=record.get("sandbox_image"),
             sandbox_image_id=record.get("sandbox_image_id"),
             execution=dict(record.get("execution") or {}),
+            verification_coverage=dict(coverage),
         )
 
     # -- one iteration -------------------------------------------------------
@@ -517,7 +615,9 @@ class ImplementationStage:
         )
 
         # 4. Executed validation, in the sandbox, against this exact commit.
-        outcome = self._validate(workspace.path, iteration_id, task_id, actor)
+        outcome = self._validate(
+            workspace.path, iteration_id, task_id, actor, contract
+        )
         if outcome is None:
             return self._record_failure(
                 task_id, iteration_id, reason=REASON_VALIDATION_FAILED,
@@ -723,7 +823,12 @@ class ImplementationStage:
 
     # -- validation ----------------------------------------------------------
     def _validate(
-        self, workspace_path: Any, iteration_id: str, task_id: str, actor: str
+        self,
+        workspace_path: Any,
+        iteration_id: str,
+        task_id: str,
+        actor: str,
+        contract: AcceptanceContract,
     ) -> ValidationOutcome | dict[str, Any] | None:
         """Plan and execute the validation command, recording the evidence."""
 
@@ -751,6 +856,37 @@ class ImplementationStage:
             sandbox=engine.config.sandbox,
             executor=engine.sandbox_executor,
         )
+        if record.succeeded:
+            verification_coverage = execute_acceptance_verifications(
+                contract,
+                workspace_path,
+                timeout_seconds=validation_config.timeout_seconds,
+                sandbox=engine.config.sandbox,
+                executor=engine.sandbox_executor,
+                expected_source_digest=record.workspace_digest,
+                expected_image_id=record.sandbox_image_id,
+            )
+        else:
+            verification_coverage = {
+                "environment_check": None,
+                "criteria": [
+                    {
+                        "id": item.id,
+                        "mandatory": item.mandatory,
+                        "declared": item.verification.model_dump(mode="json"),
+                        "status": "not_run",
+                        "selector_exists": None,
+                        "selector_executed": False,
+                        "failure_reason": "general-validation-did-not-succeed",
+                        "collection": None,
+                        "execution": None,
+                    }
+                    for item in contract.criteria
+                ],
+            }
+        record = dataclasses.replace(
+            record, verification_coverage=verification_coverage
+        )
         self.store.update_iteration(
             iteration_id=iteration_id, actor=actor, event="validation.recorded",
             fields={
@@ -771,7 +907,39 @@ class ImplementationStage:
                 detail=f"{detail}\n{record.output}", expect=("implementation_running",),
                 iteration_status=ITERATION_VALIDATION_FAILED,
             )
+        failed_obligations = [
+            item
+            for item in record.verification_coverage.get("criteria", [])
+            if item.get("mandatory") and item.get("status") != VALIDATION_STATUS_SUCCEEDED
+        ]
+        if failed_obligations:
+            details = "; ".join(
+                self._verification_failure_detail(item)
+                for item in failed_obligations
+            )
+            return self._record_failure(
+                task_id,
+                iteration_id,
+                reason=REASON_ACCEPTANCE_VERIFICATION_INCOMPLETE,
+                detail=(
+                    "Mandatory acceptance verification obligations lack required "
+                    f"successful execution evidence: {details}."
+                ),
+                expect=("implementation_running",),
+                iteration_status=ITERATION_VALIDATION_FAILED,
+            )
         return record
+
+    @staticmethod
+    def _verification_failure_detail(item: dict[str, Any]) -> str:
+        evidence = item.get("execution") or item.get("collection") or {}
+        exit_code = evidence.get("exit_code") if isinstance(evidence, dict) else None
+        reason = item.get("failure_reason") or item.get("status")
+        obstacle = str(item.get("obstacle") or "").strip()
+        return (
+            f"{item['id']} ({item['status']}, exit {exit_code}, reason {reason})"
+            + (f": {obstacle}" if obstacle else "")
+        )
 
     # -- criteria ------------------------------------------------------------
     def _contract(self, task_id: str) -> tuple[AcceptanceContract, tuple[str, ...]]:
@@ -871,7 +1039,7 @@ class ImplementationStage:
                 "digest": contract_digest(contract),
                 "criteria": [item.model_dump(mode="json") for item in contract.criteria],
             },
-            "verification_coverage": self._verification_coverage(contract, validation),
+            "verification_coverage": self._verification_coverage(validation),
             "builder": {
                 "report": dataclasses.asdict(report),
                 "digest": report.digest,
@@ -902,29 +1070,21 @@ class ImplementationStage:
 
     @staticmethod
     def _verification_coverage(
-        contract: AcceptanceContract, validation: ValidationOutcome
+        validation: ValidationOutcome,
     ) -> dict[str, Any]:
-        """What the harness actually executed, never what the proposal declared.
-
-        The approved contract may name pytest selectors, but the runtime executes
-        only the allowlisted validation command and never maps a declared selector
-        onto it, so a declared selector is never reported as executed.
-        """
+        """Bind each approved obligation to its recorded execution or explicit gap."""
 
         return {
             "executed_command": list(validation.command),
             "executed_exit_code": validation.exit_code,
-            "criteria": [
-                {
-                    "id": item.id,
-                    "declared": item.verification.model_dump(mode="json"),
-                    "selector_executed": False,
-                }
-                for item in contract.criteria
-            ],
+            "environment_check": validation.verification_coverage.get(
+                "environment_check"
+            ),
+            "criteria": validation.verification_coverage.get("criteria", []),
             "note": (
-                "Declared selectors are not executed individually; only the executed "
-                "command above ran."
+                "Only a successful exact-selector execution with matching source "
+                "digest and sandbox image identity counts as verified. Unverified, "
+                "unsupported, and not-run obligations remain explicit."
             ),
         }
 

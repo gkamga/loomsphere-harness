@@ -126,7 +126,12 @@ BUILT_FILES = {
 
 
 def fake_runtime(
-    *, exit_code: int = 0, output: str = "1 passed\n", calls: list[list[str]] | None = None
+    *,
+    exit_code: int = 0,
+    selector_collection_exit_code: int = 0,
+    selector_exit_code: int = 0,
+    output: str = "1 passed\n",
+    calls: list[list[str]] | None = None,
 ):
     """A stand-in container runtime: it records, it never launches anything."""
 
@@ -135,6 +140,15 @@ def fake_runtime(
             calls.append(list(arguments))
         if arguments[1:3] == ["image", "inspect"]:
             return CompletedProcess(arguments, 0, f"{IMAGE_ID}\n", "")
+        command = arguments[arguments.index("python:3.12-slim") + 1 :]
+        if "--collect-only" in command:
+            return CompletedProcess(
+                arguments, selector_collection_exit_code, output, ""
+            )
+        if command[:4] == ["python", "-m", "pytest", "--version"]:
+            return CompletedProcess(arguments, 0, output, "")
+        if len(command) > 4 and command[:3] == ["python", "-m", "pytest"]:
+            return CompletedProcess(arguments, selector_exit_code, output, "")
         return CompletedProcess(arguments, exit_code, output, "")
 
     return runner
@@ -148,6 +162,7 @@ def loop_model(
     qa_reports: list[dict] | None = None,
     review_verdicts: list[dict] | None = None,
     unreported_files: dict[str, str] | None = None,
+    proposal: dict | None = None,
 ) -> FunctionModel:
     """Answer as Intake, Architect, Builder, QA, and Reviewer, in that order.
 
@@ -189,7 +204,7 @@ def loop_model(
         if "# Role: Reviewer" in prompt:
             verdict = next_report(review_sequence, "review")
             return ModelResponse(parts=[TextPart(fenced(verdict))])
-        return ModelResponse(parts=[TextPart(fenced(PROPOSAL))])
+        return ModelResponse(parts=[TextPart(fenced(proposal or PROPOSAL))])
 
     return FunctionModel(respond)
 
@@ -200,6 +215,8 @@ class LoopCase(RuntimeCase):
         *,
         sandbox: bool = True,
         validation_exit_code: int = 0,
+        selector_collection_exit_code: int = 0,
+        selector_exit_code: int = 0,
         max_iterations: int = 2,
         **model_options,
     ):
@@ -226,7 +243,12 @@ class LoopCase(RuntimeCase):
             ),
             runtime="docker",
             startup_grace_seconds=5,
-            runner=fake_runtime(exit_code=validation_exit_code, calls=calls),
+            runner=fake_runtime(
+                exit_code=validation_exit_code,
+                selector_collection_exit_code=selector_collection_exit_code,
+                selector_exit_code=selector_exit_code,
+                calls=calls,
+            ),
         )
 
         state: dict[str, Path] = {"worktree": Path("/dev/null")}
@@ -341,10 +363,26 @@ class ImplementationLoop(LoopCase):
         )
         self.assertIn("test_hello.py", document["diff_excerpt"])
         self.assertEqual(document["validation"]["record"]["sandbox_image_id"], IMAGE_ID)
+        coverage = document["verification_coverage"]
+        self.assertEqual(coverage["environment_check"]["status"], "succeeded")
+        verification = coverage["criteria"][0]
+        self.assertEqual(verification["status"], "succeeded")
+        self.assertTrue(verification["selector_exists"])
+        self.assertTrue(verification["selector_executed"])
+        self.assertEqual(
+            verification["execution"]["command"],
+            ["python", "-m", "pytest", "-q", "tests/test_hello.py::test_hello"],
+        )
+        self.assertEqual(verification["execution"]["exit_code"], 0)
+        self.assertEqual(
+            verification["execution"]["source_digest"],
+            iteration["validation"]["workspace_digest"],
+        )
+        self.assertEqual(verification["execution"]["sandbox_image_id"], IMAGE_ID)
 
         # Validation really went through the sandbox boundary.
         container_calls = [call for call in calls if call[1:2] == ["run"]]
-        self.assertEqual(len(container_calls), 1)
+        self.assertEqual(len(container_calls), 4)
         arguments = container_calls[0]
         for flag in ("--cap-drop", "--security-opt", "--pids-limit", "--memory",
                      "--cpus", "--read-only", "--tmpfs"):
@@ -352,11 +390,98 @@ class ImplementationLoop(LoopCase):
         self.assertIn("no-new-privileges:true", arguments)
         self.assertEqual(arguments[arguments.index("--network") + 1], "none")
         self.assertNotIn("--privileged", arguments)
+        executed_commands = [
+            call[call.index("python:3.12-slim") + 1 :] for call in container_calls
+        ]
+        self.assertEqual(
+            executed_commands[1:],
+            [
+                ["python", "-m", "pytest", "--version"],
+                [
+                    "python", "-m", "pytest", "--collect-only", "-q",
+                    "tests/test_hello.py::test_hello",
+                ],
+                ["python", "-m", "pytest", "-q", "tests/test_hello.py::test_hello"],
+            ],
+        )
 
         # The developer's working tree is untouched: the work is on a task branch.
         self.assertEqual(self.head_of(self.repo), head_before)
         self.assertEqual(self.porcelain(self.repo), "")
         self.assertGreater(engine.store.verify_audit_chain(), 0)
+
+    def test_a_missing_mandatory_selector_stops_before_qa_and_review(self) -> None:
+        engine, task_id, _ = self.approved_task(selector_collection_exit_code=4)
+
+        view = engine.implement(task_id)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(
+            view["implementation"]["reason"], "acceptance-verification-incomplete"
+        )
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder"],
+        )
+        coverage = view["iterations"][0]["validation"]["verification_coverage"]
+        self.assertEqual(coverage["criteria"][0]["status"], "failed")
+        self.assertFalse(coverage["criteria"][0]["selector_exists"])
+        self.assertFalse(coverage["criteria"][0]["selector_executed"])
+        self.assertEqual(
+            coverage["criteria"][0]["failure_reason"],
+            "acceptance-pytest-selector-not-found",
+        )
+
+    def test_a_failing_mandatory_selector_stops_before_qa_and_review(self) -> None:
+        engine, task_id, _ = self.approved_task(selector_exit_code=1)
+
+        view = engine.implement(task_id)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(
+            view["implementation"]["reason"], "acceptance-verification-incomplete"
+        )
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder"],
+        )
+        result = view["iterations"][0]["validation"]["verification_coverage"]["criteria"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["selector_exists"])
+        self.assertTrue(result["selector_executed"])
+        self.assertEqual(result["execution"]["exit_code"], 1)
+
+    def test_a_mandatory_unverified_obligation_stays_unverified_and_blocks_readiness(
+        self,
+    ) -> None:
+        proposal = {
+            **PROPOSAL,
+            "acceptance_criteria_mapping": [
+                {
+                    "criterion": "GET /hello returns 200",
+                    "approach": "Human review required.",
+                    "mandatory": True,
+                    "verification": {"kind": "unverified"},
+                }
+            ],
+        }
+        engine, task_id, _ = self.approved_task(proposal=proposal)
+
+        view = engine.implement(task_id)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(
+            view["implementation"]["reason"], "acceptance-verification-incomplete"
+        )
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        coverage = view["iterations"][0]["validation"]["verification_coverage"]
+        self.assertEqual(coverage["criteria"][0]["status"], "unverified")
+        self.assertFalse(coverage["criteria"][0]["selector_executed"])
+        self.assertEqual(
+            coverage["criteria"][0]["failure_reason"],
+            "acceptance-obligation-unverified",
+        )
 
     def test_every_stage_start_is_recorded_once_under_one_name(self) -> None:
         """A stage start must not appear twice, and iteration changes say so."""
@@ -605,14 +730,40 @@ class ReviewerFormatRecovery(LoopCase):
             engine.accept_delivery(task_id, deliverable_digest=digest)["decision"], "accepted"
         )
 
-    def test_the_deliverable_never_claims_declared_selectors_were_executed(self) -> None:
+    def test_the_deliverable_records_exact_declared_selector_execution(self) -> None:
         engine, task_id, _ = self.failed_review()
 
         coverage = engine.retry_review(task_id)["deliverable"]["document"]["verification_coverage"]
 
         self.assertEqual(coverage["executed_command"], ["python", "-m", "pytest", "-q"])
         self.assertTrue(coverage["criteria"])
-        self.assertTrue(all(not item["selector_executed"] for item in coverage["criteria"]))
+        self.assertTrue(all(item["selector_executed"] for item in coverage["criteria"]))
+        self.assertTrue(
+            all(item["status"] == "succeeded" for item in coverage["criteria"])
+        )
+
+    def test_review_retry_refuses_missing_recorded_selector_evidence(self) -> None:
+        engine, task_id, _ = self.failed_review()
+        iteration = engine.store.iteration(task_id)
+        self.assertIsNotNone(iteration)
+        validation = dict(iteration["validation"])
+        validation.pop("verification_coverage")
+        engine.store.update_iteration(
+            iteration_id=iteration["id"],
+            actor=engine.identity.current().id,
+            event="test.verification-evidence-removed",
+            fields={"validation": validation},
+            detail={},
+        )
+        reviewers_before = len(self.reviewer_runs(engine, task_id))
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_review(task_id)
+
+        self.assertEqual(raised.exception.code, "review-retry-refused")
+        self.assertEqual(len(self.reviewer_runs(engine, task_id)), reviewers_before)
+        self.assertEqual(engine.describe(task_id)["task"]["status"], "review_failed")
+        self.assertIsNone(engine.describe(task_id)["deliverable"])
 
     def test_the_retry_is_limited_to_one_attempt(self) -> None:
         engine, task_id, _ = self.failed_review(

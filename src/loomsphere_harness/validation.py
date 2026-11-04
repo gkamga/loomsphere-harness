@@ -19,6 +19,10 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from loomsphere_harness.schemas.acceptance_contract import (
+    AcceptanceContract,
+    validate_selector,
+)
 from loomsphere_harness.sandbox import (
     REASON_SOURCE_MUTATED,
     REASON_SOURCE_UNVERIFIABLE,
@@ -42,6 +46,12 @@ REASON_WORKSPACE_CHANGED = "validation-mutated-worktree"
 REASON_DIGEST_ERROR = "validation-digest-failed"
 REASON_SANDBOX_UNAVAILABLE = "validation-sandbox-unavailable"
 REASON_SANDBOX_FAILED = "validation-sandbox-failed"
+REASON_PYTEST_UNAVAILABLE = "acceptance-pytest-environment-unavailable"
+REASON_PYTEST_SELECTOR_NOT_FOUND = "acceptance-pytest-selector-not-found"
+REASON_PYTEST_COLLECTION_FAILED = "acceptance-pytest-collection-failed"
+REASON_PROTECTED_VERIFICATION_UNAVAILABLE = (
+    "acceptance-protected-verification-unavailable"
+)
 
 #: Only these variables reach the validated code. Database URLs, tokens, and any
 #: other secret in the operator's environment are deliberately not forwarded, and
@@ -92,6 +102,7 @@ class ValidationOutcome:
     sandbox_image: str | None = None
     sandbox_image_id: str | None = None
     execution: dict[str, object] = field(default_factory=dict)
+    verification_coverage: dict[str, object] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -109,6 +120,7 @@ class ValidationOutcome:
             "sandbox_image": self.sandbox_image,
             "sandbox_image_id": self.sandbox_image_id,
             "execution": self.execution,
+            "verification_coverage": self.verification_coverage,
         }
 
 
@@ -218,6 +230,229 @@ def _map_sandbox_failure(execution: SandboxExecution) -> str:
     if execution.failure_reason == REASON_SOURCE_MUTATED:
         return REASON_WORKSPACE_CHANGED
     return REASON_SANDBOX_FAILED
+
+
+def _execution_record(
+    command: tuple[str, ...],
+    execution: SandboxExecution | None,
+    *,
+    policy: SandboxPolicy,
+    failure_reason: str | None = None,
+    output: str = "",
+) -> dict[str, object]:
+    if execution is None:
+        return {
+            "command": list(command),
+            "status": VALIDATION_STATUS_ERROR,
+            "exit_code": None,
+            "output": output,
+            "output_digest": _digest_text(output),
+            "source_digest": None,
+            "source_digest_after": None,
+            "sandbox_image": policy.image,
+            "sandbox_image_id": None,
+            "failure_reason": failure_reason,
+            "execution": {},
+        }
+
+    if execution.timed_out:
+        status = VALIDATION_STATUS_ERROR
+        reason = REASON_TIMED_OUT
+    elif execution.failure_reason is not None:
+        status = VALIDATION_STATUS_ERROR
+        reason = _map_sandbox_failure(execution)
+    elif execution.exit_code == 0:
+        status = VALIDATION_STATUS_SUCCEEDED
+        reason = None
+    else:
+        status = VALIDATION_STATUS_FAILED
+        reason = None
+
+    return {
+        "command": list(command),
+        "status": status,
+        "exit_code": execution.exit_code,
+        "output": execution.output,
+        "output_digest": execution.output_digest,
+        "source_digest": execution.source_digest,
+        "source_digest_after": execution.source_digest_after,
+        "sandbox_image": policy.image,
+        "sandbox_image_id": execution.image_id,
+        "failure_reason": reason,
+        "execution": execution.as_evidence(),
+    }
+
+
+def execute_acceptance_verifications(
+    contract: AcceptanceContract,
+    workspace: Path,
+    *,
+    timeout_seconds: int,
+    sandbox: object,
+    executor: SandboxExecutor | None,
+    expected_source_digest: str,
+    expected_image_id: str | None,
+) -> dict[str, object]:
+    """Execute supported declared selectors and preserve explicit gaps.
+
+    Pytest is provided by the configured sandbox image, not installed during a
+    run: all calls happen with network disabled and a read-only source mount.
+    """
+
+    resolved_executor, policy = _resolve_executor(
+        sandbox, timeout_seconds=timeout_seconds, executor=executor
+    )
+    pytest_criteria = [
+        item for item in contract.criteria if item.verification.kind == "pytest"
+    ]
+    environment_check: dict[str, object] | None = None
+
+    def run(command: tuple[str, ...]) -> dict[str, object]:
+        try:
+            execution = resolved_executor.execute(
+                command, workspace, environment=dict(BASE_ENV)
+            )
+        except SandboxError as error:
+            return _execution_record(
+                command,
+                None,
+                policy=policy,
+                failure_reason=error.code,
+                output=f"{error.code}: {error.message}",
+            )
+        return _execution_record(command, execution, policy=policy)
+
+    def evidence_is_bound(record: dict[str, object]) -> bool:
+        return (
+            record["source_digest"] == expected_source_digest
+            and record["source_digest_after"] == expected_source_digest
+            and record["sandbox_image_id"] == expected_image_id
+            and isinstance(expected_image_id, str)
+            and expected_image_id.startswith("sha256:")
+        )
+
+    if pytest_criteria:
+        environment_check = run(("python", "-m", "pytest", "--version"))
+        if not evidence_is_bound(environment_check):
+            if environment_check["status"] == VALIDATION_STATUS_FAILED:
+                environment_check["failure_reason"] = REASON_PYTEST_UNAVAILABLE
+            elif environment_check["status"] == VALIDATION_STATUS_SUCCEEDED:
+                environment_check["status"] = VALIDATION_STATUS_ERROR
+                environment_check["failure_reason"] = "acceptance-evidence-mismatch"
+        elif environment_check["status"] == VALIDATION_STATUS_FAILED:
+            environment_check["failure_reason"] = REASON_PYTEST_UNAVAILABLE
+
+    results: list[dict[str, object]] = []
+    for criterion in contract.criteria:
+        verification = criterion.verification
+        declared = verification.model_dump(mode="json")
+        result: dict[str, object] = {
+            "id": criterion.id,
+            "mandatory": criterion.mandatory,
+            "declared": declared,
+            "status": "unverified",
+            "selector_exists": None,
+            "selector_executed": False,
+            "failure_reason": None,
+            "collection": None,
+            "execution": None,
+        }
+
+        if verification.kind == "unverified":
+            result["failure_reason"] = "acceptance-obligation-unverified"
+            results.append(result)
+            continue
+
+        if verification.kind == "protected-pytest":
+            result["status"] = "unsupported"
+            result["failure_reason"] = REASON_PROTECTED_VERIFICATION_UNAVAILABLE
+            result["obstacle"] = (
+                "The approved protected-pytest artifact registry is not implemented "
+                "in this runtime; the selector was not substituted or executed from "
+                "the Builder worktree."
+            )
+            results.append(result)
+            continue
+
+        selector = verification.selector or ""
+        validate_selector(selector)
+        if environment_check is None or environment_check["status"] != VALIDATION_STATUS_SUCCEEDED:
+            result["status"] = "error"
+            result["failure_reason"] = (
+                environment_check["failure_reason"]
+                if environment_check is not None
+                else REASON_PYTEST_UNAVAILABLE
+            )
+            result["obstacle"] = (
+                str(environment_check.get("output") or environment_check["failure_reason"])
+                if environment_check is not None
+                else "No configured pytest sandbox environment was available."
+            )
+            results.append(result)
+            continue
+
+        collection_command = (
+            "python", "-m", "pytest", "--collect-only", "-q", selector
+        )
+        collection = run(collection_command)
+        result["collection"] = collection
+        if not evidence_is_bound(collection):
+            result["status"] = "error"
+            result["failure_reason"] = (
+                collection["failure_reason"] or "acceptance-evidence-mismatch"
+            )
+            result["obstacle"] = collection["output"]
+            results.append(result)
+            continue
+        if collection["status"] == VALIDATION_STATUS_ERROR:
+            result["status"] = "error"
+            result["failure_reason"] = collection["failure_reason"]
+            result["obstacle"] = collection["output"]
+            results.append(result)
+            continue
+        if collection["exit_code"] != 0:
+            if collection["exit_code"] in (4, 5):
+                result["status"] = VALIDATION_STATUS_FAILED
+                result["selector_exists"] = False
+                result["failure_reason"] = REASON_PYTEST_SELECTOR_NOT_FOUND
+            else:
+                result["status"] = "error"
+                result["failure_reason"] = REASON_PYTEST_COLLECTION_FAILED
+            result["obstacle"] = collection["output"]
+            results.append(result)
+            continue
+
+        result["selector_exists"] = True
+        command = ("python", "-m", "pytest", "-q", selector)
+        execution = run(command)
+        result["execution"] = execution
+        sandbox_evidence = execution["execution"]
+        result["selector_executed"] = (
+            isinstance(sandbox_evidence, dict)
+            and bool(sandbox_evidence)
+            and sandbox_evidence.get("failure_reason") != "sandbox-launch-failed"
+        )
+        if not evidence_is_bound(execution):
+            result["status"] = "error"
+            result["failure_reason"] = (
+                execution["failure_reason"] or "acceptance-evidence-mismatch"
+            )
+            result["obstacle"] = execution["output"]
+        elif execution["status"] == VALIDATION_STATUS_ERROR:
+            result["status"] = "error"
+            result["failure_reason"] = execution["failure_reason"]
+            result["obstacle"] = execution["output"]
+        elif execution["exit_code"] == 0:
+            result["status"] = VALIDATION_STATUS_SUCCEEDED
+        else:
+            result["status"] = VALIDATION_STATUS_FAILED
+            result["obstacle"] = execution["output"]
+        results.append(result)
+
+    return {
+        "environment_check": environment_check,
+        "criteria": results,
+    }
 
 
 def _resolve_executor(
@@ -358,6 +593,10 @@ __all__ = [
     "REASON_DIGEST_ERROR",
     "REASON_NO_PLAN",
     "REASON_NOT_ALLOWLISTED",
+    "REASON_PYTEST_COLLECTION_FAILED",
+    "REASON_PYTEST_SELECTOR_NOT_FOUND",
+    "REASON_PYTEST_UNAVAILABLE",
+    "REASON_PROTECTED_VERIFICATION_UNAVAILABLE",
     "REASON_SANDBOX_FAILED",
     "REASON_SANDBOX_UNAVAILABLE",
     "REASON_TIMED_OUT",
@@ -369,6 +608,7 @@ __all__ = [
     "ValidationOutcome",
     "ValidationPlan",
     "ValidationPlanError",
+    "execute_acceptance_verifications",
     "execute_validation",
     "plan_validation",
     "policy_for",

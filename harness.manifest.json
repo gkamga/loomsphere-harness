@@ -386,11 +386,11 @@
       "sha256": "64b222cc44543deca6b622cb63416de0469131a8bb76583aab9acac5252a463a"
     },
     "docs/workflows/live-acceptance-2c2.md": {
-      "bytes": 4687,
-      "sha256": "d3b6a909251514c22d05ce94a5d69097a6260f4dcc831ab887c97c26008a54da"
+      "bytes": 5110,
+      "sha256": "0b8342df5ec69260b7d75dd5e7aa897ce04f66f184f8a294a3b50f85d941c1f4"
     }
   },
-  "docs_digest": "63afef70a53b5b170d8790a36606215425e141ff4a078fa37b6b095a46383d36",
+  "docs_digest": "48a0c8f4c55fb4b4a467acf7848f3a42e9f4652357a112bce9c2a5b89abde4d3",
   "hooks": [],
   "manifest_version": 2,
   "skills": [

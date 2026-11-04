@@ -1,6 +1,8 @@
 # Phase 2C.2 live acceptance (DeepSeek via OpenRouter)
 
-Date: 2026-11-03. Result: **FAIL at the Reviewer stage** (delivery gate not reached).
+Date: 2026-11-03. Result: the initial Reviewer report failed; a controlled
+Reviewer retry succeeded and T-0003 reached **`awaiting_acceptance`**. No human
+acceptance was recorded.
 Model at every stage: `openrouter.ai/deepseek/deepseek-v4.1-flash-1017`
 (provider `openai-compatible`, approved host `openrouter.ai`). Python 3.14.2,
 pydantic-ai 2.65.0, pydantic-ai-harness 0.65.0. No credentials appear here.
@@ -33,7 +35,7 @@ The requirement must tell the Architect to use `pytest`-kind verifications
 | Builder (tools incl. `write_file`) | succeeded | 54211 / 10117 |
 | Validation (sandbox) | exit 0, 20 tests (7 frozen + 13 Builder) | n/a |
 | QA | passed, no findings | 31605 / 4328 |
-| Reviewer | **failed: `invalid-review-report`** | 44555 / 11190 |
+| Reviewer | initial `invalid-review-report`; controlled retry succeeded | initial 44555 / 11190 |
 
 - Proposal digest approved by the local user: `1fd856119628bc311a8a405bb1adc62136c7bf971f9ac540ddd2d022f67aeb98`.
 - Generated commit `a1b0a660c8cd` on `loomsphere/task-t-0003` (base `880ec95a1b85`):
@@ -43,8 +45,9 @@ The requirement must tell the Architect to use `pytest`-kind verifications
   `network=none`, `read_only_source=true`, user `65534:65534`, 2 CPU / 2048 MB / 256 pids,
   source digest before = after (`7977b702…5155`), output digest `0e73b611…89b6`.
   The image is Python 3.12 (no 3.14 image existed locally) and has no pytest.
-- Audit chain verified (30 events). No deliverable digest exists; none was recorded.
-- No acceptance, delivery decision, push, or PR.
+- Audit chain verified (30 events) at the initial failure. The later Reviewer
+  retry produced the existing deliverable and moved T-0003 to
+  `awaiting_acceptance`; it was not accepted.
 
 ## Defects found
 
@@ -56,8 +59,9 @@ The requirement must tell the Architect to use `pytest`-kind verifications
    should enumerate valid severities, or the schema should tolerate `info`.
 3. **No retry path** from `review_failed`: `implement` refuses (`not-approved`), so a
    transient Reviewer format error forces a new task and new approval.
-4. Approved `pytest`-kind selectors are never executed; only the allowlisted `unittest` run
-   is recorded, which the Reviewer noted as a gap.
+4. At the time of this run, approved `pytest`-kind selectors were never executed;
+   only the allowlisted `unittest` run was recorded, which the Reviewer noted as a
+   gap.
 5. A dirty-worktree flag on T-0001 came from a host `__pycache__` created by the operator's
    own pre-check (an operator error, not a harness defect).
 
@@ -68,8 +72,12 @@ The requirement must tell the Architect to use `pytest`-kind verifications
   strict); `loomsphere-harness retry-review <task>` reruns only the Reviewer after an
   `invalid-review-report`, once per iteration, after re-verifying approval, commit,
   workspace digest, validation and QA evidence. A real rejection is never retried.
-- Defect 4 is an **explicit acceptance blocker**, not resolved. The approved proposal
+- Defect 4 was an **explicit acceptance blocker** in this run. The approved proposal
   declares `pytest` selectors; the sandbox image has no pytest and only the allowlisted
-  `unittest` command runs. The deliverable records `verification_coverage` with
-  `selector_executed: false` for each criterion. Closing it needs a runtime that executes
-  declared selectors (or a new approved proposal); the approved contract is not altered.
+  `unittest` command ran. Its existing deliverable records
+  `selector_executed: false` for each criterion. The follow-up enforcement executes
+  approved selectors for new implementation runs, but it does not rewrite T-0003's
+  approved contract, prior runs, deliverable, or audit history. The independent
+  acceptance tests retain SHA-256
+  `f8bb81c21bd05eda1d8fcdcc64af9ee8021e5a3aa410ce354d94311419745902`; the existing
+  T-0003 deliverable is not automatically accepted.

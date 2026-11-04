@@ -256,12 +256,35 @@ def render_evidence(view: dict[str, Any]) -> str:
     coverage = document.get("verification_coverage")
     if coverage:
         lines += ["", "Verification coverage (declared vs executed):"]
+        environment = coverage.get("environment_check")
+        if environment:
+            lines.append(
+                f"  pytest environment: {environment['status']} "
+                f"exit {environment['exit_code']} "
+                f"image {environment.get('sandbox_image_id')} "
+                f"source {environment.get('source_digest')}"
+            )
         for item in coverage["criteria"]:
             declared = item["declared"]
             lines.append(
-                f"  {item['id']}  declared {declared.get('kind')} {declared.get('selector') or ''}"
+                f"  {item['id']}  {item['status']}  declared {declared.get('kind')} "
+                f"{declared.get('selector') or ''}"
+                f"  exists: {item['selector_exists']}"
                 f"  selector executed: {'yes' if item['selector_executed'] else 'no'}"
             )
+            execution = item.get("execution")
+            if execution:
+                lines.append(
+                    f"    exact command {' '.join(execution['command'])}; "
+                    f"exit {execution['exit_code']}; image "
+                    f"{execution.get('sandbox_image_id')}; source "
+                    f"{execution.get('source_digest')}"
+                )
+            if item.get("failure_reason"):
+                lines.append(
+                    f"    obstacle {item['failure_reason']}: "
+                    f"{item.get('obstacle', '')}"
+                )
         lines.append(f"  {coverage['note']}")
     for label, key in (("QA", "qa"), ("Reviewer", "review")):
         report = document[key]["report"]
