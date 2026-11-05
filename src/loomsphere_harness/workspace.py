@@ -244,8 +244,16 @@ def create_task_workspace(
     workspace_root: str | Path,
     task_key: str,
     base_commit: str,
+    *,
+    replace_existing: bool = False,
 ) -> TaskWorkspace:
-    """Create a fresh worktree pinned to ``base_commit`` on a private branch."""
+    """Create a fresh worktree pinned to ``base_commit`` on a private branch.
+
+    ``replace_existing`` is off by default, so a leftover directory or branch is
+    reported instead of being deleted. Deleting a worktree can destroy work a
+    failed Builder already produced, and recovery depends on those bytes still
+    being there; only an explicit ``replace_existing=True`` discards them.
+    """
 
     root = resolve_repository_root(repository_root)
     resolved_root_dir = Path(workspace_root).expanduser().resolve()
@@ -257,13 +265,23 @@ def create_task_workspace(
 
     resolved_root_dir.mkdir(parents=True, exist_ok=True)
 
-    # Predictable recovery: a leftover directory or branch from an earlier attempt
-    # is discarded before the new worktree is created.
-    if path.exists():
-        shutil.rmtree(path)
     _git_succeeds(root, ["worktree", "prune"])
-    if _git_succeeds(root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
-        _git(root, "branch", "-D", branch)
+    branch_exists = _git_succeeds(
+        root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]
+    )
+    if path.exists() or branch_exists:
+        if not replace_existing:
+            raise WorkspaceError(
+                "workspace-exists",
+                "A previous workspace or branch for this task still exists; it is "
+                "kept rather than replaced so recorded work is never destroyed.",
+            )
+        # Only reachable from an explicit caller decision to start over.
+        if path.exists():
+            shutil.rmtree(path)
+        _git_succeeds(root, ["worktree", "prune"])
+        if branch_exists:
+            _git(root, "branch", "-D", branch)
 
     _git(root, "worktree", "add", "--force", "-B", branch, str(path), commit)
     if not path.is_dir():
@@ -298,6 +316,31 @@ def ensure_task_workspace(
             base_commit=base_commit,
         )
     return create_task_workspace(repository_root, workspace_root, task_key, base_commit)
+
+
+def resume_task_workspace(workspace_root: str | Path, task_key: str) -> TaskWorkspace:
+    """Return the worktree a failed Builder left behind, never creating or deleting.
+
+    Recovery must operate on the bytes that already exist. This helper therefore
+    refuses when nothing usable is present instead of falling back to worktree
+    creation, which is the only path that can discard recorded work.
+    """
+
+    path = assert_within(
+        Path(workspace_root).expanduser().resolve(),
+        workspace_path_for(workspace_root, task_key),
+    )
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    return TaskWorkspace(
+        path=path,
+        branch=task_branch_name(task_key),
+        commit=head_commit(path),
+        base_commit=head_commit(path),
+    )
 
 
 def remove_task_workspace(
@@ -429,6 +472,127 @@ def is_clean(path: Path) -> bool:
     return not _git(path, "status", "--porcelain").strip()
 
 
+def is_ancestor(path: Path, ancestor: str, descendant: str) -> bool:
+    """True when ``ancestor`` is reachable from ``descendant``."""
+
+    if not COMMIT_SHA_PATTERN.fullmatch(ancestor) or not COMMIT_SHA_PATTERN.fullmatch(
+        descendant
+    ):
+        return False
+    return _git_succeeds(path, ["merge-base", "--is-ancestor", ancestor, descendant])
+
+
+def _entry_path(root: Path, name: str) -> Path:
+    """Resolve one git-reported path inside the worktree, refusing escapes."""
+
+    if not name or Path(name).is_absolute() or ".." in Path(name).parts:
+        raise WorkspaceError(
+            "invalid-path", f"The worktree reported an unusable path: {name!r}"
+        )
+    candidate = root / name
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError as error:
+        raise WorkspaceError(
+            "invalid-path", f"{name!r} resolves outside the task worktree."
+        ) from error
+    return candidate
+
+
+def changed_paths(path: Path, base_commit: str) -> list[str]:
+    """Every path that differs from ``base_commit``, committed or not.
+
+    Read-only: it compares the worktree against the base commit and adds the
+    untracked, non-ignored files, so a Builder that wrote files and then died
+    before committing is still fully visible.
+    """
+
+    if not COMMIT_SHA_PATTERN.fullmatch(base_commit):
+        raise WorkspaceError(
+            "invalid-commit", f"The base commit is not a commit hash: {base_commit!r}"
+        )
+    raw = _git_bytes(path, "diff", "--name-only", "-z", base_commit)
+    names = {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
+    raw = _git_bytes(path, "ls-files", "--others", "--exclude-standard", "-z")
+    names |= {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
+    return sorted(names)
+
+
+def recoverable_inventory(
+    path: Path,
+    base_commit: str,
+    *,
+    max_files: int = 200,
+    max_scan_bytes: int = 1_000_000,
+) -> tuple[str, list[dict[str, str]]]:
+    """Digest exactly the content a failed Builder left in the worktree.
+
+    The digest covers path, mode, and content of every path that differs from the
+    base commit, sorted by path, so two inspections of the same bytes agree and a
+    single byte of drift changes the value a human is asked to authorise. Nothing
+    is written, staged, committed, reset, or cleaned.
+    """
+
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    names = changed_paths(path, base_commit)
+    if len(names) > max_files:
+        raise WorkspaceError(
+            "too-many-files", f"The recoverable change set changes more than {max_files} files."
+        )
+    entries: list[dict[str, str]] = []
+    for name in names:
+        file_path = _entry_path(path, name)
+        if not file_path.is_file():
+            entries.append({"path": name, "mode": "deleted", "sha256": ""})
+            continue
+        if file_path.stat().st_size > max_scan_bytes:
+            raise WorkspaceError(
+                "file-too-large", f"{name} is too large to inspect before recovery."
+            )
+        try:
+            payload = file_path.read_bytes()
+        except OSError as error:
+            raise WorkspaceError(
+                "unreadable-file", f"{name} could not be read: {error}"
+            ) from error
+        mode = "executable" if file_path.stat().st_mode & 0o111 else "file"
+        entries.append({"path": name, "mode": mode, "sha256": sha256_hex(payload)})
+    hasher = hashlib.sha256()
+    for entry in entries:
+        hasher.update(f"{entry['path']}\0{entry['mode']}\0{entry['sha256']}\n".encode("utf-8"))
+    return hasher.hexdigest(), entries
+
+
+def screen_change_set(
+    path: Path, names: list[str], *, max_scan_bytes: int = 1_000_000
+) -> None:
+    """Refuse a change set that contains a credential or an unscreenable file."""
+
+    for name in names:
+        if SECRET_PATH_PATTERN.search(name):
+            raise WorkspaceError(
+                "secret-path",
+                f"The change set contains a file that must never be published: {name}",
+            )
+        file_path = _entry_path(path, name)
+        if not file_path.is_file():
+            continue
+        if file_path.stat().st_size > max_scan_bytes:
+            raise WorkspaceError(
+                "file-too-large",
+                f"{name} is too large to screen before delivery.",
+            )
+        if SECRET_CONTENT_PATTERN.search(file_path.read_bytes()):
+            raise WorkspaceError(
+                "secret-content",
+                f"{name} contains content that looks like a credential.",
+            )
+
+
 def inspect_change_set(
     path: Path,
     *,
@@ -477,26 +641,9 @@ def inspect_change_set(
                 "unauthorized-path",
                 f"The reviewed commit contains a path the implementation did not report: {name}",
             )
-        if SECRET_PATH_PATTERN.search(name):
-            raise WorkspaceError(
-                "secret-path",
-                f"The reviewed commit contains a file that must never be published: {name}",
-            )
-        if entry["status"].startswith("D"):
-            continue
-        file_path = path / name
-        if not file_path.is_file():
-            continue
-        if file_path.stat().st_size > max_scan_bytes:
-            raise WorkspaceError(
-                "file-too-large",
-                f"{name} is too large to screen before delivery.",
-            )
-        if SECRET_CONTENT_PATTERN.search(file_path.read_bytes()):
-            raise WorkspaceError(
-                "secret-content",
-                f"{name} contains content that looks like a credential.",
-            )
+    screen_change_set(
+        path, [entry["path"] for entry in changes], max_scan_bytes=max_scan_bytes
+    )
 
     return ChangeSet(
         base_commit=base_commit,
@@ -522,6 +669,7 @@ __all__ = [
     "assert_disjoint",
     "assert_within",
     "changed_files",
+    "changed_paths",
     "commit_worktree",
     "create_task_workspace",
     "diff_excerpt",
@@ -530,12 +678,16 @@ __all__ = [
     "head_commit",
     "inspect_change_set",
     "inventory",
+    "is_ancestor",
     "is_clean",
     "is_worktree",
+    "recoverable_inventory",
     "remove_task_workspace",
+    "resume_task_workspace",
     "resolve_commit",
     "resolve_repository_root",
     "retain_commit",
+    "screen_change_set",
     "sha256_hex",
     "task_branch_name",
     "validate_task_key",

@@ -327,6 +327,35 @@ If the only failure is an invalid Reviewer report, one retry is available:
 loomsphere-harness --repo . retry-review T-0001
 ```
 
+### Recovering a failed Builder
+
+A Builder that dies after it has written files — an exhausted token budget, a
+provider error, a timeout — fails the task, but its work is not thrown away. When
+the failure is recorded the runtime screens the worktree and commits whatever
+survives on the task branch, so the attempt can be examined instead of repeated.
+
+```sh
+loomsphere-harness --repo . inspect-recovery T-0001
+```
+
+This is read-only: no run, no audit event, no change to the worktree. It prints the
+failed Builder run, the preserved commit, the file inventory with a SHA-256 per
+file, the snapshot digest, how many recoveries remain, every reason a recovery
+would be refused, and the next command. If the screen refuses a path, nothing was
+committed and the work is left as it is.
+
+```sh
+loomsphere-harness --repo . recover-builder T-0001 --snapshot-digest <sha256>
+```
+
+The digest binds your decision to the exact bytes you inspected; a changed
+worktree, a moved `HEAD`, a missing worktree, or a second recovery is refused with
+`recovery-refused` and nothing is altered. The recovery does not call the Builder
+again — the recorded change set goes through the same validation, QA, Reviewer, and
+human acceptance gates as any other delivery, and the deliverable records
+`builder.status = "not-recorded"` because no Builder report or Builder test run
+ever existed.
+
 ## 10. Reviewing evidence
 
 ```sh
@@ -385,7 +414,7 @@ loomsphere-harness --help
 ```
 
 The asset suite digest changes only when agents, skills, hooks, contracts, or
-instructions change. Existing SQLite state is migrated in place (v1 → v2 at this
+instructions change. Existing SQLite state is migrated in place (v1 → v2 → v3 at this
 release); a state file from a newer schema is refused rather than rewritten.
 
 For declarative assets installed with `tools/harness_install.py`, follow

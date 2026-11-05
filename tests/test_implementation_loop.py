@@ -20,6 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 
@@ -32,6 +33,7 @@ from runtime_support import (  # noqa: E402
     fenced,
 )
 
+from loomsphere_harness.cli import render_recovery  # noqa: E402
 from loomsphere_harness.config import SandboxConfig, ValidationConfig  # noqa: E402
 from loomsphere_harness.engine import Engine, EngineError  # noqa: E402
 from loomsphere_harness.pydantic_harness import PydanticHarnessRunner  # noqa: E402
@@ -115,6 +117,19 @@ REVIEW_INFO_SEVERITY = {
     ],
 }
 REVIEW_REJECTED_INFO_SEVERITY = {**REVIEW_REJECTED, "findings": REVIEW_INFO_SEVERITY["findings"]}
+REVIEW_CHANGES_REQUIRED = {
+    "verdict": "changes-required",
+    "summary": "The change set needs one more pass before a human sees it.",
+    "findings": [
+        {"severity": "blocking", "description": "The test covers nothing yet.",
+         "evidence": "the diff adds only a placeholder"},
+    ],
+    "acceptance_criteria": [
+        {"criterion_id": CRITERION_ID, "criterion": CRITERION_TEXT,
+         "status": "met", "evidence": "recorded pytest exit 0"},
+    ],
+    "follow_ups": ["Cover the route."],
+}
 
 BUILT_FILES = {
     "tests/test_hello.py": (
@@ -123,6 +138,12 @@ BUILT_FILES = {
         "    assert True\n"
     ),
 }
+
+
+def out_of_budget(message: str = "the run reached its total token budget") -> Exception:
+    """The failure the real Demandro Builder hit after writing five files."""
+
+    return UsageLimitExceeded(message)
 
 
 def fake_runtime(
@@ -163,6 +184,7 @@ def loop_model(
     review_verdicts: list[dict] | None = None,
     unreported_files: dict[str, str] | None = None,
     proposal: dict | None = None,
+    builder_failures: dict[int, Exception] | None = None,
 ) -> FunctionModel:
     """Answer as Intake, Architect, Builder, QA, and Reviewer, in that order.
 
@@ -171,11 +193,17 @@ def loop_model(
     commit. The QA and Reviewer answers are consumed in sequence, so a suite can
     script a rework and the attempt that follows it. The `progress` counters are
     owned by the caller because the runtime builds a fresh model per agent run.
+
+    `builder_failures` maps a Builder attempt number to the exception that attempt
+    raises *after* writing its files, which is how a run that runs out of budget
+    leaves usable work behind. Because the attempt counter lives in `progress`, the
+    script survives the runtime building a new model for every run.
     """
 
     counts = progress if progress is not None else {"builder": 0, "qa": 0, "review": 0}
     qa_sequence = list(qa_reports or [QA_REPORT])
     review_sequence = list(review_verdicts or [REVIEW_VERDICT])
+    failures = dict(builder_failures or {})
 
     def next_report(sequence: list[dict], name: str) -> dict:
         index = min(counts[name], len(sequence) - 1)
@@ -198,6 +226,10 @@ def loop_model(
                 target = Path(worktree) / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
+            failure = failures.get(counts["builder"])
+            if failure is not None:
+                # The files are on disk; the run never gets to answer.
+                raise failure
             return ModelResponse(parts=[TextPart(fenced(build_report or BUILD_REPORT))])
         if "# Role: QA" in prompt:
             return ModelResponse(parts=[TextPart(fenced(next_report(qa_sequence, "qa")))])
@@ -850,6 +882,378 @@ class ReviewerFormatRecovery(LoopCase):
         )
 
         self.assertRefused(engine, task_id)
+
+
+class BuilderRecovery(LoopCase):
+    """Human-authorised recovery of work a failed Builder already wrote.
+
+    The scripted Builder writes its files and then stops the way the real run did —
+    the model's token budget is exhausted — so a change set exists but a build
+    report does not. Every test here checks that the recovery reuses the production
+    gate rather than going around it: the Builder is never invoked again, the
+    original failure record is never rewritten, and validation, QA, the Reviewer,
+    and the human delivery decision all still decide the outcome.
+    """
+
+    def worktree(self, engine, task_id):
+        return engine.workspace_root / f"task-{task_id.lower()}"
+
+    def failed_builder(self, **options):
+        options.setdefault("builder_failures", {1: out_of_budget()})
+        engine, task_id, calls = self.approved_task(**options)
+        view = engine.implement(task_id)
+        self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertIsNone(view["deliverable"])
+        return engine, task_id, calls
+
+    def inspection(self, engine, task_id):
+        return engine.inspect_recovery(task_id)["recovery"]
+
+    def snapshot_digest(self, engine, task_id):
+        inspection = self.inspection(engine, task_id)
+        self.assertTrue(inspection["eligible"], inspection["obstacles"])
+        return inspection["snapshot"]["digest"]
+
+    def assertRefused(self, engine, task_id, *, digest="0" * 64):
+        """A refusal changes nothing at all: no run, no audit event, no commit."""
+
+        worktree = self.worktree(engine, task_id)
+        task_before = engine._task(task_id)
+        iteration_before = engine.store.iteration(task_id)
+        runs_before = engine.store.runs(task_id)
+        audit_before = engine.store.audit_events(task_id)
+        recoveries_before = engine.store.recoveries(task_id)
+        head_before = self.head_of(worktree)
+        porcelain_before = self.porcelain(worktree)
+
+        with self.assertRaises(EngineError) as raised:
+            engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(raised.exception.code, "recovery-refused")
+        self.assertEqual(engine._task(task_id), task_before)
+        self.assertEqual(engine.store.iteration(task_id), iteration_before)
+        self.assertEqual(engine.store.runs(task_id), runs_before)
+        self.assertEqual(engine.store.audit_events(task_id), audit_before)
+        self.assertEqual(engine.store.recoveries(task_id), recoveries_before)
+        self.assertEqual(self.head_of(worktree), head_before)
+        self.assertEqual(self.porcelain(worktree), porcelain_before)
+        self.assertEqual(self.porcelain(self.repo), "")
+        return raised.exception
+
+    # -- the failure preserves usable work ------------------------------------
+    def test_a_builder_that_runs_out_of_budget_leaves_its_work_behind(self) -> None:
+        engine, task_id, calls = self.failed_builder()
+        iteration = engine.store.iteration(task_id)
+        worktree = self.worktree(engine, task_id)
+
+        self.assertEqual(iteration["status"], "failed")
+        self.assertEqual(iteration["failure_reason"], "resource-limit-exceeded")
+        # No Builder answer was ever produced, so no report was recorded.
+        self.assertIsNone(iteration["build_report"])
+        self.assertIsNone(iteration["build_digest"])
+        # ...but the files the Builder wrote were frozen on the task branch.
+        self.assertTrue((worktree / "tests" / "test_hello.py").exists())
+        self.assertEqual(self.head_of(worktree), iteration["commit_sha"])
+        self.assertNotEqual(iteration["commit_sha"], iteration["base_commit"])
+        self.assertEqual(self.porcelain(worktree), "")
+        self.assertEqual(
+            [run["role"] for run in engine.store.runs(task_id)],
+            ["intake", "architect", "builder"],
+        )
+        # Nothing was validated, reviewed, or delivered for a failed run.
+        self.assertEqual(calls, [])
+        self.assertEqual(self.porcelain(self.repo), "")
+        self.assertIsNone(engine.describe(task_id)["acceptance"])
+
+    def test_inspecting_the_preserved_work_changes_nothing(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        worktree = self.worktree(engine, task_id)
+        head_before = self.head_of(worktree)
+        porcelain_before = self.porcelain(worktree)
+        runs_before = len(engine.store.runs(task_id))
+        audit_before = len(engine.store.audit_events(task_id))
+
+        first = self.inspection(engine, task_id)
+        second = self.inspection(engine, task_id)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first["eligible"])
+        self.assertEqual(first["obstacles"], [])
+        self.assertEqual(first["limit"], 1)
+        self.assertEqual(first["recoveries"], [])
+        self.assertEqual(len(first["snapshot"]["digest"]), 64)
+        self.assertEqual(
+            [entry["path"] for entry in first["snapshot"]["files"]],
+            ["tests/test_hello.py"],
+        )
+        self.assertEqual(first["snapshot"]["files"][0]["mode"], "file")
+        self.assertEqual(first["builder_run"]["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(first["iteration"]["status"], "failed")
+        self.assertIn(first["snapshot"]["digest"], first["next"])
+        self.assertIn("recover-builder", first["next"])
+        # The human-facing view is rendered from this exact structure.
+        rendered = render_recovery({"recovery": first})
+        self.assertIn(first["snapshot"]["digest"], rendered)
+        self.assertIn("recover-builder", rendered)
+        self.assertIn("tests/test_hello.py", rendered)
+        self.assertIn("authorized recoveries 0 of 1", rendered)
+        # Reading is not changing: same commit, same worktree, same records.
+        self.assertEqual(self.head_of(worktree), head_before)
+        self.assertEqual(self.porcelain(worktree), porcelain_before)
+        self.assertEqual(len(engine.store.runs(task_id)), runs_before)
+        self.assertEqual(len(engine.store.audit_events(task_id)), audit_before)
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+
+    # -- the authorised recovery ----------------------------------------------
+    def test_recovering_delivers_through_the_existing_pipeline(self) -> None:
+        engine, task_id, calls = self.failed_builder()
+        failure_detail = engine.store.iteration(task_id)["failure_detail"]
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["implementation"]["snapshot_digest"], digest)
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertIsNone(view["acceptance"])
+        # The Builder is never asked again; QA and the Reviewer still are.
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder", "qa", "reviewer"],
+        )
+        self.assertTrue(any("--network" in call for call in calls))
+
+        document = view["deliverable"]["document"]
+        builder = document["builder"]
+        self.assertEqual(builder["status"], "not-recorded")
+        self.assertIsNone(builder["report"])
+        self.assertIsNone(builder["digest"])
+        self.assertIsNone(builder["tests_run"])
+        self.assertEqual(builder["test_execution"], "not-recorded")
+        self.assertEqual(builder["reason"], "resource-limit-exceeded")
+        self.assertEqual(builder["run_id"], view["implementation"]["builder_run_id"])
+
+        recovery = document["recovery"]
+        self.assertEqual(recovery["acceptance"], "pending-human-acceptance")
+        self.assertEqual(recovery["builder_report"], "not-recorded")
+        self.assertEqual(recovery["builder_tests_run"], "not-recorded")
+        self.assertEqual(recovery["authorized_by"], "alice")
+        self.assertEqual(recovery["snapshot_digest"], digest)
+        self.assertEqual(recovery["recovery_digest"], document["iteration"]["workspace_digest"])
+        self.assertEqual(recovery["failed_builder_run_id"], builder["run_id"])
+        self.assertEqual(
+            [entry["path"] for entry in recovery["changed_files"]],
+            ["tests/test_hello.py"],
+        )
+        self.assertEqual(
+            [entry["path"] for entry in document["changed_files"]],
+            ["tests/test_hello.py"],
+        )
+
+        recovered = engine.store.iteration(task_id)
+        self.assertEqual(recovered["status"], "ready")
+        self.assertIsNotNone(recovered["qa_run_id"])
+        self.assertIsNotNone(recovered["reviewer_run_id"])
+        # The iteration's own failure record is never rewritten by a recovery.
+        self.assertEqual(recovered["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(recovered["failure_detail"], failure_detail)
+
+        events = [event["event"] for event in view["audit"]]
+        self.assertEqual(events.count("recovery.authorized"), 1)
+        self.assertEqual(events.count("recovery.frozen"), 1)
+        self.assertEqual(events.count("builder.started"), 1)
+        self.assertEqual(events.count("qa.started"), 1)
+        self.assertEqual(events.count("reviewer.started"), 1)
+        self.assertGreater(engine.store.verify_audit_chain(), 0)
+
+    def test_the_failed_builder_run_is_kept_exactly_as_it_failed(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        before = [run for run in engine.store.runs(task_id) if run["role"] == "builder"]
+        digest = self.snapshot_digest(engine, task_id)
+
+        engine.recover_builder(task_id, snapshot_digest=digest)
+
+        after = [run for run in engine.store.runs(task_id) if run["role"] == "builder"]
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[0]["status"], "failed")
+        self.assertEqual(after[0]["failure_reason"], "resource-limit-exceeded")
+
+    def test_the_recovered_delivery_still_waits_for_a_human(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertIsNone(view["acceptance"])
+        with self.assertRaises(StoreError):
+            engine.accept_delivery(task_id, deliverable_digest="0" * 64)
+        decision = engine.accept_delivery(
+            task_id, deliverable_digest=view["deliverable"]["digest"]
+        )
+        self.assertEqual(decision["decision"], "accepted")
+
+    def test_the_qa_role_still_gates_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_builder(qa_reports=[QA_FAILED])
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "changes_required")
+        self.assertEqual(view["task"]["status"], "changes_required")
+        self.assertIsNone(view["deliverable"])
+        self.assertEqual(engine.store.iteration(task_id)["status"], "changes_required")
+
+    def test_the_reviewer_still_gates_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_builder(
+            review_verdicts=[REVIEW_CHANGES_REQUIRED]
+        )
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "changes_required")
+        self.assertEqual(view["task"]["status"], "changes_required")
+        self.assertIsNone(view["deliverable"])
+        self.assertEqual(engine.store.iteration(task_id)["status"], "changes_required")
+
+    def test_a_rejection_still_ends_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_builder(review_verdicts=[REVIEW_REJECTED])
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "review-rejected")
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(engine.store.iteration(task_id)["status"], "review_failed")
+        self.assertIsNone(view["deliverable"])
+
+    def test_validation_still_gates_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_builder(validation_exit_code=1)
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(engine.store.iteration(task_id)["status"], "validation_failed")
+        self.assertIsNone(view["deliverable"])
+        self.assertEqual([run["role"] for run in view["runs"]].count("qa"), 0)
+
+    # -- what a recovery refuses ----------------------------------------------
+    def test_a_wrong_snapshot_digest_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+
+        with self.assertRaises(EngineError) as raised:
+            engine.recover_builder(task_id, snapshot_digest="0" * 64)
+
+        self.assertEqual(raised.exception.code, "recovery-refused")
+        self.assertIn("not the digest of the work", str(raised.exception))
+        self.assertIn(digest, str(raised.exception))
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        self.assertEqual(engine.store.recoveries(task_id), [])
+
+    def test_a_malformed_digest_is_refused_before_anything_is_read(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+
+        error = self.assertRefused(engine, task_id, digest="not-a-digest")
+
+        self.assertIn("64-character digest", str(error))
+
+    def test_the_authorisation_is_limited_to_one_recovery(self) -> None:
+        engine, task_id, _ = self.failed_builder(validation_exit_code=1)
+        digest = self.snapshot_digest(engine, task_id)
+        engine.recover_builder(task_id, snapshot_digest=digest)
+        self.assertEqual(len(engine.store.recoveries(task_id)), 1)
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any(
+                "already used its 1 authorised recovery" in obstacle
+                for obstacle in inspection["obstacles"]
+            ),
+            inspection["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id, digest=digest)
+        self.assertIn("already used its 1 authorised recovery", str(error))
+
+    def test_a_worktree_changed_after_the_freeze_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+        worktree = self.worktree(engine, task_id)
+        (worktree / "tests" / "test_hello.py").write_text("# tampered\n", encoding="utf-8")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("workspace-dirty" in obstacle for obstacle in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id, digest=digest)
+        # The refusal left the changed work exactly where the human found it.
+        self.assertEqual(
+            (worktree / "tests" / "test_hello.py").read_text(encoding="utf-8"),
+            "# tampered\n",
+        )
+
+    def test_a_missing_worktree_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        shutil.rmtree(self.worktree(engine, task_id))
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertIsNone(inspection["snapshot"])
+        self.assertEqual(inspection["limit"], 1)
+        self.assertEqual(inspection["recoveries"], [])
+        self.assertTrue(inspection["obstacles"])
+        self.assertIsNone(inspection["next"])
+        rendered = render_recovery({"recovery": inspection})
+        self.assertIn("Not recoverable:", rendered)
+        self.assertNotIn("Recovery available", rendered)
+        with self.assertRaises(EngineError) as raised:
+            engine.recover_builder(task_id, snapshot_digest="0" * 64)
+        self.assertEqual(raised.exception.code, "recovery-refused")
+        self.assertEqual(engine.store.recoveries(task_id), [])
+
+    def test_work_that_fails_the_secret_screen_is_never_committed(self) -> None:
+        engine, task_id, _ = self.failed_builder(
+            unreported_files={".env": "AWS_SECRET_ACCESS_KEY=not-a-real-key\n"}
+        )
+        worktree = self.worktree(engine, task_id)
+
+        self.assertIsNone(engine.store.iteration(task_id)["commit_sha"])
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertIsNone(inspection["snapshot"])
+        self.assertTrue(
+            any("never committed a change set" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+        # Refusing to freeze the work did not delete it.
+        self.assertTrue((worktree / ".env").exists())
+        self.assertTrue((worktree / "tests" / "test_hello.py").exists())
+
+    def test_a_healthy_task_is_not_a_recovery_candidate(self) -> None:
+        engine, task_id, _ = self.approved_task()
+        view = engine.implement(task_id)
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("only implementation_failed" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        digest = inspection["snapshot"]["digest"]
+        self.assertRefused(engine, task_id, digest=digest)
 
 
 if __name__ == "__main__":  # pragma: no cover

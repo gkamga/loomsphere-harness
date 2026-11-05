@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
@@ -71,11 +72,16 @@ from loomsphere_harness.workspace import (
     DIFF_EXCERPT_CHARS,
     TaskWorkspace,
     WorkspaceError,
+    changed_paths,
     commit_worktree,
     diff_excerpt,
     ensure_task_workspace,
     inspect_change_set,
+    is_ancestor,
     is_worktree,
+    recoverable_inventory,
+    resume_task_workspace,
+    screen_change_set,
     workspace_path_for,
 )
 
@@ -97,6 +103,35 @@ MAX_REVIEW_RETRIES = 1
 REASON_REVIEW_RETRY_REFUSED = "review-retry-refused"
 #: Verdicts that already carry a Reviewer decision; they are never re-asked.
 ADVERSE_VERDICTS = ("rejected", "changes-required")
+
+#: A failed Builder's preserved change set may be recovered this many times per
+#: iteration. Authorization is recorded, so the limit survives a restart.
+MAX_BUILDER_RECOVERIES = 1
+REASON_RECOVERY_REFUSED = "recovery-refused"
+REASON_RECOVERY_ELIGIBLE = "recovery-eligible"
+#: An authorised recovery that stopped before delivery; the claim is closed with
+#: this reason so the task is never left open.
+REASON_RECOVERY_INCOMPLETE = "recovery-incomplete"
+#: A Builder run that stopped without writing a report leaves an interrupted run
+#: rather than a failed one; the worktree is treated exactly the same way.
+REASON_BUILDER_INTERRUPTED = "builder-interrupted"
+
+#: Failure reasons that describe a run which stopped *after* it may have written
+#: files: resource and time limits, provider faults, harness faults, an empty
+#: response, and an interrupted process. A refused or invalid *report* is excluded
+#: because it means the Builder reached the end of its turn and answered.
+RECOVERABLE_FAILURES = (
+    "resource-limit-exceeded",
+    "timed-out",
+    "provider-unavailable",
+    "model-error",
+    "harness-error",
+    "empty-response",
+    REASON_BUILDER_INTERRUPTED,
+)
+#: Run statuses that mean the Builder did not finish its turn.
+RECOVERABLE_RUN_STATUSES = ("failed", "interrupted")
+_SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
 COMMIT_MESSAGE = "loomsphere-harness: {task} iteration {number}"
 DETAIL_MAX_CHARS = 4_000
@@ -326,6 +361,521 @@ class ImplementationStage:
     @staticmethod
     def _refuse(message: str) -> NoReturn:
         raise EngineError(REASON_REVIEW_RETRY_REFUSED, message)
+
+    # -- human-authorised recovery of a failed Builder -----------------------
+    def inspect_recovery(self, task_id: str) -> dict[str, Any]:
+        """Report what a failed Builder left behind, without changing anything.
+
+        Read-only by construction. It resolves an existing worktree, reads the
+        committed change set, and recomputes the snapshot digest. It never creates
+        a workspace, stages a file, commits, resets, cleans, or deletes anything,
+        so a `recover-builder` refusal can never have damaged the work it refused.
+        """
+
+        engine = self.engine
+        store = self.store
+        task = engine._task(task_id)
+        iteration = store.iteration(task_id)
+        runs = store.runs(task_id)
+        builder_run = self._failed_builder_run(runs)
+
+        view: dict[str, Any] = {
+            "task": {"id": task_id, "title": task["title"], "status": task["status"]},
+            "iteration": (
+                None
+                if iteration is None
+                else {
+                    "id": iteration["id"],
+                    "number": iteration["number"],
+                    "status": iteration["status"],
+                    "failure_reason": iteration.get("failure_reason"),
+                    "failure_detail": iteration.get("failure_detail"),
+                    "commit": iteration.get("commit_sha"),
+                    "base_commit": iteration.get("base_commit"),
+                }
+            ),
+            "builder_run": (
+                None
+                if builder_run is None
+                else {
+                    "id": builder_run["id"],
+                    "status": builder_run["status"],
+                    "failure_reason": builder_run.get("failure_reason"),
+                    "failure_detail": builder_run.get("failure_detail"),
+                }
+            ),
+            "recoveries": [
+                {
+                    "id": item["id"],
+                    "snapshot_digest": item["snapshot_digest"],
+                    "recovery_digest": item["recovery_digest"],
+                    "created_at": item["created_at"],
+                }
+                for item in store.recoveries(task_id)
+            ],
+            "limit": MAX_BUILDER_RECOVERIES,
+            "eligible": False,
+            "obstacles": [],
+            "workspace": None,
+            "change_set": None,
+            "snapshot": None,
+            "next": None,
+        }
+
+        snapshot: dict[str, Any] | None = None
+        changeset: ChangeSet | None = None
+        snapshot_error: str | None = None
+        if iteration is not None and iteration.get("commit_sha"):
+            path = workspace_path_for(engine.workspace_root, task_id)
+            if is_worktree(path):
+                view["workspace"] = {
+                    "path": str(path),
+                    "branch": iteration.get("branch"),
+                    "recorded_path": iteration.get("workspace_path"),
+                }
+                try:
+                    resume_task_workspace(engine.workspace_root, task_id)
+                    changeset = inspect_change_set(
+                        path,
+                        base_commit=iteration["base_commit"],
+                        reviewed_commit=str(iteration.get("commit_sha")),
+                    )
+                    digest, entries = recoverable_inventory(path, iteration["base_commit"])
+                except WorkspaceError as error:
+                    snapshot_error = f"{error.code}: {error.message}"
+                else:
+                    snapshot = {"digest": digest, "files": entries}
+                    view["change_set"] = {
+                        "base_commit": changeset.base_commit,
+                        "head_commit": changeset.head_commit,
+                        "workspace_digest": changeset.workspace_digest,
+                        "changed_files": changeset.changed_files,
+                        # The failed Builder never produced a report, so there is
+                        # no claimed file list to compare against the change set.
+                        "reported_files": None,
+                    }
+
+        if snapshot is None:
+            # No digest can be shown, so report why from the same list
+            # `recover-builder` enforces rather than inventing a reason here.
+            obstacles = self._recovery_obstacles(task, iteration, builder_run, None)
+            if snapshot_error is not None:
+                obstacles.append(snapshot_error)
+            elif not obstacles:
+                obstacles.append(
+                    "The task worktree holding the failed Builder's work is not available."
+                )
+            view["obstacles"] = obstacles
+            return view
+
+        view["snapshot"] = snapshot
+        view["obstacles"] = self._recovery_obstacles(task, iteration, builder_run, changeset)
+        view["eligible"] = not view["obstacles"]
+        if view["eligible"]:
+            view["next"] = (
+                f"loomsphere-harness recover-builder {task_id} "
+                f"--snapshot-digest {snapshot['digest']}"
+            )
+        return view
+
+    def recover_builder(self, task_id: str, *, snapshot_digest: str) -> dict[str, Any]:
+        """Freeze a failed Builder's preserved work and take it through the gate.
+
+        The Builder is never invoked again. The preserved worktree is snapshotted,
+        compared to the digest a human quoted from `inspect-recovery`, committed
+        exactly as it stands, and then validated, QA-checked, and reviewed by the
+        same stages a normal iteration uses. The original failed run, its failure
+        reason, and the iteration's own failure record are never rewritten.
+        """
+
+        engine = self.engine
+        store = self.store
+        task = engine._task(task_id)
+        iteration = store.iteration(task_id)
+        runs = store.runs(task_id)
+        builder_run = self._failed_builder_run(runs)
+        if iteration is None or builder_run is None:
+            self._refuse_recovery(
+                "The task has no failed Builder run and no iteration to recover."
+            )
+        if not _SHA256_PATTERN.match(snapshot_digest):
+            self._refuse_recovery(
+                "The snapshot digest must be the 64-character digest printed by "
+                "`inspect-recovery`."
+            )
+
+        obstacles = self._recovery_obstacles(task, iteration, builder_run, None)
+        if obstacles:
+            self._refuse_recovery(" ".join(obstacles))
+
+        # The approval must still bind the exact proposal the contract comes from.
+        proposal = store.proposal(task_id)
+        approval = store.approval(task_id)
+        if (
+            proposal is None
+            or approval is None
+            or approval["decision"] != "approved"
+            or proposal["status"] != "approved"
+            or approval["proposal_id"] != proposal["id"]
+            or approval["proposal_digest"] != proposal["digest"]
+            or _document_digest(proposal["document"]) != proposal["digest"]
+        ):
+            self._refuse_recovery("The original approval no longer matches the proposal.")
+        contract, criteria_lines = self._contract(task_id)
+
+        # The worktree must still hold exactly the commit the failure recorded.
+        path = workspace_path_for(engine.workspace_root, task_id)
+        recorded = iteration.get("workspace_path")
+        if not is_worktree(path) or not recorded or Path(recorded).resolve() != path.resolve():
+            self._refuse_recovery("The task worktree is missing or is not the recorded workspace.")
+        try:
+            workspace = resume_task_workspace(engine.workspace_root, task_id)
+            commit = str(iteration.get("commit_sha") or "")
+            if workspace.commit != commit:
+                self._refuse_recovery(
+                    "The worktree head has moved since the change set was committed; "
+                    "the recorded commit is no longer what would be recovered."
+                )
+            if not is_ancestor(path, iteration["base_commit"], commit):
+                self._refuse_recovery("The recorded commit is not on top of the approved base.")
+            changeset = inspect_change_set(
+                path, base_commit=iteration["base_commit"], reviewed_commit=commit
+            )
+            digest, entries = recoverable_inventory(path, iteration["base_commit"])
+        except WorkspaceError as error:
+            self._refuse_recovery(f"The worktree no longer matches its record ({error.code}).")
+
+        if (
+            changeset.workspace_digest != iteration.get("workspace_digest")
+            or changeset.head_commit != commit
+        ):
+            self._refuse_recovery("The preserved content differs from the recorded change set.")
+        if digest != snapshot_digest:
+            self._refuse_recovery(
+                "The supplied digest is not the digest of the work that would be "
+                f"recovered (current snapshot {digest})."
+            )
+
+        recovery_note = self._recovery_note(
+            task=task, iteration=iteration, builder_run=builder_run, changeset=changeset,
+            digest=digest, entries=entries,
+        )
+        actor = engine.identity.current().id
+        record = store.authorize_builder_recovery(
+            task_id=task_id,
+            iteration_id=iteration["id"],
+            actor=actor,
+            recovery_digest=changeset.workspace_digest,
+            snapshot_digest=digest,
+            base_commit=changeset.base_commit,
+            head_commit=changeset.head_commit,
+            changed_files=entries,
+            contract_digest=contract_digest(contract),
+            failure={
+                "reason": builder_run.get("failure_reason"),
+                "detail": str(builder_run.get("failure_detail") or "")[:DETAIL_MAX_CHARS],
+            },
+            builder_run_id=builder_run["id"],
+            limit=MAX_BUILDER_RECOVERIES,
+        )
+
+        try:
+            outcome = self._recover_after_build(
+                task=engine._task(task_id), iteration=iteration, contract=contract,
+                criteria_lines=criteria_lines, workspace=workspace, changeset=changeset,
+                recovery=recovery_note,
+            )
+            if outcome["result"] != "ready":
+                return {**outcome, "recovery_id": record["id"], "snapshot_digest": digest}
+            published = self._publish(
+                engine._task(task_id), iteration, contract, outcome
+            )
+            return {
+                "result": "delivered", "iteration_id": iteration["id"],
+                "recovery_id": record["id"], "snapshot_digest": digest,
+                "builder_run_id": builder_run["id"], **published,
+            }
+        except Exception:
+            # The recovery was claimed before it ran. If it did not finish the task
+            # would otherwise stay in a running state for ever, so the claim is
+            # closed here rather than left open.
+            self._close_open_recovery(task_id, iteration["id"])
+            raise
+
+    def _close_open_recovery(self, task_id: str, iteration_id: str) -> None:
+        """Close a claimed recovery that did not reach a decision of its own."""
+        if self.engine._task(task_id)["status"] != "implementation_running":
+            return
+        self._record_failure(
+            task_id, iteration_id,
+            reason=REASON_RECOVERY_INCOMPLETE,
+            detail=(
+                "The authorised recovery stopped before it reached a decision. The "
+                "preserved work is still committed on the task branch and the "
+                "original failure record is unchanged."
+            ),
+            expect=("implementation_running",),
+            iteration_status=ITERATION_FAILED,
+        )
+
+    def _recover_after_build(
+        self,
+        *,
+        task: dict[str, Any],
+        iteration: dict[str, Any],
+        contract: AcceptanceContract,
+        criteria_lines: tuple[str, ...],
+        workspace: TaskWorkspace,
+        changeset: ChangeSet,
+        recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Validation, QA, and review for a recovered change set.
+
+        The same three stages a normal iteration runs, in the same order, against
+        the same records. The only difference is that the Builder prompt is never
+        composed, no build report exists, and the QA and Reviewer prompts carry the
+        recovery provenance so neither role can silently assume one was.
+        """
+
+        engine = self.engine
+        store = self.store
+        task_id = task["id"]
+        iteration_id = iteration["id"]
+        actor = engine.identity.current().id
+
+        store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="recovery.frozen",
+            fields={
+                "commit_sha": changeset.head_commit,
+                "workspace_digest": changeset.workspace_digest,
+                "diff_excerpt": diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
+            },
+            detail={
+                "commit": changeset.head_commit,
+                "files": len(changeset.changed_files),
+                "snapshot_digest": recovery["snapshot_digest"],
+                "builder_run_id": recovery["builder_run_id"],
+            },
+        )
+
+        outcome = self._validate(
+            workspace.path, iteration_id, task_id, actor, contract, changeset=changeset
+        )
+        if outcome is None:
+            return self._record_failure(
+                task_id, iteration_id, reason=REASON_VALIDATION_FAILED,
+                detail="The recovered change set could not be validated.",
+                expect=("implementation_running",),
+                iteration_status=ITERATION_VALIDATION_FAILED,
+            )
+        if isinstance(outcome, dict):
+            return outcome
+        validation = outcome
+
+        persona, _, selection = engine.persona_and_skills(task, QA)
+        try:
+            qa_prompt = compose_qa_prompt(
+                persona=persona,
+                task_title=task["title"],
+                requirements=task["requirements"],
+                acceptance_criteria=task["acceptance_criteria"],
+                task_identifier=task_id,
+                implementation_summary="",
+                implementation_files=changeset.paths,
+                diff_excerpt=diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
+                validation_command=validation.command,
+                validation_exit_code=validation.exit_code,
+                validation_output=str(validation.output),
+                approved_criteria=criteria_lines,
+                skills=selection.documents,
+                recovery=recovery,
+            )
+        except LoopPromptError as error:
+            return self._record_failure(
+                task_id, iteration_id, reason=error.code, detail=error.message,
+                expect=("implementation_running",),
+            )
+
+        store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
+            fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": iteration["number"]},
+        )
+        qa_outcome = engine.invoke_role(
+            task=task, role=QA, composed=qa_prompt, selection=selection,
+            expect=("implementation_running",), running="qa_running",
+            failed="qa_failed", workspace_path=workspace.path, writable=False,
+        )
+        if not qa_outcome.succeeded:
+            return self._failed_run(
+                qa_outcome, task_id, iteration_id, running="implementation_running"
+            )
+        try:
+            qa = parse_qa_report(qa_outcome.response_text)
+        except ReportError as error:
+            self._fail_run(
+                qa_outcome, task_id, running="qa_running", failed="qa_failed",
+                reason=REASON_INVALID_QA_REPORT, detail=error.message,
+            )
+            return self._record_failure(
+                task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
+                detail=error.message, expect=None, iteration_status=ITERATION_QA_FAILED,
+            )
+        store.succeed_run(
+            run_id=qa_outcome.run_id, response_text=qa_outcome.response_text,
+            events=dict(qa_outcome.events),
+        )
+        store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="qa.recorded",
+            fields={"qa_report": dataclasses.asdict(qa), "qa_digest": qa.digest,
+                    "qa_run_id": qa_outcome.run_id},
+            detail={"verdict": qa.verdict, "findings": len(qa.findings)},
+        )
+
+        problems = self._criteria_problems(qa.acceptance_criteria, contract)
+        if qa.verdict != "passed" or qa.blocking_findings or problems:
+            return self._rework(
+                task_id, iteration_id, expect=("qa_running",), reason=REASON_QA_BLOCKED,
+                feedback=self._qa_feedback(qa, problems),
+            )
+
+        try:
+            review_prompt, review_selection = self._review_prompt(
+                task, report=None, qa=qa, diff=changeset.diff, command=validation.command,
+                exit_code=validation.exit_code, criteria_lines=criteria_lines,
+                recovery=recovery,
+            )
+        except LoopPromptError as error:
+            return self._record_failure(
+                task_id, iteration_id, reason=error.code, detail=error.message,
+                expect=("qa_running",),
+            )
+
+        store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="iteration.review-started",
+            fields={"status": ITERATION_REVIEW_RUNNING}, detail={"iteration": iteration["number"]},
+        )
+        review_outcome = engine.invoke_role(
+            task=task, role=REVIEWER, composed=review_prompt, selection=review_selection,
+            expect=("qa_running",), running="review_running",
+            failed="review_failed", workspace_path=workspace.path, writable=False,
+        )
+        return self._finish_review(
+            task_id=task_id, iteration_id=iteration_id, contract=contract,
+            review_outcome=review_outcome, changeset=changeset, report=None, qa=qa,
+            validation=validation, workspace=workspace,
+        )
+
+    def _recovery_obstacles(
+        self,
+        task: dict[str, Any],
+        iteration: dict[str, Any] | None,
+        builder_run: dict[str, Any] | None,
+        changeset: ChangeSet | None,
+    ) -> list[str]:
+        """Every reason the preserved work cannot be recovered, in one place.
+
+        `inspect-recovery` reports these and `recover-builder` refuses on the same
+        list, so what a human is shown and what the gate enforces cannot drift.
+        """
+
+        store = self.store
+        task_id = task["id"]
+        obstacles: list[str] = []
+        if task["status"] != "implementation_failed":
+            obstacles.append(
+                f"Task {task_id} is {task['status']}; only implementation_failed can be recovered."
+            )
+        if iteration is None:
+            obstacles.append("The task has no iteration to recover.")
+        else:
+            if iteration["status"] != ITERATION_FAILED:
+                obstacles.append(
+                    f"Iteration {iteration['number']} is {iteration['status']}; "
+                    "only a failed iteration can be recovered."
+                )
+            if not iteration.get("commit_sha"):
+                obstacles.append(
+                    "The failed run never committed a change set, so there is nothing "
+                    "to authorize."
+                )
+            if iteration.get("build_report") or iteration.get("build_digest"):
+                obstacles.append(
+                    "This iteration already has a Builder report; a normal retry applies, "
+                    "not a recovery."
+                )
+            if iteration["base_commit"] != task.get("repo_commit"):
+                obstacles.append(
+                    "The iteration base commit does not match the approved repository commit."
+                )
+        if builder_run is None:
+            obstacles.append("No failed Builder run is recorded for this task.")
+        else:
+            if builder_run["status"] not in RECOVERABLE_RUN_STATUSES:
+                obstacles.append(
+                    f"The Builder run is {builder_run['status']}, not a failed run."
+                )
+            reason = builder_run.get("failure_reason")
+            if reason not in RECOVERABLE_FAILURES:
+                obstacles.append(
+                    f"The Builder failed with {reason!r}; recovery applies only to runs that "
+                    "stopped before answering, not to a refused or unparseable report."
+                )
+        if store.deliverable(task_id) is not None or store.acceptance(task_id) is not None:
+            obstacles.append("A deliverable or delivery decision already exists.")
+        used = len(
+            [item for item in store.recoveries(task_id)
+             if iteration is None or item["iteration_id"] == iteration["id"]]
+        )
+        if used >= MAX_BUILDER_RECOVERIES:
+            obstacles.append(
+                f"Iteration {iteration['number'] if iteration else '?'} already used its "
+                f"{MAX_BUILDER_RECOVERIES} authorised recovery."
+            )
+        if changeset is not None and iteration is not None:
+            if changeset.workspace_digest != iteration.get("workspace_digest"):
+                obstacles.append(
+                    "The preserved worktree content differs from the recorded change set."
+                )
+        return obstacles
+
+    @staticmethod
+    def _failed_builder_run(runs: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+        """The Builder run that stopped, or ``None`` when the Builder succeeded."""
+
+        builder = [
+            run for run in runs
+            if run["role"] == "builder" and run["status"] in RECOVERABLE_RUN_STATUSES
+        ]
+        return builder[-1] if builder else None
+
+    def _recovery_note(
+        self,
+        *,
+        task: dict[str, Any],
+        iteration: dict[str, Any],
+        builder_run: dict[str, Any],
+        changeset: ChangeSet,
+        digest: str,
+        entries: Sequence[dict[str, str]],
+    ) -> dict[str, Any]:
+        """The provenance QA and the Reviewer are told, and the document records."""
+
+        return {
+            "failure_reason": builder_run.get("failure_reason"),
+            "failure_detail": str(builder_run.get("failure_detail") or ""),
+            "builder_run_id": builder_run["id"],
+            "base_commit": changeset.base_commit,
+            "head_commit": changeset.head_commit,
+            "snapshot_digest": digest,
+            "recovery_digest": changeset.workspace_digest,
+            "changed_files": list(entries),
+            "iteration": iteration["number"],
+            "task": task["id"],
+        }
+
+    @staticmethod
+    def _refuse_recovery(message: str) -> NoReturn:
+        raise EngineError(REASON_RECOVERY_REFUSED, message)
 
     def _format_failed_review_run(
         self, task_id: str, iteration: dict[str, Any], runs: dict[str, dict[str, Any]]
@@ -560,7 +1110,17 @@ class ImplementationStage:
             failed="implementation_failed", workspace_path=workspace.path, writable=True,
         )
         if not builder.succeeded:
-            return self._failed_run(builder, task_id, iteration_id, running="implementation_running")
+            # The run already moved the task to implementation_failed, but the
+            # worktree still holds whatever the Builder wrote before it stopped.
+            # Preserve it so a human can examine and authorise exactly that work.
+            error = builder.error
+            return self._record_failure(
+                task_id, iteration_id,
+                reason=error.reason if error is not None else "run-failed",
+                detail=error.detail if error is not None else "The invocation failed.",
+                expect=None,
+                extra=self._freeze_builder_work(workspace, task_id, iteration),
+            )
 
         try:
             report = parse_build_report(builder.response_text)
@@ -616,7 +1176,7 @@ class ImplementationStage:
 
         # 4. Executed validation, in the sandbox, against this exact commit.
         outcome = self._validate(
-            workspace.path, iteration_id, task_id, actor, contract
+            workspace.path, iteration_id, task_id, actor, contract, changeset=changeset
         )
         if outcome is None:
             return self._record_failure(
@@ -728,12 +1288,13 @@ class ImplementationStage:
         self,
         task: dict[str, Any],
         *,
-        report: BuildReport,
+        report: BuildReport | None,
         qa: QaReport,
         diff: str,
         command: Sequence[str],
         exit_code: int | None,
         criteria_lines: Sequence[str],
+        recovery: dict[str, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Compose the Reviewer prompt from recorded evidence only."""
 
@@ -744,7 +1305,7 @@ class ImplementationStage:
             requirements=task["requirements"],
             acceptance_criteria=task["acceptance_criteria"],
             task_identifier=task["id"],
-            implementation_summary=report.summary,
+            implementation_summary=report.summary if report is not None else "",
             diff_excerpt=diff_excerpt(diff, DIFF_EXCERPT_CHARS),
             validation_command=command,
             validation_exit_code=exit_code,
@@ -753,6 +1314,7 @@ class ImplementationStage:
             qa_findings=[finding.description for finding in qa.findings],
             approved_criteria=criteria_lines,
             skills=selection.documents,
+            recovery=recovery,
         )
         return prompt, selection
 
@@ -764,7 +1326,7 @@ class ImplementationStage:
         contract: AcceptanceContract,
         review_outcome: RoleOutcome,
         changeset: ChangeSet,
-        report: BuildReport,
+        report: BuildReport | None,
         qa: QaReport,
         validation: ValidationOutcome,
         workspace: Any,
@@ -829,8 +1391,15 @@ class ImplementationStage:
         task_id: str,
         actor: str,
         contract: AcceptanceContract,
+        *,
+        changeset: ChangeSet | None = None,
     ) -> ValidationOutcome | dict[str, Any] | None:
-        """Plan and execute the validation command, recording the evidence."""
+        """Plan and execute the validation command, recording the evidence.
+
+        ``changeset`` binds the recorded execution to the exact commit that is being
+        validated. A recovery always supplies it; the loop records it on the
+        iteration once validation has run.
+        """
 
         engine = self.engine
         validation_config = engine.config.validation
@@ -905,6 +1474,16 @@ class ImplementationStage:
                 task_id, iteration_id,
                 reason=record.failure_reason or REASON_VALIDATION_FAILED,
                 detail=f"{detail}\n{record.output}", expect=("implementation_running",),
+                iteration_status=ITERATION_VALIDATION_FAILED,
+            )
+        if changeset is not None and record.workspace_digest != changeset.workspace_digest:
+            return self._record_failure(
+                task_id, iteration_id, reason=REASON_VALIDATION_FAILED,
+                detail=(
+                    "The validated source digest does not match the committed "
+                    f"change set ({record.workspace_digest} != {changeset.workspace_digest})."
+                ),
+                expect=("implementation_running",),
                 iteration_status=ITERATION_VALIDATION_FAILED,
             )
         failed_obligations = [
@@ -1003,7 +1582,7 @@ class ImplementationStage:
         """Freeze the reviewed change set into the deliverable a human decides on."""
 
         changeset: ChangeSet = outcome["changeset"]
-        report: BuildReport = outcome["report"]
+        report: BuildReport | None = outcome["report"]
         qa: QaReport = outcome["qa"]
         review: ReviewVerdict = outcome["review"]
         validation: ValidationOutcome = outcome["validation"]
@@ -1013,6 +1592,7 @@ class ImplementationStage:
         # Re-read the iteration: the builder/QA/Reviewer run identifiers were
         # recorded after the copy the loop was holding.
         iteration = self.store.iteration(task_id) or iteration
+        recovery = self.store.recovery_for_iteration(iteration["id"])
 
         document: dict[str, Any] = {
             "schema_version": DELIVERABLE_SCHEMA_VERSION,
@@ -1040,11 +1620,48 @@ class ImplementationStage:
                 "criteria": [item.model_dump(mode="json") for item in contract.criteria],
             },
             "verification_coverage": self._verification_coverage(validation),
-            "builder": {
-                "report": dataclasses.asdict(report),
-                "digest": report.digest,
-                "run_id": iteration.get("builder_run_id"),
-            },
+            "builder": (
+                {
+                    "report": dataclasses.asdict(report),
+                    "digest": report.digest,
+                    "run_id": iteration.get("builder_run_id"),
+                    "status": "reported",
+                }
+                if report is not None
+                else {
+                    # The Builder stopped before writing a report. Nothing is
+                    # inferred, summarised, or simulated in its place.
+                    "report": None,
+                    "digest": None,
+                    "run_id": recovery["builder_run_id"] if recovery else None,
+                    "status": "not-recorded",
+                    "reason": recovery["failure_reason"] if recovery else None,
+                    "detail": recovery["failure_detail"] if recovery else None,
+                    "tests_run": None,
+                    "test_execution": "not-recorded",
+                }
+            ),
+            "recovery": (
+                None
+                if recovery is None
+                else {
+                    "id": recovery["id"],
+                    "authorized_by": recovery["actor"],
+                    "authorized_at": recovery["created_at"],
+                    "failed_builder_run_id": recovery["builder_run_id"],
+                    "failure_reason": recovery["failure_reason"],
+                    "failure_detail": recovery["failure_detail"],
+                    "base_commit": recovery["base_commit"],
+                    "head_commit": recovery["head_commit"],
+                    "snapshot_digest": recovery["snapshot_digest"],
+                    "recovery_digest": recovery["recovery_digest"],
+                    "changed_files": recovery["changed_files"],
+                    "contract_digest": recovery["contract_digest"],
+                    "builder_report": "not-recorded",
+                    "builder_tests_run": "not-recorded",
+                    "acceptance": "pending-human-acceptance",
+                }
+            ),
             "validation": {
                 "record": validation.as_record(),
                 "exit_code": validation.exit_code,
@@ -1101,6 +1718,43 @@ class ImplementationStage:
             reason=reason, detail=detail[:DETAIL_MAX_CHARS],
             response_text=outcome.response_text, events=dict(outcome.events),
         )
+
+    def _freeze_builder_work(
+        self, workspace: TaskWorkspace, task_id: str, iteration: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Preserve whatever a failed Builder wrote, and say exactly what it is.
+
+        The files are committed on the task branch under a message that says they
+        are unfinished, so a later attempt that reuses the worktree cannot silently
+        lose them and a human can put a single digest on exactly what survived.
+
+        This is preservation, not acceptance. Nothing here is validated, QA never
+        sees it, no build report is invented, and only `recover-builder` can take
+        the work further. A change set that looks like a credential is left on disk
+        untouched and is deliberately not committed, so it cannot be recovered.
+        A freeze that fails changes nothing about the recorded failure.
+        """
+
+        path = workspace.path
+        base_commit = iteration["base_commit"]
+        try:
+            names = changed_paths(path, base_commit)
+            if not names:
+                return {}
+            screen_change_set(path, names)
+            commit = commit_worktree(
+                path,
+                COMMIT_MESSAGE.format(task=task_id, number=iteration["number"])
+                + " [unfinished Builder work preserved after failure]",
+            )
+            changeset = inspect_change_set(path, base_commit=base_commit, reviewed_commit=commit)
+        except WorkspaceError:
+            return {}
+        return {
+            "commit_sha": changeset.head_commit,
+            "workspace_digest": changeset.workspace_digest,
+            "diff_excerpt": diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
+        }
 
     def _failed_run(
         self, outcome: RoleOutcome, task_id: str, iteration_id: str, *, running: str
@@ -1177,7 +1831,13 @@ class ImplementationStage:
 __all__ = [
     "DELIVERABLE_SCHEMA_VERSION",
     "ImplementationStage",
+    "MAX_BUILDER_RECOVERIES",
     "MAX_REVIEW_RETRIES",
+    "RECOVERABLE_FAILURES",
+    "REASON_BUILDER_INTERRUPTED",
+    "REASON_RECOVERY_ELIGIBLE",
+    "REASON_RECOVERY_INCOMPLETE",
+    "REASON_RECOVERY_REFUSED",
     "REASON_REVIEW_RETRY_REFUSED",
     "REASON_CONTRACT_UNAVAILABLE",
     "REASON_INVALID_BUILD_REPORT",

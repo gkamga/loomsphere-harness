@@ -29,8 +29,9 @@ from loomsphere_harness.validation import ValidationPlanError
 from loomsphere_harness.workspace import WorkspaceError
 
 COMMANDS = (
-    "init", "submit", "run", "show", "approve", "reject", "implement", "retry-review", "changes",
-    "evidence", "accept", "reject-delivery", "status", "audit",
+    "init", "submit", "run", "show", "approve", "reject", "implement", "retry-review",
+    "inspect-recovery", "recover-builder", "changes", "evidence", "accept", "reject-delivery",
+    "status", "audit",
 )
 EXPECTED_ERRORS = (
     ConfigError, AssetIntegrityError, EngineError, StoreError, RepositoryError, ApprovalError,
@@ -74,6 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-review",
         help="re-run only the Reviewer after an invalid-review-report failure (one retry)")
     retry_review.add_argument("task")
+    inspect_recovery = sub.add_parser(
+        "inspect-recovery",
+        help="show what a failed Builder preserved, without changing anything")
+    inspect_recovery.add_argument("task")
+    recover_builder = sub.add_parser(
+        "recover-builder",
+        help="authorize the exact preserved change set and take it through validation, "
+             "QA, and review (does not re-run the Builder)")
+    recover_builder.add_argument("task")
+    recover_builder.add_argument(
+        "--snapshot-digest", "--digest", dest="snapshot_digest", required=True,
+        help="snapshot SHA-256 shown by `inspect-recovery`")
     changes = sub.add_parser("changes", help="show the recorded change set of the deliverable")
     changes.add_argument("task")
     evidence = sub.add_parser("evidence", help="show the validation and review evidence")
@@ -459,6 +472,68 @@ def render_status(view: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_recovery(view: dict[str, Any]) -> str:
+    """Show what a failed Builder preserved and whether it can be recovered."""
+
+    inspection = view["recovery"]
+    task = inspection["task"]
+    lines = [f"{task['id']}  {task['status']}  {task['title']}"]
+    iteration = inspection.get("iteration")
+    if iteration is None:
+        lines.append("no iteration is recorded for this task")
+    else:
+        lines.append(
+            f"iteration {iteration['number']}  {iteration['status']}  "
+            f"{iteration.get('failure_reason') or '-'}"
+        )
+    builder_run = inspection.get("builder_run")
+    if builder_run is None:
+        lines.append("builder run: none recorded")
+    else:
+        lines.append(
+            f"builder run {builder_run['id']}  {builder_run['status']}  "
+            f"{builder_run.get('failure_reason') or '-'}"
+        )
+        detail = str(builder_run.get("failure_detail") or "").strip()
+        if detail:
+            lines.append(f"  {detail.splitlines()[0][:160]}")
+        lines.append(
+            "  no build report, no claimed file list, and no claimed test run were recorded"
+        )
+
+    workspace = inspection.get("workspace")
+    snapshot = inspection.get("snapshot")
+    change_set = inspection.get("change_set")
+    if workspace:
+        lines += ["", f"workspace {workspace['path']}"]
+        lines.append(f"  branch {workspace.get('branch') or '-'}")
+    if change_set:
+        lines.append(
+            f"  base {change_set['base_commit'][:12]} -> {change_set['head_commit'][:12]}"
+        )
+    if snapshot:
+        lines += ["", f"recoverable files ({len(snapshot['files'])})"]
+        for entry in snapshot["files"]:
+            lines.append(
+                f"  {entry['mode']:<10} {entry['path']}  {(entry['sha256'] or '-')[:16]}"
+            )
+        lines += ["", f"snapshot digest {snapshot['digest']}"]
+    if change_set:
+        lines.append(f"change set digest {change_set['workspace_digest']}")
+
+    used = len(inspection.get("recoveries") or [])
+    lines += ["", f"authorized recoveries {used} of {inspection['limit']}"]
+    obstacles = inspection.get("obstacles") or []
+    if obstacles:
+        lines.append("")
+        lines.append("Not recoverable:")
+        lines.extend(f"  - {obstacle}" for obstacle in obstacles)
+    elif inspection.get("next"):
+        lines.append("Recovery available. Authorize exactly this work with:")
+        lines.append(f"  {inspection['next']}")
+    return "\n".join(lines)
+
+
 def run_command(args: argparse.Namespace) -> int:
     engine = _engine(args)
     command = args.command
@@ -492,6 +567,14 @@ def run_command(args: argparse.Namespace) -> int:
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command == "retry-review":
         view = engine.retry_review(args.task)
+        _emit(args, view, render_iterations(view))
+        return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
+    elif command == "inspect-recovery":
+        view = engine.inspect_recovery(args.task)
+        _emit(args, view, render_recovery(view))
+        return 0 if view["recovery"]["eligible"] else 3
+    elif command == "recover-builder":
+        view = engine.recover_builder(args.task, snapshot_digest=args.snapshot_digest)
         _emit(args, view, render_iterations(view))
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command in ("changes", "evidence"):

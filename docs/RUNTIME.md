@@ -120,6 +120,8 @@ loomsphere-harness --repo . approve T-0001 --digest <proposal sha256>
 loomsphere-harness --repo . reject  T-0001 --digest <sha256> --reason "..."
 loomsphere-harness --repo . implement T-0001   # Builder, validation, QA, Reviewer
 loomsphere-harness --repo . retry-review T-0001 # one Reviewer-only retry
+loomsphere-harness --repo . inspect-recovery T-0001 # work a failed Builder left behind
+loomsphere-harness --repo . recover-builder T-0001 --snapshot-digest <sha256>
 loomsphere-harness --repo . changes T-0001     # recorded change set of the deliverable
 loomsphere-harness --repo . evidence T-0001    # validation run and review evidence
 loomsphere-harness --repo . accept  T-0001 --digest <deliverable sha256> [--reason "..."]
@@ -133,7 +135,46 @@ repository to it. The runtime never reads assets from inside the target repo.
 
 `--json` gives machine-readable output. Exit codes: `0` ok, `2` refused (error on
 stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
-`implement` → `awaiting_acceptance`, `changes`/`evidence` → no deliverable).
+`implement` → `awaiting_acceptance`, `changes`/`evidence` → no deliverable,
+`inspect-recovery` → the preserved work is not recoverable, `recover-builder` → the
+recovered work did not reach `awaiting_acceptance`).
+
+## Recovering work a failed Builder left behind
+
+A Builder can fail after it has written useful files — a model budget that runs out,
+a provider error, a timeout, an interrupted run. The failure used to end the task with
+its work stranded in the worktree. Two commands now turn that work into a decision a
+human makes:
+
+- At the moment the Builder fails, the runtime reads the worktree through the same
+  secret/size screen the delivery gate uses, commits what survives on
+  `loomsphere/task-<key>` with a fixup message saying the work is unfinished, and
+  records the commit, the workspace digest, and a diff excerpt on the iteration. If
+  the screen refuses a path, nothing is committed and the work is left exactly as it
+  is; it is never deleted.
+- `inspect-recovery <task>` is read-only. It reports the failed Builder run, the
+  preserved commit, the file inventory with a per-file mode and SHA-256, the snapshot
+  digest, how many recoveries are left, every obstacle that would block a recovery,
+  and the exact command to run next. It creates no run, writes no audit event, and
+  does not touch the worktree.
+- `recover-builder <task> --snapshot-digest <sha256>` requires that digest, which
+  binds the authorization to the exact bytes the human inspected. A changed worktree,
+  a different HEAD, a missing worktree, a task that is not `implementation_failed`, or
+  an exhausted allowance is refused (`recovery-refused`) without changing state.
+  A recovery is allowed once per task.
+- The recovery does **not** call the Builder. It reuses the recorded change set and
+  runs the existing validation, QA, and Reviewer stages unchanged, on the same
+  container-only, digest-checked path. A QA block returns the task to
+  `changes_required`, a rejection fails it, and a passing review reaches
+  `awaiting_acceptance` — with the same human acceptance gate as any other delivery.
+- Nothing is rewritten to make the recovery look cleaner: the failed Builder run keeps
+  its `failed` status and reason, the iteration keeps its original failure reason and
+  detail, and the recovery is recorded beside them in an append-only `recoveries`
+  table with the authorizing OS user and both digests.
+- The recovered deliverable states what was never observed. Its `builder` section is
+  `status: "not-recorded"` with `tests_run: null`, the QA and Reviewer prompts carry a
+  recovery provenance block telling them no Builder report exists, and the top-level
+  `recovery` document ends at `acceptance: "pending-human-acceptance".
 
 ## What is enforced
 
