@@ -21,6 +21,7 @@ Trust boundary, enforced by what is registered rather than by the prompt:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 from collections.abc import Mapping
@@ -64,6 +65,13 @@ DENIED_PATTERNS: tuple[str, ...] = (
 WRITER_ROLES = frozenset({"builder"})
 TOOL_ARGUMENT_CHARS = 300
 TOOL_ACTIVITY_LIMIT = 400
+#: Argument keys whose value is a search selector. The literal value can carry a
+#: credential, customer data, or the exact content being searched for, so only a
+#: digest, the argument name, and its length are recorded.
+SEARCH_ARGUMENT_KEYS: tuple[str, ...] = ("query", "pattern", "include_glob", "glob")
+#: Argument keys naming the object a tool acted on. A workspace-relative path is
+#: the useful diagnostic and is not workspace content, so it stays readable.
+TARGET_ARGUMENT_KEYS: tuple[str, ...] = ("path", "directory", "target")
 #: Conservative bounds on what one tool result may add to a model context. The
 #: library defaults (2,000 lines / 50,000 characters / 1,000 entries) let a single
 #: read or listing fill a small model's window before any implementation starts.
@@ -655,13 +663,20 @@ class _RunFailure(Exception):
         self.response_text = response_text
 
 
-def _argument_target(args: object) -> str | None:
-    """The single name a tool call acts on, and nothing else.
+def _argument_target(args: object) -> dict[str, object] | None:
+    """Safe diagnostic metadata for the object a tool call acted on.
 
     A read returns file contents and a write carries them in its arguments, so
     neither is recorded: run evidence is hash-chained and append-only, which makes
     it the worst possible place for a copy of the workspace or a credential a file
-    happened to contain. The path is enough to follow what a run was doing.
+    happened to contain.
+
+    Search selectors (``query``, ``pattern``, and glob filters) are also never
+    recorded literally. A search string can be a credential, customer data, or the
+    exact content being looked for. What is kept is a SHA-256 digest, the argument
+    name, and the value's length: enough to correlate repeated calls without
+    copying the value. Path-like arguments stay readable because a bounded
+    workspace-relative path is what makes the record diagnosable.
     """
 
     if isinstance(args, str):
@@ -671,10 +686,23 @@ def _argument_target(args: object) -> str | None:
             return None
     if not isinstance(args, Mapping):
         return None
-    for key in ("path", "directory", "pattern", "query", "glob", "target"):
+    for key in SEARCH_ARGUMENT_KEYS:
         value = args.get(key)
-        if isinstance(value, str):
-            return _clip(value, TOOL_ARGUMENT_CHARS)
+        if isinstance(value, str) and value:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            return {
+                "target": f"sha256:{digest}",
+                "target_kind": key,
+                "target_chars": len(value),
+            }
+    for key in TARGET_ARGUMENT_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return {
+                "target": _clip(value, TOOL_ARGUMENT_CHARS),
+                "target_kind": key,
+                "target_chars": len(value),
+            }
     return None
 
 
@@ -694,9 +722,14 @@ def _tool_activity(messages: list[object]) -> list[dict[str, object]]:
     for message in messages:
         for part in getattr(message, "parts", ()):
             if isinstance(part, ToolCallPart):
+                target = _argument_target(part.args) or {
+                    "target": None,
+                    "target_kind": None,
+                    "target_chars": None,
+                }
                 calls[part.tool_call_id] = {
                     "tool": part.tool_name,
-                    "target": _argument_target(part.args),
+                    **target,
                     "outcome": "no-result",
                 }
             elif isinstance(part, ToolReturnPart) and part.tool_call_id in calls:

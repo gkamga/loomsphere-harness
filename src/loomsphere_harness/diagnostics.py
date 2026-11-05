@@ -30,6 +30,18 @@ MEASURED = "measured"
 PARTIAL = "partial"
 UNAVAILABLE = "unavailable"
 
+#: Token accounting is reported separately from request and tool-call counts:
+#: those counters stay measured even when a provider omits usage for some
+#: requests, while token totals become lower bounds.
+TOKEN_COMPLETE = "complete"
+TOKEN_PARTIAL = "partial"
+TOKEN_UNAVAILABLE = "unavailable"
+_TOKEN_ACCOUNTING = {
+    MEASURED: TOKEN_COMPLETE,
+    PARTIAL: TOKEN_PARTIAL,
+    UNAVAILABLE: TOKEN_UNAVAILABLE,
+}
+
 #: Usage field -> the run limit that bounds it. The two names differ, so the
 #: mapping is explicit: a lookup that used the usage name against the limit table
 #: silently produced no entries at all.
@@ -102,6 +114,11 @@ def usage_snapshot(usage: Any) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "availability": availability,
+        # A partial run measured some requests and not others, so the token
+        # counters are a floor: consumption was at least this high and may be
+        # higher. Request and tool-call counts remain exact.
+        "token_accounting": _TOKEN_ACCOUNTING[availability],
+        "tokens_are_lower_bound": availability == PARTIAL,
         "unmeasured_requests": unmeasured,
         "source": USAGE_SOURCE,
     }
@@ -116,22 +133,54 @@ def budget_report(
     """Observed consumption per limit, with near/exceeded warnings.
 
     Reported from what was actually recorded; an unmeasured counter produces no
-    entry rather than a misleading percentage.
+    entry rather than a misleading percentage. When only some requests reported
+    usage, the token entry is marked as a lower bound and is never labelled
+    ``within``: the observed total is a floor, not evidence of spare budget.
+    Request and tool-call entries stay exact because those counters do not depend
+    on provider usage data.
     """
 
+    availability = usage.get("availability") if isinstance(usage, Mapping) else None
+    if availability not in (MEASURED, PARTIAL, UNAVAILABLE):
+        # Historical or hand-built evidence without the field keeps the previous
+        # behaviour rather than inventing a partial result.
+        availability = MEASURED
+    unmeasured = (
+        _count(usage.get("unmeasured_requests")) if isinstance(usage, Mapping) else None
+    )
     entries: list[dict[str, Any]] = []
     for name, limit_name in LIMIT_FIELDS.items():
         used = usage.get(name) if isinstance(usage, Mapping) else None
         allowed = limits.get(limit_name) if isinstance(limits, Mapping) else None
         if _count(used) is None or _count(allowed) in (None, 0):
             continue
+        partial_tokens = name == "total_tokens" and availability == PARTIAL
         ratio = round(used / allowed, 4)
         if used >= allowed:
             state = "exceeded"
+        elif partial_tokens:
+            # Some usage was never reported, so even a low observed total cannot
+            # support a "within budget" conclusion.
+            state = "lower-bound"
         elif ratio >= threshold:
             state = "near"
         else:
             state = "within"
+        if partial_tokens:
+            skipped = f"{unmeasured}" if unmeasured else "some"
+            message = (
+                f"{name} used at least {used} of {allowed} "
+                f"({ratio * 100:.1f}% of the configured limit); {skipped} request(s) "
+                "reported no usage, so actual consumption is higher and this is not "
+                "evidence of staying within budget"
+            )
+            basis = "observed-lower-bound"
+        else:
+            message = (
+                f"{name} used {used} of {allowed} ({ratio * 100:.1f}% of the "
+                f"configured limit)"
+            )
+            basis = "measured"
         entries.append(
             {
                 "name": name,
@@ -139,14 +188,14 @@ def budget_report(
                 "allowed": allowed,
                 "ratio": ratio,
                 "state": state,
-                "message": (
-                    f"{name} used {used} of {allowed} ({ratio * 100:.1f}% of the "
-                    f"configured limit)"
-                ),
+                "basis": basis,
+                "message": message,
             }
         )
     return {
         "threshold": threshold,
+        "usage_availability": availability,
+        "token_accounting": _TOKEN_ACCOUNTING[availability],
         "entries": entries,
         "warnings": [entry for entry in entries if entry["state"] != "within"],
         "note": DIAGNOSTIC_NOTE,
@@ -161,6 +210,9 @@ __all__ = [
     "LIMIT_FIELDS",
     "MEASURED",
     "PARTIAL",
+    "TOKEN_COMPLETE",
+    "TOKEN_PARTIAL",
+    "TOKEN_UNAVAILABLE",
     "UNAVAILABLE",
     "USAGE_SOURCE",
     "budget_report",

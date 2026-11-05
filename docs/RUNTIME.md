@@ -54,6 +54,7 @@ api_key_env = "LOOMSPHERE_MODEL_API_KEY"         # NAME of the env var holding t
 # api_key_file = "/path/to/key"                  # alternative; never an inline key
 # require_api_key = false                        # local servers only
 # request_limit, tool_call_limit, total_token_limit, max_output_tokens, timeout_seconds
+# [model.role_limits.<role>]                     # optional per-role narrowing; see below
 
 [state]
 # dir = "/path/outside/repo"   # default: ~/.local/share/loomsphere-harness/projects/<hash>
@@ -191,6 +192,89 @@ stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
 - **Output truncation** is reported, never silent: a run whose output hit the token
   limit records `truncation` signals, its `finish_reason`, and the token counts, and
   the stage fails rather than treating a partial response as complete.
+
+## Role budgets, usage diagnostics, and bounded reads
+
+### Per-role limits
+
+`[model]` holds the global budgets. An optional `[model.role_limits.<role>]` table
+narrows them for one role. The supported roles are `intake`, `architect`, `builder`,
+`qa`, and `reviewer`; the keys are `request_limit`, `tool_call_limit`, and
+`total_token_limit`. `max_output_tokens` and `timeout_seconds` remain global only.
+
+```toml
+[model]
+request_limit = 60
+tool_call_limit = 120
+total_token_limit = 600000
+
+# Illustrative values, not recommended production budgets. A role override may
+# only lower a global value, never raise it.
+[model.role_limits.intake]
+request_limit = 12
+total_token_limit = 120000
+
+[model.role_limits.builder]
+tool_call_limit = 90
+```
+
+Inheritance is per field: a key omitted from a role table keeps the global value,
+and a role with no table inherits every global. An override larger than the global
+value is refused with `config-limit-widened`. An unknown role, an unknown key, a
+duplicate role, a non-table entry, or a value that is not a positive integer is
+refused with `config-invalid`. Both are configuration errors, reported before any
+model call.
+
+The limits a run actually used are recorded in its evidence (`events.limits`), and
+each value carries its origin in `events.limits.sources`: `global` for an inherited
+value, `role_limits.<role>` for an override. `loomsphere-harness status` shows the
+same effective limits with that origin, so a failed run does not need the config
+file to be interpreted.
+
+### Usage diagnostics
+
+Every run records `duration_ms`, `usage`, `diagnostics`, and `tool_summary`,
+whether it succeeded or failed. A failed run does not produce a final report or
+change set, but it does carry the accounting of what it attempted, including the
+tool calls it actually made.
+
+`usage` reports `requests`, `tool_calls`, `input_tokens`, `output_tokens`,
+`total_tokens`, `unmeasured_requests`, and `source`. Token accounting is reported
+separately from request and tool-call counts, because a provider can omit usage
+for some responses without making the counters unknown:
+
+- `availability = "measured"` — every request reported usage. Token counts are
+  exact and the budget entries use `within`, `near`, or `exceeded` as usual.
+- `availability = "partial"` — some requests reported no usage. The token counts
+  are an observed lower bound (`tokens_are_lower_bound = true`, rendered as `>=N`),
+  and the `total_tokens` diagnostic is never reported as `within`; its state is
+  `lower-bound`. Actual consumption was at least the recorded figure and may be
+  higher. Request and tool-call counts are unaffected.
+- `availability = "unavailable"` — no usable usage was reported. Token fields are
+  `null`, never `0`, and text output says `unknown`, not zero.
+
+Diagnostic warnings are computed after the run. An entry at or above 80% of a
+configured limit is reported as `near`; a met or exceeded limit is `exceeded`. The
+warnings are observations, not enforcement: the runtime checks limits between
+steps, so a run can finish slightly above one. They are also not a financial cap;
+they count recorded usage against the configured budget. Cost is reported as
+`unavailable` because no verified billing units or prices are configured, and the
+recorded token counts are the auditable figures.
+
+A search selector passed to `search_files` is not stored as text in the run
+evidence. Tool activity records the tool name, a workspace-relative target path,
+outcome, and result size; a search `pattern` or `query` is recorded only as a
+SHA-256 digest with the argument name and its length. Prompts, tool results, and
+file contents are never copied into the audit trail.
+
+### Bounded reads and paging
+
+A tool result is bounded before it enters a model's context: 400 lines and 24,000
+characters per file read, 200 directory-listing entries, 100 search matches, and
+200 `find_files` results. A clipped read names the first line it did not show, and
+`read_file` accepts `offset` and `limit`, so paging continues from that point.
+These bounds apply equally to read-only Intake and Architect runs and to the
+Builder.
 
 ## The implementation loop
 

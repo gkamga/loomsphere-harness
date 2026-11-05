@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import sqlite3
@@ -49,6 +50,10 @@ from loomsphere_harness.diagnostics import (  # noqa: E402
     COST_UNAVAILABLE,
     DIAGNOSTIC_THRESHOLD,
     MEASURED,
+    PARTIAL,
+    TOKEN_COMPLETE,
+    TOKEN_PARTIAL,
+    TOKEN_UNAVAILABLE,
     UNAVAILABLE,
     budget_report,
     usage_snapshot,
@@ -65,6 +70,7 @@ from loomsphere_harness.pydantic_harness import (  # noqa: E402
     PydanticHarnessConfig,
     PydanticHarnessRunner,
     RoleLimits,
+    _argument_target,
     tools_for,
 )
 from loomsphere_harness.store import StoreError  # noqa: E402
@@ -124,6 +130,26 @@ def echo_tool_model(tool: str, args: dict) -> FunctionModel:
     return FunctionModel(respond)
 
 
+def status_view(events: dict, *, role: str = "qa", status: str = "ok",
+                failure: str | None = None) -> dict:
+    """The minimal stored view ``render_status`` needs, without a full engine run."""
+
+    return {
+        "task": {
+            "id": "T-0001", "status": "awaiting_approval", "title": "fixture",
+            "repo_ref": "HEAD", "repo_commit": "0" * 40, "repo_dirty": False,
+            "acceptance_criteria": "the fixture is returned",
+        },
+        "runs": [
+            {
+                "role": role, "status": status, "model": "test-model",
+                "prompt_digest": "0" * 64, "failure_reason": failure,
+                "events": events,
+            }
+        ],
+    }
+
+
 class BudgetDiagnostics(unittest.TestCase):
     """The pure report the executor and the CLI both render."""
 
@@ -152,13 +178,66 @@ class BudgetDiagnostics(unittest.TestCase):
     def test_an_unmeasured_usage_is_unknown_and_never_zero(self) -> None:
         snapshot = usage_snapshot(RunUsage(requests=2, unmeasured_requests=2))
         self.assertEqual(snapshot["availability"], UNAVAILABLE)
+        self.assertEqual(snapshot["token_accounting"], TOKEN_UNAVAILABLE)
         self.assertIsNone(snapshot["input_tokens"])
         self.assertIsNone(snapshot["output_tokens"])
         self.assertIsNone(snapshot["total_tokens"])
+        self.assertNotIn(
+            "total_tokens",
+            [entry["name"] for entry in budget_report(snapshot, self.limits)["entries"]],
+        )
 
         measured = usage_snapshot(RunUsage(requests=2, input_tokens=0, output_tokens=0))
         self.assertEqual(measured["availability"], MEASURED)
+        self.assertEqual(measured["token_accounting"], TOKEN_COMPLETE)
         self.assertEqual(measured["total_tokens"], 0)
+        self.assertFalse(measured["tokens_are_lower_bound"])
+
+    def test_completely_measured_usage_keeps_exact_budget_reporting(self) -> None:
+        snapshot = usage_snapshot(RunUsage(requests=2, input_tokens=700, output_tokens=100))
+        self.assertEqual(snapshot["availability"], MEASURED)
+        self.assertEqual(snapshot["token_accounting"], TOKEN_COMPLETE)
+        self.assertFalse(snapshot["tokens_are_lower_bound"])
+
+        entries = {
+            entry["name"]: entry
+            for entry in budget_report(snapshot, self.limits)["entries"]
+        }
+        self.assertEqual(entries["total_tokens"]["state"], "within")
+        self.assertEqual(entries["total_tokens"]["basis"], "measured")
+        self.assertIn("total_tokens used 800 of 600000", entries["total_tokens"]["message"])
+        self.assertNotIn("at least", entries["total_tokens"]["message"])
+
+    def test_partially_measured_usage_is_a_lower_bound_and_never_within_budget(self) -> None:
+        # Enough observed token usage to pass the warning threshold, but one
+        # request never reported usage, so the total can only be a floor.
+        snapshot = usage_snapshot(
+            RunUsage(
+                requests=4, tool_calls=2, input_tokens=560_000, output_tokens=0,
+                unmeasured_requests=1,
+            )
+        )
+        self.assertEqual(snapshot["availability"], PARTIAL)
+        self.assertEqual(snapshot["token_accounting"], TOKEN_PARTIAL)
+        self.assertTrue(snapshot["tokens_are_lower_bound"])
+        self.assertEqual(snapshot["total_tokens"], 560_000)
+
+        report = budget_report(snapshot, self.limits)
+        self.assertEqual(report["usage_availability"], PARTIAL)
+        self.assertEqual(report["token_accounting"], TOKEN_PARTIAL)
+        entries = {entry["name"]: entry for entry in report["entries"]}
+        tokens = entries["total_tokens"]
+        self.assertEqual(tokens["state"], "lower-bound")
+        self.assertEqual(tokens["basis"], "observed-lower-bound")
+        self.assertIn("at least 560000", tokens["message"])
+        self.assertIn("not evidence of staying within budget", tokens["message"])
+        self.assertIn(tokens, report["warnings"])
+
+        # Counters that do not depend on provider usage stay exact.
+        self.assertEqual(entries["requests"]["basis"], "measured")
+        self.assertEqual(entries["requests"]["state"], "within")
+        self.assertEqual(entries["tool_calls"]["basis"], "measured")
+        self.assertEqual(entries["tool_calls"]["state"], "within")
 
 
 class BudgetedRun(RuntimeCase):
@@ -364,9 +443,41 @@ class SuccessfulRunEvidence(RuntimeCase):
         self.assertEqual(len(activity), 1)
         self.assertEqual(activity[0]["tool"], "read_file")
         self.assertEqual(activity[0]["target"], "notes.txt")
+        self.assertEqual(activity[0]["target_kind"], "path")
+        self.assertEqual(activity[0]["target_chars"], len("notes.txt"))
         self.assertEqual(activity[0]["outcome"], "returned")
         self.assertGreater(activity[0]["result_chars"], 0)
         self.assertNotIn("SENTINEL-FILE-CONTENT", json.dumps(result.events))
+
+    def test_a_search_selector_is_digested_and_never_recorded(self) -> None:
+        selector = "SENTINEL-SEARCH-s3cr3t"
+        (self.repo / "notes.txt").write_text("hello\n", encoding="utf-8")
+        runner = PydanticHarnessRunner(
+            model_config(),
+            model=echo_tool_model("search_files", {"pattern": selector, "path": "."}),
+        )
+        result = runner.run(AgentInvocation(uuid4(), self.repo, "read", 30, role="qa"))
+
+        digest = "sha256:" + hashlib.sha256(selector.encode("utf-8")).hexdigest()
+        activity = result.events["tool_activity"]
+        self.assertEqual(len(activity), 1)
+        self.assertEqual(activity[0]["tool"], "search_files")
+        self.assertEqual(activity[0]["target"], digest)
+        self.assertEqual(activity[0]["target_kind"], "pattern")
+        self.assertEqual(activity[0]["target_chars"], len(selector))
+
+        # Neither the stored events nor the rendered status may carry the selector.
+        serialized = json.dumps(result.events, sort_keys=True)
+        self.assertNotIn(selector, serialized)
+        text = cli.render_status(status_view(result.events))
+        self.assertNotIn(selector, text)
+        self.assertIn("search_files", text)
+
+        # A tool that names its selector `query` is digested the same way. `query`
+        # is not one of the FileSystem tool arguments, so this covers the shared
+        # argument classifier directly.
+        self.assertEqual(_argument_target({"query": selector})["target"], digest)
+        self.assertEqual(_argument_target({"query": selector})["target_kind"], "query")
 
 
 class RoleLimitResolution(RuntimeCase):
@@ -618,6 +729,62 @@ class StatusRendering(BudgetedRun):
         self.assertIn("unknown", text)
         self.assertNotIn("tokens=0/0", text)
         self.assertIn("token counts are unknown, not zero", text)
+
+    def test_a_failed_run_still_shows_the_tools_it_called(self) -> None:
+        view, _ = self.failing_intake()
+        run = self.intake_run(view)
+        self.assertEqual(run["events"]["tool_summary"]["calls"], 2)
+        self.assertEqual(run["events"]["tool_summary"]["by_tool"], {"read_file": 2})
+
+        text = cli.render_status(view)
+        self.assertIn("tool calls: 2 (read_file=2)", text)
+        # The failed run has no final report; the tool counts are what makes it
+        # diagnosable without reading raw evidence.
+        payload = json.loads(self.render(view, as_json=True))
+        self.assertEqual(payload["runs"][0]["events"]["tool_summary"]["calls"], 2)
+
+    def test_a_successful_run_shows_counts_rather_than_only_tool_names(self) -> None:
+        runner = PydanticHarnessRunner(
+            model_config(), model=echo_tool_model("read_file", {"path": "README.md"})
+        )
+        result = runner.run(AgentInvocation(uuid4(), self.repo, "read", 30, role="qa"))
+
+        text = cli.render_status(status_view(result.events))
+        self.assertIn("tool calls: 1 (read_file=1)", text)
+        self.assertNotIn("    tools:", text)
+
+    def test_a_historical_run_without_a_summary_still_renders_its_tools(self) -> None:
+        runner = PydanticHarnessRunner(
+            model_config(), model=echo_tool_model("read_file", {"path": "README.md"})
+        )
+        result = runner.run(AgentInvocation(uuid4(), self.repo, "read", 30, role="qa"))
+        events = json.loads(json.dumps(result.events))
+        events.pop("tool_summary")
+
+        text = cli.render_status(status_view(events))
+        self.assertIn("tools: read_file", text)
+        self.assertNotIn("tool calls:", text)
+
+    def test_partial_token_accounting_is_rendered_as_a_lower_bound(self) -> None:
+        view, _ = self.failing_intake()
+        run = self.intake_run(view)
+        events = json.loads(json.dumps(run["events"]))
+        events["usage"].update(
+            {
+                "input_tokens": 1_000, "output_tokens": 20, "total_tokens": 1_020,
+                "availability": "partial", "token_accounting": "partial",
+                "tokens_are_lower_bound": True, "unmeasured_requests": 1,
+            }
+        )
+        events["diagnostics"] = budget_report(events["usage"], events["limits"])
+        run["events"] = events
+
+        text = cli.render_status(view)
+        self.assertIn("tokens=>=1000/>=20", text)
+        self.assertIn("total_tokens=>=1020", text)
+        self.assertIn("token totals are observed lower bounds", text)
+        self.assertIn("at least 1020", text)
+        self.assertNotIn("total_tokens used 1020", text)
 
 
 class SecurityBoundaries(BudgetedRun):
