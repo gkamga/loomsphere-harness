@@ -115,7 +115,25 @@ BUILDER_RULES = """\
 8. Validation runs in a network-isolated sandbox against the recorded change set.
    A test that needs the network, a container runtime, or an external service
    cannot be validated here: keep the suite runnable offline with what the image
-   already provides."""
+   already provides.
+9. Work in a bounded number of discovery steps, not an unbounded exploration.
+   List the project structure once, near the start, and reuse what you learned
+   instead of listing the same directory again.
+10. Search for the specific names, paths, and strings your change touches rather
+    than browsing files to understand the project in general.
+11. Read the file you are changing, and the files its tests import, in full. Do
+    not read whole directories, generated output, lock files, vendored code, or
+    documentation for background.
+12. Never reread a file whose content you already hold, and never repeat a search
+    whose result you already have. Reopen something only when the change you just
+    made could have altered it, and say why in your next step.
+13. Spend your remaining steps on the implementation and its automated tests, not
+    on exploratory documentation. Requirements and criteria in this prompt are the
+    specification; do not search the repository for a second opinion on them.
+14. If the change cannot be completed inside this budget, stop and report the
+    blocker and the exact files you still need to read, rather than continuing to
+    explore. A precise blocked report is an acceptable outcome; an unfinished
+    exploration is not."""
 
 QA_RULES = """\
 1. Do not modify any file; you are reviewing a recorded change set.

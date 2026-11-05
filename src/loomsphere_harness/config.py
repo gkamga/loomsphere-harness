@@ -38,7 +38,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from loomsphere_harness.pydantic_harness import PydanticHarnessConfig
+from loomsphere_harness.pydantic_harness import (
+    ROLE_LIMIT_KEYS,
+    ROLES,
+    PydanticHarnessConfig,
+    RoleLimits,
+)
 
 CONFIG_ENV = "LOOMSPHERE_HARNESS_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.config/loomsphere-harness/config.toml")
@@ -67,6 +72,7 @@ _MODEL_KEYS = {
     "total_token_limit",
     "max_output_tokens",
     "timeout_seconds",
+    "role_limits",
 }
 _HARNESS_KEYS = {"root"}
 _STATE_KEYS = {"dir"}
@@ -248,6 +254,19 @@ def parse_config(
     api_key = value.strip() if value and value.strip() else None
 
     defaults = PydanticHarnessConfig()
+    request_limit = _positive(model, "request_limit", defaults.request_limit)
+    tool_call_limit = _positive(model, "tool_call_limit", defaults.tool_call_limit)
+    total_token_limit = _positive(
+        model, "total_token_limit", defaults.total_token_limit
+    )
+    role_limits = _role_limits(
+        model.get("role_limits"),
+        globals_={
+            "request_limit": request_limit,
+            "tool_call_limit": tool_call_limit,
+            "total_token_limit": total_token_limit,
+        },
+    )
     model_config = PydanticHarnessConfig(
         provider=provider,
         base_url=_optional_text(model, "base_url"),
@@ -257,14 +276,13 @@ def parse_config(
         api_key_file=_optional_text(model, "api_key_file"),
         require_api_key=bool(model.get("require_api_key", True)),
         workspace_root=None,
-        request_limit=_positive(model, "request_limit", defaults.request_limit),
-        tool_call_limit=_positive(model, "tool_call_limit", defaults.tool_call_limit),
-        total_token_limit=_positive(
-            model, "total_token_limit", defaults.total_token_limit
-        ),
+        request_limit=request_limit,
+        tool_call_limit=tool_call_limit,
+        total_token_limit=total_token_limit,
         max_output_tokens=_positive(
             model, "max_output_tokens", defaults.max_output_tokens
         ),
+        role_limits=role_limits,
     )
     root = _optional_text(harness, "root")
     state_dir = _optional_text(state, "dir")
@@ -363,3 +381,69 @@ def _positive(section: Mapping[str, Any], key: str, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ConfigError("config-invalid", f"{key} must be a positive integer.")
     return value
+
+
+def _role_limits(
+    raw: Any, *, globals_: Mapping[str, int]
+) -> tuple[RoleLimits, ...]:
+    """Parse ``[model.role_limits.<role>]`` tables into per-role overrides.
+
+    Every failure mode is refused with a code, never repaired by guessing: an
+    unknown role name would otherwise silently run under the global budget, and a
+    zero or negative value would otherwise turn a limit into an immediate failure
+    or an unlimited run. An override may narrow a global limit but never widen it,
+    because a per-role table that raised a limit would quietly undo the operator's
+    global decision.
+    """
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            "config-invalid", "model.role_limits must be a table of agent roles."
+        )
+    unknown_roles = sorted(set(raw) - set(ROLES))
+    if unknown_roles:
+        raise ConfigError(
+            "config-invalid",
+            f"Unknown roles in [model.role_limits]: {unknown_roles}; expected a "
+            f"subset of {list(ROLES)}.",
+        )
+    parsed: list[RoleLimits] = []
+    for role in ROLES:
+        if role not in raw:
+            continue
+        section = raw[role]
+        if not isinstance(section, dict):
+            raise ConfigError(
+                "config-invalid",
+                f"[model.role_limits.{role}] must be a table of limit overrides.",
+            )
+        unknown_keys = sorted(set(section) - set(ROLE_LIMIT_KEYS))
+        if unknown_keys:
+            raise ConfigError(
+                "config-invalid",
+                f"Unknown keys in [model.role_limits.{role}]: {unknown_keys}; "
+                f"expected a subset of {list(ROLE_LIMIT_KEYS)}.",
+            )
+        values: dict[str, int] = {}
+        for key in ROLE_LIMIT_KEYS:
+            if key not in section:
+                # Unspecified fields inherit the global value at run time.
+                continue
+            value = section[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(
+                    "config-invalid",
+                    f"model.role_limits.{role}.{key} must be a positive integer.",
+                )
+            if value > globals_[key]:
+                raise ConfigError(
+                    "config-limit-widened",
+                    f"model.role_limits.{role}.{key} ({value}) exceeds the global "
+                    f"{key} ({globals_[key]}); a role override may only lower a limit.",
+                )
+            values[key] = value
+        if values:
+            parsed.append(RoleLimits(role=role, **values))
+    return tuple(parsed)
