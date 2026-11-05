@@ -296,21 +296,139 @@ def render_evidence(view: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _count_text(value: Any) -> str:
+    """A measured count, or ``unknown``.
+
+    ``unknown`` is deliberately not ``0``: a provider that reported no usage must
+    not leave a failed run looking like it consumed nothing.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "unknown"
+    return str(value)
+
+
+def _tokens_text(value: Any, *, lower_bound: bool) -> str:
+    """A token count, ``unknown``, or an explicit floor.
+
+    A partially measured run reported usage for some requests and not others, so
+    the stored total is a lower bound. Rendering it like an exact count would
+    invite exactly the budget conclusion the evidence cannot support.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "unknown"
+    return f">={value}" if lower_bound else str(value)
+
+
+def _tool_summary_text(summary: dict[str, Any]) -> str:
+    """Recorded tool-call counts for one run, successful or failed."""
+
+    line = f"    tool calls: {_count_text(summary.get('calls'))}"
+    by_tool = summary.get("by_tool") or {}
+    if by_tool:
+        line += " (" + ", ".join(f"{name}={count}" for name, count in by_tool.items()) + ")"
+    if summary.get("truncated") and summary.get("distinct") is not None:
+        line += f"; distinct={summary['distinct']}, per-tool list truncated"
+    return line
+
+
+def _limit_text(limits: dict[str, Any], sources: dict[str, Any], key: str) -> str:
+    allowed = limits.get(key)
+    if allowed is None:
+        return "unknown"
+    source = sources.get(key)
+    return f"{allowed} ({source})" if source else str(allowed)
+
+
+def _run_diagnostic_lines(run: dict[str, Any]) -> list[str]:
+    """Effective limits, observed usage, and warnings for one run.
+
+    Read only from recorded evidence, so the text view and ``--json`` view cannot
+    disagree, and so a stale run rendered by an older binary shows what was
+    actually stored rather than a guess.
+    """
+
+    events = run.get("events") or {}
+    usage = events.get("usage") or {}
+    limits = events.get("limits") or {}
+    diagnostics = events.get("diagnostics") or {}
+    lines: list[str] = []
+    if limits:
+        sources = limits.get("sources") or {}
+        timeout = limits.get("timeout_seconds")
+        lines.append(
+            "    limits: "
+            f"requests={_limit_text(limits, sources, 'request_limit')} "
+            f"tool_calls={_limit_text(limits, sources, 'tool_call_limit')} "
+            f"total_tokens={_limit_text(limits, sources, 'total_token_limit')}"
+            + (f" timeout={timeout}s" if timeout is not None else "")
+        )
+    if usage:
+        lower_bound = bool(usage.get("tokens_are_lower_bound")) or (
+            usage.get("token_accounting") == "partial"
+        )
+        lines.append(
+            "    usage: "
+            f"requests={_count_text(usage.get('requests'))} "
+            f"tool_calls={_count_text(usage.get('tool_calls'))} "
+            f"total_tokens={_tokens_text(usage.get('total_tokens'), lower_bound=lower_bound)}"
+            + (
+                f" duration={(events.get('duration_ms') if events.get('duration_ms') is not None else 'unknown')}ms"
+            )
+        )
+    warnings = diagnostics.get("warnings") or []
+    if warnings:
+        lines.append(
+            "    observed diagnostic warnings: "
+            + "; ".join(str(warning.get("message")) for warning in warnings)
+        )
+    availability = usage.get("availability")
+    if availability and availability != "measured":
+        unmeasured = usage.get("unmeasured_requests")
+        detail = f" ({unmeasured} request(s) reported no usage)" if unmeasured else ""
+        if usage.get("tokens_are_lower_bound"):
+            lines.append(
+                f"    usage availability: {availability}{detail}; token totals are "
+                "observed lower bounds, so actual consumption may be higher"
+            )
+        else:
+            lines.append(
+                f"    usage availability: {availability}{detail}; "
+                "token counts are unknown, not zero"
+            )
+    return lines
+
+
 def render_status(view: dict[str, Any]) -> str:
     lines = [
         render_task({**view, "proposal": None, "intake": None, "approval": None}).splitlines()[0],
         "Runs:",
     ]
     for run in view["runs"]:
-        usage = (run.get("events") or {}).get("usage") or {}
+        events = run.get("events") or {}
+        usage = events.get("usage") or {}
+        duration = events.get("duration_ms")
+        lower_bound = bool(usage.get("tokens_are_lower_bound"))
         lines.append(
             f"  {run['role']:<9} {run['status']:<11} model={run['model']} prompt={str(run['prompt_digest'])[:12]}"
-            f" tokens={usage.get('input_tokens', '-')}/{usage.get('output_tokens', '-')}"
+            f" tokens={_tokens_text(usage.get('input_tokens'), lower_bound=lower_bound)}"
+            f"/{_tokens_text(usage.get('output_tokens'), lower_bound=lower_bound)}"
+            + (f" duration={duration}ms" if duration is not None else "")
             + (f" failure={run['failure_reason']}" if run["failure_reason"] else "")
         )
-        activity = (run.get("events") or {}).get("tool_activity") or []
-        if activity:
-            lines.append("    tools: " + ", ".join(sorted({a["tool"] for a in activity})))
+        lines += _run_diagnostic_lines(run)
+        summary = events.get("tool_summary") or {}
+        if summary:
+            # Recorded for failed runs too, which is why status can show what the
+            # run actually called even when it produced no final answer.
+            lines.append(_tool_summary_text(summary))
+        else:
+            # Runs recorded before tool summaries existed still carry a bounded
+            # activity list; show the tools rather than inventing counts.
+            activity = events.get("tool_activity") or []
+            if activity:
+                lines.append("    tools: " + ", ".join(sorted({a["tool"] for a in activity})))
         truncation = (run.get("events") or {}).get("truncation") or {}
         if truncation:
             lines.append(
@@ -318,6 +436,26 @@ def render_status(view: dict[str, Any]) -> str:
                 + f" finish_reason={truncation.get('finish_reason')}"
                 + f" tokens={truncation.get('output_tokens')}/{truncation.get('max_output_tokens')}"
             )
+    note = next(
+        (
+            (run.get("events") or {}).get("diagnostics", {}).get("note")
+            for run in view["runs"]
+            if (run.get("events") or {}).get("diagnostics")
+        ),
+        None,
+    )
+    if note:
+        lines += ["", f"Note: {note}"]
+    cost = next(
+        (
+            (run.get("events") or {}).get("diagnostics", {}).get("cost")
+            for run in view["runs"]
+            if (run.get("events") or {}).get("diagnostics")
+        ),
+        None,
+    )
+    if cost:
+        lines.append(f"Cost: {cost.get('status')} — {cost.get('reason')}")
     return "\n".join(lines)
 
 
