@@ -186,7 +186,7 @@ def loop_model(
     worktree: Path,
     progress: dict[str, int] | None = None,
     build_report: dict | None = None,
-    qa_reports: list[dict] | None = None,
+    qa_reports: list[dict | str] | None = None,
     review_verdicts: list[dict] | None = None,
     unreported_files: dict[str, str] | None = None,
     proposal: dict | None = None,
@@ -205,6 +205,10 @@ def loop_model(
     raises *after* writing its files, which is how a run that runs out of budget
     leaves usable work behind. Because the attempt counter lives in `progress`, the
     script survives the runtime building a new model for every run.
+
+    A QA entry may be raw response text instead of a report dict, which is how a
+    suite scripts the shapes this module's sibling pins: prose, a truncated turn,
+    or two conflicting fenced documents in one answer.
     """
 
     counts = progress if progress is not None else {"builder": 0, "qa": 0, "review": 0}
@@ -216,6 +220,11 @@ def loop_model(
         index = min(counts[name], len(sequence) - 1)
         counts[name] += 1
         return sequence[index]
+
+    def render(answer: dict | str) -> str:
+        """A scripted answer: a report dict is fenced, raw text is sent as written."""
+
+        return answer if isinstance(answer, str) else fenced(answer)
 
     def respond(messages, info):
         prompt = "\n".join(
@@ -241,7 +250,7 @@ def loop_model(
                 raise failure
             return ModelResponse(parts=[TextPart(fenced(build_report or BUILD_REPORT))])
         if "# Role: QA" in prompt:
-            return ModelResponse(parts=[TextPart(fenced(next_report(qa_sequence, "qa")))])
+            return ModelResponse(parts=[TextPart(render(next_report(qa_sequence, "qa")))])
         if "# Role: Reviewer" in prompt:
             verdict = next_report(review_sequence, "review")
             return ModelResponse(parts=[TextPart(fenced(verdict))])
@@ -1296,6 +1305,43 @@ class BuilderRecovery(LoopCase):
         self.assertEqual(view["task"]["status"], "changes_required")
         self.assertIsNone(view["deliverable"])
         self.assertEqual(engine.store.iteration(task_id)["status"], "changes_required")
+
+    def test_a_recovered_qa_answer_gets_the_same_bounded_correction(self) -> None:
+        # A recovered run reaches QA through the same method as a normal iteration,
+        # so it cannot be held to a looser standard of answer or a different number
+        # of attempts: the same one corrective run, with the same audit event.
+        engine, task_id, _ = self.failed_builder(
+            qa_reports=[{"summary": "I could not decide."}, QA_REPORT]
+        )
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        qa = [run for run in view["runs"] if run["role"] == "qa"]
+        self.assertEqual(len(qa), 2)
+        self.assertEqual(qa[0]["failure_reason"], "invalid-qa-report")
+        self.assertEqual(qa[1]["status"], "succeeded")
+        events = [entry["event"] for entry in view["audit"]]
+        self.assertEqual(events.count("iteration.qa-format-retry"), 1)
+        iteration = engine.store.iteration(task_id)
+        self.assertEqual(iteration["status"], "ready")
+        self.assertEqual(iteration["qa_report"]["verdict"], "passed")
+        self.assertEqual(iteration["qa_run_id"], qa[-1]["id"])
+
+    def test_a_recovered_qa_answer_that_stays_unreadable_fails_closed(self) -> None:
+        engine, task_id, _ = self.failed_builder(
+            qa_reports=[{"summary": "I could not decide."}]
+        )
+        digest = self.snapshot_digest(engine, task_id)
+
+        view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "invalid-qa-report")
+        self.assertEqual(len([run for run in view["runs"] if run["role"] == "qa"]), 2)
+        self.assertEqual(engine.store.iteration(task_id)["status"], "qa_failed")
+        self.assertIsNone(view["deliverable"])
 
     def test_the_reviewer_still_gates_the_recovered_work(self) -> None:
         engine, task_id, _ = self.failed_builder(

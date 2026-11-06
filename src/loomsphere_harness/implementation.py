@@ -46,6 +46,7 @@ from loomsphere_harness.reports import (
     QaReport,
     ReportError,
     ReviewVerdict,
+    declared_verdicts,
     missing_criteria,
     parse_build_report,
     parse_qa_report,
@@ -53,6 +54,8 @@ from loomsphere_harness.reports import (
     unmet_criteria,
 )
 from loomsphere_harness.schemas.architect_proposal import extract_payload
+from loomsphere_harness.architect_prompt import ComposedPrompt, with_format_correction
+from loomsphere_harness.skill_selection import SkillSelection
 from loomsphere_harness.schemas.acceptance_contract import (
     AcceptanceContract,
     AcceptanceContractError,
@@ -104,6 +107,18 @@ MAX_REVIEW_RETRIES = 1
 REASON_REVIEW_RETRY_REFUSED = "review-retry-refused"
 #: Verdicts that already carry a Reviewer decision; they are never re-asked.
 ADVERSE_VERDICTS = ("rejected", "changes-required")
+
+#: A QA report-format failure may be corrected this many times per iteration, in
+#: the same iteration and against the same recorded evidence. A corrected report
+#: that is merely adverse is a decision, not a format failure, and is never
+#: re-asked. The bound is a constant so no configuration can lengthen it.
+MAX_QA_FORMAT_ATTEMPTS = 2
+QA_FORMAT_RETRY_EVENT = "iteration.qa-format-retry"
+#: QA verdicts that already carry a decision. A QA answer whose payload declares one
+#: of these is never asked again, however malformed the rest of the report is, and
+#: however many documents the answer offers: if *any* parseable candidate declares
+#: `failed`, a second answer could only reverse the decision, not clarify it.
+ADVERSE_QA_VERDICTS = ("failed",)
 
 #: A failed Builder's preserved change set may be recovered this many times per
 #: iteration. Authorization is recorded, so the limit survives a restart.
@@ -867,47 +882,17 @@ class ImplementationStage:
                 expect=("implementation_running",),
             )
 
-        store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
-            fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": iteration["number"]},
+        # QA runs through the same bounded, audited path a normal iteration uses, so
+        # a recovered-Builder run cannot be held to a different standard of answer
+        # or a different number of attempts.
+        qa = self._run_qa(
+            task, task_id=task_id, iteration_id=iteration_id,
+            number=iteration["number"], contract=contract,
+            workspace_path=workspace.path, qa_prompt=qa_prompt,
+            selection=selection, actor=actor,
         )
-        qa_outcome = engine.invoke_role(
-            task=task, role=QA, composed=qa_prompt, selection=selection,
-            expect=("implementation_running",), running="qa_running",
-            failed="qa_failed", workspace_path=workspace.path, writable=False,
-        )
-        if not qa_outcome.succeeded:
-            return self._failed_run(
-                qa_outcome, task_id, iteration_id, running="implementation_running"
-            )
-        try:
-            qa = parse_qa_report(qa_outcome.response_text)
-        except ReportError as error:
-            self._fail_run(
-                qa_outcome, task_id, running="qa_running", failed="qa_failed",
-                reason=REASON_INVALID_QA_REPORT, detail=error.message,
-            )
-            return self._record_failure(
-                task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
-                detail=error.message, expect=None, iteration_status=ITERATION_QA_FAILED,
-            )
-        store.succeed_run(
-            run_id=qa_outcome.run_id, response_text=qa_outcome.response_text,
-            events=dict(qa_outcome.events),
-        )
-        store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="qa.recorded",
-            fields={"qa_report": dataclasses.asdict(qa), "qa_digest": qa.digest,
-                    "qa_run_id": qa_outcome.run_id},
-            detail={"verdict": qa.verdict, "findings": len(qa.findings)},
-        )
-
-        problems = self._criteria_problems(qa.acceptance_criteria, contract)
-        if qa.verdict != "passed" or qa.blocking_findings or problems:
-            return self._rework(
-                task_id, iteration_id, expect=("qa_running",), reason=REASON_QA_BLOCKED,
-                feedback=self._qa_feedback(qa, problems),
-            )
+        if isinstance(qa, dict):
+            return qa
 
         try:
             review_prompt, review_selection = self._review_prompt(
@@ -1273,6 +1258,125 @@ class ImplementationStage:
         )
 
     # -- one iteration -------------------------------------------------------
+    def _run_qa(
+        self,
+        task: dict[str, Any],
+        *,
+        task_id: str,
+        iteration_id: str,
+        number: int,
+        contract: AcceptanceContract,
+        workspace_path: Path,
+        qa_prompt: ComposedPrompt,
+        selection: SkillSelection,
+        actor: str,
+    ) -> QaReport | dict[str, Any]:
+        """Ask QA, and at most once more when the answer is unreadable.
+
+        Both ways into QA come through here — the normal iteration and the
+        human-authorised recovered-Builder run — so the attempt bound, the separate
+        run records, the audit event, and the evidence QA reads cannot drift between
+        them. A returned ``QaReport`` was recorded and passed; a returned ``dict`` is
+        the already-recorded failure the caller must hand back unchanged.
+
+        QA may be asked once more when its answer is unreadable. The evidence it
+        reads, the change set, and the contract are unchanged: only the complaint
+        about the answer's structure is added, so a second answer cannot be a second
+        opinion manufactured out of new material. An answer that already declared an
+        adverse verdict in any of the documents it offered is a decision and is never
+        re-asked.
+        """
+
+        engine = self.engine
+        self.store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
+            fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": number},
+        )
+        qa_outcome: RoleOutcome | None = None
+        qa: QaReport | None = None
+        prompt = qa_prompt
+        expect: tuple[str, ...] = ("implementation_running",)
+        for attempt in range(1, MAX_QA_FORMAT_ATTEMPTS + 1):
+            qa_outcome = engine.invoke_role(
+                task=task, role=QA, composed=prompt, selection=selection,
+                expect=expect, running="qa_running",
+                failed="qa_failed", workspace_path=workspace_path, writable=False,
+            )
+            if not qa_outcome.succeeded:
+                return self._failed_run(
+                    qa_outcome, task_id, iteration_id, running="implementation_running"
+                )
+            try:
+                qa = parse_qa_report(qa_outcome.response_text)
+            except ReportError as error:
+                self._fail_run(
+                    qa_outcome, task_id, running="qa_running", failed="qa_failed",
+                    reason=REASON_INVALID_QA_REPORT, detail=error.message,
+                )
+                detail = error.message
+                # Every document this answer offered is read, not just the first
+                # one: an answer that declares both `failed` and `passed` has made
+                # an adverse decision, and the order it wrote them in must not
+                # decide whether it earns a second look.
+                adverse = [
+                    verdict
+                    for verdict in declared_verdicts(qa_outcome.response_text, role=QA)
+                    if verdict in ADVERSE_QA_VERDICTS
+                ]
+                if adverse:
+                    # The answer states its decision in a parseable payload and gets
+                    # the body wrong. Re-asking would only invite a different
+                    # verdict, so the declaration stands and the refusal is final.
+                    detail = (
+                        f"{detail} The answer declared the verdict {adverse[0]!r}, so "
+                        "it is not asked again: a second answer could only reverse "
+                        "that decision, not clarify it."
+                    )
+                if adverse or attempt == MAX_QA_FORMAT_ATTEMPTS:
+                    return self._record_failure(
+                        task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
+                        detail=detail, expect=None, iteration_status=ITERATION_QA_FAILED,
+                    )
+                # The refused answer stays recorded on its own run; the correction
+                # is a separate run, and the audit trail says why it exists.
+                self.store.audit(
+                    task_id, actor, QA_FORMAT_RETRY_EVENT,
+                    {
+                        "iteration_id": iteration_id, "attempt": attempt,
+                        "max_attempts": MAX_QA_FORMAT_ATTEMPTS,
+                        "failed_run_id": qa_outcome.run_id, "code": error.code,
+                        "remedy": "format-correction",
+                    },
+                )
+                expect = ("qa_failed",)
+                prompt = with_format_correction(
+                    qa_prompt, role="QA", detail=error.message
+                )
+                continue
+            break
+        if qa is None or qa_outcome is None:  # pragma: no cover - the loop assigns both
+            raise EngineError(
+                REASON_INVALID_QA_REPORT, "The QA report could not be recorded."
+            )
+        self.store.succeed_run(
+            run_id=qa_outcome.run_id, response_text=qa_outcome.response_text,
+            events=dict(qa_outcome.events),
+        )
+        self.store.update_iteration(
+            iteration_id=iteration_id, actor=actor, event="qa.recorded",
+            fields={"qa_report": dataclasses.asdict(qa), "qa_digest": qa.digest,
+                    "qa_run_id": qa_outcome.run_id},
+            detail={"verdict": qa.verdict, "findings": len(qa.findings)},
+        )
+
+        problems = self._criteria_problems(qa.acceptance_criteria, contract)
+        if qa.verdict != "passed" or qa.blocking_findings or problems:
+            return self._rework(
+                task_id, iteration_id, expect=("qa_running",), reason=REASON_QA_BLOCKED,
+                feedback=self._qa_feedback(qa, problems),
+            )
+        return qa
+
     def _iterate(
         self,
         task: dict[str, Any],
@@ -1444,46 +1548,14 @@ class ImplementationStage:
                 expect=("implementation_running",),
             )
 
-        self.store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
-            fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": number},
+        # 5b. QA goes through the same bounded, audited path on every route into it.
+        qa = self._run_qa(
+            task, task_id=task_id, iteration_id=iteration_id, number=number,
+            contract=contract, workspace_path=workspace.path, qa_prompt=qa_prompt,
+            selection=selection, actor=actor,
         )
-        qa_outcome = engine.invoke_role(
-            task=task, role=QA, composed=qa_prompt, selection=selection,
-            expect=("implementation_running",), running="qa_running",
-            failed="qa_failed", workspace_path=workspace.path, writable=False,
-        )
-        if not qa_outcome.succeeded:
-            return self._failed_run(qa_outcome, task_id, iteration_id, running="implementation_running")
-
-        try:
-            qa = parse_qa_report(qa_outcome.response_text)
-        except ReportError as error:
-            self._fail_run(
-                qa_outcome, task_id, running="qa_running", failed="qa_failed",
-                reason=REASON_INVALID_QA_REPORT, detail=error.message,
-            )
-            return self._record_failure(
-                task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
-                detail=error.message, expect=None, iteration_status=ITERATION_QA_FAILED,
-            )
-        self.store.succeed_run(
-            run_id=qa_outcome.run_id, response_text=qa_outcome.response_text,
-            events=dict(qa_outcome.events),
-        )
-        self.store.update_iteration(
-            iteration_id=iteration_id, actor=actor, event="qa.recorded",
-            fields={"qa_report": dataclasses.asdict(qa), "qa_digest": qa.digest,
-                    "qa_run_id": qa_outcome.run_id},
-            detail={"verdict": qa.verdict, "findings": len(qa.findings)},
-        )
-
-        problems = self._criteria_problems(qa.acceptance_criteria, contract)
-        if qa.verdict != "passed" or qa.blocking_findings or problems:
-            return self._rework(
-                task_id, iteration_id, expect=("qa_running",), reason=REASON_QA_BLOCKED,
-                feedback=self._qa_feedback(qa, problems),
-            )
+        if isinstance(qa, dict):
+            return qa
 
         # 6. Reviewer: the last automated decision before the human gate.
         task = engine._task(task_id)
@@ -2067,8 +2139,11 @@ class ImplementationStage:
 __all__ = [
     "DELIVERABLE_SCHEMA_VERSION",
     "ImplementationStage",
+    "ADVERSE_QA_VERDICTS",
     "MAX_BUILDER_RECOVERIES",
+    "MAX_QA_FORMAT_ATTEMPTS",
     "MAX_REVIEW_RETRIES",
+    "QA_FORMAT_RETRY_EVENT",
     "RECOVERABLE_FAILURES",
     "REASON_BUILDER_INTERRUPTED",
     "REASON_RECOVERY_ELIGIBLE",

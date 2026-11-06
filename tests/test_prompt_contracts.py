@@ -20,10 +20,13 @@ from loomsphere_harness.schemas.acceptance_contract import AcceptanceVerificatio
 
 
 def report(severity: str, verdict: str = "accepted") -> str:
+    """A report that satisfies every required field, so only severity can fail."""
+
     return (
         "```json\n"
         '{"verdict": "%s", "summary": "s", "findings": '
-        '[{"severity": "%s", "description": "d"}], "acceptance_criteria": []}\n'
+        '[{"severity": "%s", "description": "d"}], "acceptance_criteria": [],'
+        ' "residual_risks": [], "follow_ups": []}\n'
         "```"
     ) % (verdict, severity)
 

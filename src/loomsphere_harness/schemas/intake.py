@@ -20,11 +20,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from loomsphere_harness.schemas.architect_proposal import ProposalValidationError, extract_payload
+from loomsphere_harness.schemas.architect_proposal import (
+    PAYLOAD_INVALID,
+    ProposalValidationError,
+    select_payload,
+)
 
 RequestType = Literal[
     "feature",
@@ -89,7 +93,16 @@ MAX_LIST_ENTRIES = 50
 
 
 class IntakeReportError(ValueError):
-    """The agent response did not contain a report matching the intake contract."""
+    """The agent response did not contain a report matching the intake contract.
+
+    ``code`` carries the failure class the runtime records, so a missing payload
+    and a payload that breaks the contract are distinguishable evidence.
+    """
+
+    def __init__(self, message: str, *, code: str = PAYLOAD_INVALID) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class _Text(BaseModel):
@@ -278,17 +291,22 @@ class IntakeAssessment(_Text):
         return self.implications.areas()
 
 
+def is_intake_payload(payload: dict[str, Any]) -> bool:
+    """Whether an object has the shape of an intake assessment rather than an example."""
+
+    intent = payload.get("intent")
+    return isinstance(intent, dict) and isinstance(intent.get("summary"), str)
+
+
 def parse_intake_assessment(text: str) -> IntakeAssessment:
     """Parse one agent response into a validated intake assessment."""
 
     try:
-        payload = extract_payload(text)
+        candidate = select_payload(text, role="Intake", matches=is_intake_payload)
     except ProposalValidationError as error:
-        raise IntakeReportError(
-            "The agent response did not contain an intake assessment JSON object."
-        ) from error
+        raise IntakeReportError(error.message, code=error.code) from error
     try:
-        return IntakeAssessment.model_validate(payload)
+        return IntakeAssessment.model_validate(candidate.payload)
     except Exception as error:  # pydantic.ValidationError
         raise IntakeReportError(
             f"The intake assessment did not match its contract: {error}"
@@ -329,5 +347,6 @@ __all__ = [
     "SpecialistRecommendation",
     "canonical_intake",
     "intake_digest",
+    "is_intake_payload",
     "parse_intake_assessment",
 ]

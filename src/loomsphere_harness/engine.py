@@ -35,6 +35,7 @@ from loomsphere_harness.architect_prompt import (
     ComposedPrompt,
     compose_architect_prompt,
     load_persona_text,
+    with_format_correction,
 )
 from loomsphere_harness.assets import (
     AssetIntegrityError,
@@ -103,6 +104,13 @@ STAGES = (INTAKE, ARCHITECT, BUILDER, QA, REVIEWER)
 IMPLEMENTATION_STAGES = (BUILDER, QA, REVIEWER)
 FAILURE_INVALID_INTAKE = "invalid-intake"
 FAILURE_INVALID_PROPOSAL = "invalid-proposal"
+
+#: The Intake and Architect stages may correct a formatting mistake once. A second
+#: refusal is final: the stage fails with the classifier for its role and the human
+#: decides what happens next. The bound is a constant, not a setting, so no
+#: configuration can turn a formatting problem into an unbounded retry loop.
+MAX_FORMAT_ATTEMPTS = 2
+FORMAT_RETRY_EVENT = "format-retry"
 
 
 @dataclass(frozen=True)
@@ -312,41 +320,58 @@ class Engine:
 
         model_config = dataclasses.replace(self.config.model, workspace_root=str(self.environment.workspace_path))
         model_name, runtime = runtime_identity(model_config)
-        invocation = AgentInvocation(
-            run_id=uuid.uuid4(),
-            workspace_path=self.environment.workspace_path,
-            prompt=composed.text,
-            timeout_seconds=self.config.timeout_seconds,
-            read_only=True,
-            allowed_tools=declared_tools(persona_path),
-            role=role,
-        )
-        run_id = self.store.begin_run(
-            task_id=task_id, role=role, expect=expect, running_status=running, actor=actor,
-            evidence={
-                "prompt_digest": composed.digest, "persona_digest": composed.persona_digest,
-                "catalog_digest": load_catalog(str(assets.catalog_root), str(assets.agents_root),
-                                               str(assets.skills_root)).digest,
-                "suite_digest": assets.suite_digest, "skill_selection": selection.evidence(),
-                "model": model_name, "runtime": runtime,
-            },
-        )
-        try:
-            self._dispatch_hooks(BEFORE_AGENT_INVOCATION, hooks, task, task_id, run_id, role,
-                                 snapshot.commit, composed.digest, selection, actor)
-            result = self._runner_factory(model_config).run(invocation)
-            self._dispatch_hooks(AFTER_AGENT_COMPLETION, hooks, task, task_id, run_id, role,
-                                 snapshot.commit, composed.digest, selection, actor)
-        except AgentExecutionError as error:
-            self.store.fail_run(run_id=run_id, task_id=task_id, failed_status=failed,
-                                running_status=running, actor=actor, reason=error.reason,
-                                detail=error.detail, response_text=error.response_text,
-                                events=error.events)
-            return
-        if role == INTAKE:
-            self._record_intake(task_id, run_id, running, failed, actor, result)
-        else:
-            self._record_proposal(task_id, run_id, running, failed, actor, result)
+        catalog_digest = load_catalog(str(assets.catalog_root), str(assets.agents_root),
+                                      str(assets.skills_root)).digest
+        recorder = self._record_intake if role == INTAKE else self._record_proposal
+        expect_status = expect
+        prompt = composed
+        for attempt in range(1, MAX_FORMAT_ATTEMPTS + 1):
+            invocation = AgentInvocation(
+                run_id=uuid.uuid4(),
+                workspace_path=self.environment.workspace_path,
+                prompt=prompt.text,
+                timeout_seconds=self.config.timeout_seconds,
+                read_only=True,
+                allowed_tools=declared_tools(persona_path),
+                role=role,
+            )
+            run_id = self.store.begin_run(
+                task_id=task_id, role=role, expect=expect_status, running_status=running,
+                actor=actor,
+                evidence={
+                    "prompt_digest": prompt.digest, "persona_digest": prompt.persona_digest,
+                    "catalog_digest": catalog_digest,
+                    "suite_digest": assets.suite_digest, "skill_selection": selection.evidence(),
+                    "model": model_name, "runtime": runtime,
+                },
+            )
+            try:
+                self._dispatch_hooks(BEFORE_AGENT_INVOCATION, hooks, task, task_id, run_id, role,
+                                     snapshot.commit, prompt.digest, selection, actor)
+                result = self._runner_factory(model_config).run(invocation)
+                self._dispatch_hooks(AFTER_AGENT_COMPLETION, hooks, task, task_id, run_id, role,
+                                     snapshot.commit, prompt.digest, selection, actor)
+            except AgentExecutionError as error:
+                self.store.fail_run(run_id=run_id, task_id=task_id, failed_status=failed,
+                                    running_status=running, actor=actor, reason=error.reason,
+                                    detail=error.detail, response_text=error.response_text,
+                                    events=error.events)
+                return
+            refusal = recorder(task_id, run_id, running, failed, actor, result)
+            if refusal is None:
+                return
+            if attempt == MAX_FORMAT_ATTEMPTS:
+                return
+            # The refused attempt stays recorded exactly as it happened; the one
+            # corrective attempt is a separate run, announced in the audit trail.
+            self.store.audit(task_id, actor, f"{role}.{FORMAT_RETRY_EVENT}", {
+                "role": role, "attempt": attempt, "max_attempts": MAX_FORMAT_ATTEMPTS,
+                "failed_run_id": run_id, "code": refusal.code,
+                "failure_detail": refusal.message[:500], "remedy": "format-correction",
+            })
+            expect_status = (failed,)
+            prompt = with_format_correction(composed, role=role.capitalize(),
+                                            detail=refusal.message)
 
     def _dispatch_hooks(self, event, hooks, task, task_id, run_id, role, commit, prompt_digest,
                         selection, actor) -> None:
@@ -469,7 +494,10 @@ class Engine:
             return RoleOutcome(run_id=run_id, error=error)
         return RoleOutcome(run_id=run_id, result=result)
 
-    def _record_intake(self, task_id, run_id, running, failed, actor, result) -> None:
+    def _record_intake(self, task_id, run_id, running, failed, actor, result
+                       ) -> IntakeReportError | None:
+        """Record the Intake assessment, or the refusal that stopped it."""
+
         try:
             assessment = parse_intake_assessment(result.response_text)
         except IntakeReportError as error:
@@ -477,15 +505,19 @@ class Engine:
                                 running_status=running, actor=actor, reason=FAILURE_INVALID_INTAKE,
                                 detail=str(error)[:2000], response_text=result.response_text,
                                 events=result.events)
-            return
+            return error
         self.store.succeed_intake(
             run_id=run_id, task_id=task_id, response_text=result.response_text,
             events=result.events, digest=intake_digest(assessment),
             document=canonical_intake(assessment),
             needs_clarification=assessment.needs_clarification, actor=actor,
         )
+        return None
 
-    def _record_proposal(self, task_id, run_id, running, failed, actor, result) -> None:
+    def _record_proposal(self, task_id, run_id, running, failed, actor, result
+                         ) -> ProposalValidationError | None:
+        """Record the Architect proposal, or the refusal that stopped it."""
+
         try:
             proposal = parse_architect_proposal(result.response_text)
         except ProposalValidationError as error:
@@ -493,12 +525,13 @@ class Engine:
                                 running_status=running, actor=actor, reason=FAILURE_INVALID_PROPOSAL,
                                 detail=str(error)[:2000], response_text=result.response_text,
                                 events=result.events)
-            return
+            return error
         self.store.succeed_architect(
             run_id=run_id, task_id=task_id, response_text=result.response_text,
             events=result.events, digest=proposal_digest(proposal),
             document=canonical_proposal(proposal), actor=actor,
         )
+        return None
 
     def _compose(self, task: dict[str, Any], role: str, assets: TrustedAssets
                  ) -> tuple[ComposedPrompt, SkillSelection]:
