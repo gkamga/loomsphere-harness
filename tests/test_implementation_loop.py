@@ -186,7 +186,7 @@ def loop_model(
     worktree: Path,
     progress: dict[str, int] | None = None,
     build_report: dict | None = None,
-    qa_reports: list[dict] | None = None,
+    qa_reports: list[dict | str] | None = None,
     review_verdicts: list[dict] | None = None,
     unreported_files: dict[str, str] | None = None,
     proposal: dict | None = None,
@@ -205,6 +205,10 @@ def loop_model(
     raises *after* writing its files, which is how a run that runs out of budget
     leaves usable work behind. Because the attempt counter lives in `progress`, the
     script survives the runtime building a new model for every run.
+
+    A QA entry may be raw response text instead of a report dict, which is how a
+    suite scripts the shapes this module's sibling pins: prose, a truncated turn,
+    or two conflicting fenced documents in one answer.
     """
 
     counts = progress if progress is not None else {"builder": 0, "qa": 0, "review": 0}
@@ -216,6 +220,11 @@ def loop_model(
         index = min(counts[name], len(sequence) - 1)
         counts[name] += 1
         return sequence[index]
+
+    def render(answer: dict | str) -> str:
+        """A scripted answer: a report dict is fenced, raw text is sent as written."""
+
+        return answer if isinstance(answer, str) else fenced(answer)
 
     def respond(messages, info):
         prompt = "\n".join(
@@ -241,7 +250,7 @@ def loop_model(
                 raise failure
             return ModelResponse(parts=[TextPart(fenced(build_report or BUILD_REPORT))])
         if "# Role: QA" in prompt:
-            return ModelResponse(parts=[TextPart(fenced(next_report(qa_sequence, "qa")))])
+            return ModelResponse(parts=[TextPart(render(next_report(qa_sequence, "qa")))])
         if "# Role: Reviewer" in prompt:
             verdict = next_report(review_sequence, "review")
             return ModelResponse(parts=[TextPart(fenced(verdict))])

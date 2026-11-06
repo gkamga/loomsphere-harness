@@ -46,7 +46,7 @@ from loomsphere_harness.reports import (
     QaReport,
     ReportError,
     ReviewVerdict,
-    declared_verdict,
+    declared_verdicts,
     missing_criteria,
     parse_build_report,
     parse_qa_report,
@@ -115,8 +115,9 @@ ADVERSE_VERDICTS = ("rejected", "changes-required")
 MAX_QA_FORMAT_ATTEMPTS = 2
 QA_FORMAT_RETRY_EVENT = "iteration.qa-format-retry"
 #: QA verdicts that already carry a decision. A QA answer whose payload declares one
-#: of these is never asked again, however malformed the rest of the report is: a
-#: second answer could only reverse the decision, not clarify it.
+#: of these is never asked again, however malformed the rest of the report is, and
+#: however many documents the answer offers: if *any* parseable candidate declares
+#: `failed`, a second answer could only reverse the decision, not clarify it.
 ADVERSE_QA_VERDICTS = ("failed",)
 
 #: A failed Builder's preserved change set may be recovered this many times per
@@ -1282,7 +1283,8 @@ class ImplementationStage:
         reads, the change set, and the contract are unchanged: only the complaint
         about the answer's structure is added, so a second answer cannot be a second
         opinion manufactured out of new material. An answer that already declared an
-        adverse verdict is a decision and is never re-asked.
+        adverse verdict in any of the documents it offered is a decision and is never
+        re-asked.
         """
 
         engine = self.engine
@@ -1312,17 +1314,25 @@ class ImplementationStage:
                     reason=REASON_INVALID_QA_REPORT, detail=error.message,
                 )
                 detail = error.message
-                declared = declared_verdict(qa_outcome.response_text, role=QA)
-                if declared in ADVERSE_QA_VERDICTS:
+                # Every document this answer offered is read, not just the first
+                # one: an answer that declares both `failed` and `passed` has made
+                # an adverse decision, and the order it wrote them in must not
+                # decide whether it earns a second look.
+                adverse = [
+                    verdict
+                    for verdict in declared_verdicts(qa_outcome.response_text, role=QA)
+                    if verdict in ADVERSE_QA_VERDICTS
+                ]
+                if adverse:
                     # The answer states its decision in a parseable payload and gets
                     # the body wrong. Re-asking would only invite a different
                     # verdict, so the declaration stands and the refusal is final.
                     detail = (
-                        f"{detail} The answer declared the verdict {declared!r}, so it "
-                        "is not asked again: a second answer could only reverse that "
-                        "decision, not clarify it."
+                        f"{detail} The answer declared the verdict {adverse[0]!r}, so "
+                        "it is not asked again: a second answer could only reverse "
+                        "that decision, not clarify it."
                     )
-                if declared in ADVERSE_QA_VERDICTS or attempt == MAX_QA_FORMAT_ATTEMPTS:
+                if adverse or attempt == MAX_QA_FORMAT_ATTEMPTS:
                     return self._record_failure(
                         task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
                         detail=detail, expect=None, iteration_status=ITERATION_QA_FAILED,

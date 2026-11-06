@@ -42,7 +42,7 @@ from loomsphere_harness.architect_prompt import (  # noqa: E402
 from loomsphere_harness.reports import (  # noqa: E402
     REQUIRED_ARRAYS,
     ReportError,
-    declared_verdict,
+    declared_verdicts,
     parse_build_report,
     parse_qa_report,
     parse_review_verdict,
@@ -178,15 +178,15 @@ class DeclaredVerdict(unittest.TestCase):
 
     def test_a_declared_verdict_is_read_whatever_its_case(self) -> None:
         self.assertEqual(
-            declared_verdict(fenced({**QA_REPORT, "verdict": "FAILED"}), role="qa"),
-            "failed",
+            declared_verdicts(fenced({**QA_REPORT, "verdict": "FAILED"}), role="qa"),
+            ("failed",),
         )
         self.assertEqual(
-            declared_verdict(fenced(REVIEW_VERDICT), role="Reviewer"), "accepted"
+            declared_verdicts(fenced(REVIEW_VERDICT), role="Reviewer"), ("accepted",)
         )
         self.assertEqual(
-            declared_verdict(fenced({**QA_REPORT, "verdict": "passed"}), role="QA"),
-            "passed",
+            declared_verdicts(fenced({**QA_REPORT, "verdict": "passed"}), role="QA"),
+            ("passed",),
         )
 
     def test_a_broken_payload_still_declares_its_verdict(self) -> None:
@@ -196,14 +196,34 @@ class DeclaredVerdict(unittest.TestCase):
                          "findings": [{"severity": "info", "description": "x"}]})
         with self.assertRaises(ReportError):
             parse_qa_report(broken)
-        self.assertEqual(declared_verdict(broken, role="qa"), "failed")
+        self.assertEqual(declared_verdicts(broken, role="qa"), ("failed",))
 
     def test_prose_is_never_read_as_a_verdict(self) -> None:
         prose = "I would have failed this change. The verdict is failed."
-        self.assertIsNone(declared_verdict(prose, role="qa"))
-        self.assertIsNone(declared_verdict(fenced({**QA_REPORT, "verdict": "lgtm"}),
-                                          role="qa"))
-        self.assertIsNone(declared_verdict(fenced({**QA_REPORT, "verdict": 1}), role="qa"))
+        self.assertEqual(declared_verdicts(prose, role="qa"), ())
+        self.assertEqual(
+            declared_verdicts(fenced({**QA_REPORT, "verdict": "lgtm"}), role="qa"), ()
+        )
+        self.assertEqual(
+            declared_verdicts(fenced({**QA_REPORT, "verdict": 1}), role="qa"), ()
+        )
+
+    def test_every_document_an_answer_offers_is_read(self) -> None:
+        # Ordering must not decide whether an adverse decision is seen: a caller
+        # asking "did any of these documents say failed?" gets the same answer
+        # whichever way round the model wrote them.
+        failed_first = (
+            f"{fenced({**QA_REPORT, 'verdict': 'failed'})}\n\n"
+            f"{fenced({**QA_REPORT, 'verdict': 'passed'})}"
+        )
+        passed_first = (
+            f"{fenced({**QA_REPORT, 'verdict': 'passed'})}\n\n"
+            f"{fenced({**QA_REPORT, 'verdict': 'failed'})}"
+        )
+        self.assertEqual(declared_verdicts(failed_first, role="qa"),
+                         ("passed", "failed"))
+        self.assertEqual(declared_verdicts(passed_first, role="qa"),
+                         ("failed", "passed"))
 
 
 class ReportClassification(unittest.TestCase):
@@ -482,6 +502,49 @@ class QaCorrection(LoopCase):
         self.assertIsNone(view["iterations"][0].get("qa_report"))
         events = [entry["event"] for entry in view["audit"]]
         self.assertNotIn("iteration.qa-format-retry", events)
+
+    # -- two conflicting documents in one answer ------------------------------
+    def conflicting(self, first: str, second: str) -> str:
+        """One answer that offers two complete QA reports that disagree."""
+
+        return (
+            f"{fenced_qa(verdict=first)}\n\nOn a second reading:\n\n"
+            f"{fenced_qa(verdict=second)}"
+        )
+
+    def assert_ambiguous_and_final(self, view) -> None:
+        """An ambiguous answer is refused, and a `failed` in it is never re-asked."""
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "invalid-qa-report")
+        detail = view["implementation"]["detail"]
+        self.assertIn("different documents", detail)
+        self.assertIn("declared the verdict 'failed'", detail)
+        self.assertEqual([run["role"] for run in view["runs"]],
+                         ["intake", "architect", "builder", "qa"])
+        self.assertEqual(len(self.qa_runs(view)), 1)
+        self.assertEqual(self.qa_runs(view)[0]["failure_reason"], "invalid-qa-report")
+        self.assertEqual(view["task"]["status"], "qa_failed")
+        self.assertEqual(view["iterations"][0]["status"], "qa_failed")
+        self.assertIsNone(view["iterations"][0].get("qa_report"))
+        events = [entry["event"] for entry in view["audit"]]
+        self.assertNotIn("iteration.qa-format-retry", events)
+
+    def test_a_passed_report_never_masks_a_failed_one_offered_before_it(self) -> None:
+        # `passed` is the last block, so it ranks first. The answer still declared
+        # `failed`, and that decision is not up for a second opinion.
+        engine, task_id, _ = self.approved_task(
+            qa_reports=[self.conflicting("failed", "passed"), QA_REPORT]
+        )
+
+        self.assert_ambiguous_and_final(engine.implement(task_id))
+
+    def test_a_passed_report_never_masks_a_failed_one_offered_after_it(self) -> None:
+        engine, task_id, _ = self.approved_task(
+            qa_reports=[self.conflicting("passed", "failed"), QA_REPORT]
+        )
+
+        self.assert_ambiguous_and_final(engine.implement(task_id))
 
 
 class BuilderIsNeverRerun(LoopCase):

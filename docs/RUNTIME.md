@@ -395,9 +395,11 @@ When such a verdict is declared inside a report that breaks the schema, the answ
 refused as `invalid-qa-report` or `invalid-review-report` and is *not* re-asked: a
 second answer could only reverse the decision, not clarify it. The verdict is read
 from the declared JSON payload and never scanned out of the surrounding prose, so a
-sentence like "this would have failed" is not treated as a verdict. Only the
-Reviewer has an explicit retry, and it is the human-approved `retry-review`
-command, not an automatic one.
+sentence like "this would have failed" is not treated as a verdict. *Every* parseable
+document an answer offers is read, so an answer that offers both a `failed` and a
+`passed` report has declared an adverse verdict whichever order it wrote them in, and
+it is refused as ambiguous rather than asked again. Only the Reviewer has an explicit
+retry, and it is the human-approved `retry-review` command, not an automatic one.
 
 ## The implementation loop
 

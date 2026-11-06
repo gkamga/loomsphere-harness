@@ -374,8 +374,8 @@ def report_role_name(role: str) -> str:
     return REPORT_ROLE_NAMES.get(role.lower(), role)
 
 
-def declared_verdict(text: str, *, role: str) -> str | None:
-    """The verdict an answer explicitly declares in a JSON object it offers.
+def declared_verdicts(text: str, *, role: str) -> tuple[str, ...]:
+    """Every verdict an answer explicitly declares, in the order it offers them.
 
     Only parseable objects are inspected; the prose around them is never scanned
     for words like "failed", so a summary sentence cannot be mistaken for the
@@ -383,17 +383,27 @@ def declared_verdict(text: str, *, role: str) -> str | None:
     reached an adverse decision, which is exactly the case where a second attempt
     could only reverse it rather than clarify it.
 
-    It reads the payload, not a validated report: an answer whose verdict is
-    declared but whose body breaks the schema still made a decision, and that
-    decision is what the caller must not talk it out of.
+    *Every* candidate is read, not just the most trustworthy one. An answer that
+    offers two reports — one declaring ``failed``, one declaring ``passed`` — has
+    declared an adverse verdict, and the order it happened to write them in must not
+    decide whether it is asked again. The caller is given the whole set so it can
+    answer "did any of this answer's documents reach an adverse decision?" rather
+    than "what did the first one say?".
+
+    It reads payloads, not a validated report: an answer whose verdict is declared
+    but whose body breaks the schema still made a decision, and that decision is
+    what the caller must not talk it out of.
     """
 
     known = VERDICTS_BY_ROLE[report_role_name(role)]
+    found: list[str] = []
     for candidate in payload_objects(text):
         verdict = candidate.payload.get("verdict")
-        if isinstance(verdict, str) and verdict.strip().lower() in known:
-            return verdict.strip().lower()
-    return None
+        if isinstance(verdict, str):
+            normalized = verdict.strip().lower()
+            if normalized in known and normalized not in found:
+                found.append(normalized)
+    return tuple(found)
 
 
 # -- parsers -------------------------------------------------------------------
@@ -482,7 +492,7 @@ __all__ = [
     "BuildReport",
     "REPORT_ROLE_NAMES",
     "VERDICTS_BY_ROLE",
-    "declared_verdict",
+    "declared_verdicts",
     "missing_criteria",
     "parse_build_report",
     "parse_qa_report",
