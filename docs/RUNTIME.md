@@ -151,12 +151,24 @@ human makes:
   `loomsphere/task-<key>` with a fixup message saying the work is unfinished, and
   records the commit, the workspace digest, and a diff excerpt on the iteration. If
   the screen refuses a path, nothing is committed and the work is left exactly as it
-  is; it is never deleted.
+  is; it is never deleted. Discovery, screening, staging, and the post-commit check
+  all operate on one set of paths: that set includes Git-ignored, untracked files
+  (they can hold credentials), and the commit is rejected unless the staged and
+  committed file lists are exactly the screened list.
+- A process that dies mid-Builder leaves no failure record. The next command marks
+  the run `interrupted`, closes the open iteration as failed, and leaves the
+  uncommitted work where it is. `inspect-recovery` then shows the preserved inventory,
+  and `recover-builder` screens and commits it at authorization time under the same
+  exact-set rule before validating it. A stage that is genuinely running is never
+  treated this way: a recovery holds an exclusive lease on the task for its whole
+  duration, so a second process running `status` or `inspect-recovery` cannot close a
+  live recovery.
 - `inspect-recovery <task>` is read-only. It reports the failed Builder run, the
   preserved commit, the file inventory with a per-file mode and SHA-256, the snapshot
   digest, how many recoveries are left, every obstacle that would block a recovery,
   and the exact command to run next. It creates no run, writes no audit event, and
-  does not touch the worktree.
+  does not touch the worktree. (`status` is the repairing command: it marks
+  interrupted stages on the way to reporting state.)
 - `recover-builder <task> --snapshot-digest <sha256>` requires that digest, which
   binds the authorization to the exact bytes the human inspected. A changed worktree,
   a different HEAD, a missing worktree, a task that is not `implementation_failed`, or
@@ -196,7 +208,9 @@ human makes:
   run). Clarification answers are not part of this milestone: resubmit a clarified
   requirement.
 - **Restart**: all state is SQLite. A run left `running` by a crash is marked
-  `interrupted` on the next command and the stage can be re-run with `run`.
+  `interrupted` on the next command and the stage can be re-run with `run`; a Builder
+  stage is additionally left recoverable, with its uncommitted work preserved for
+  `recover-builder`.
 - **Isolated worktree**: the Builder never runs in the developer's checkout. Each
   task gets `task-<key>` at `workspace_root/task-<key>` on branch
   `loomsphere/task-<key>`, created from the approved `HEAD`. The workspace root must

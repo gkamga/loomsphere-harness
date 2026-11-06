@@ -113,8 +113,13 @@ REASON_RECOVERY_ELIGIBLE = "recovery-eligible"
 #: this reason so the task is never left open.
 REASON_RECOVERY_INCOMPLETE = "recovery-incomplete"
 #: A Builder run that stopped without writing a report leaves an interrupted run
-#: rather than a failed one; the worktree is treated exactly the same way.
+#: rather than a failed one; the worktree is treated exactly the same way. Two
+#: spellings exist because the run is marked by the store when a process dies:
+#: ``store.recover_interrupted`` writes plain ``interrupted``, while the loop writes
+#: the role-qualified reason. Both mean the same thing to recovery, so both are
+#: accepted rather than one silently making a crashed Builder unrecoverable.
 REASON_BUILDER_INTERRUPTED = "builder-interrupted"
+REASON_RUN_INTERRUPTED = "interrupted"
 
 #: Failure reasons that describe a run which stopped *after* it may have written
 #: files: resource and time limits, provider faults, harness faults, an empty
@@ -128,6 +133,7 @@ RECOVERABLE_FAILURES = (
     "harness-error",
     "empty-response",
     REASON_BUILDER_INTERRUPTED,
+    REASON_RUN_INTERRUPTED,
 )
 #: Run statuses that mean the Builder did not finish its turn.
 RECOVERABLE_RUN_STATUSES = ("failed", "interrupted")
@@ -367,9 +373,17 @@ class ImplementationStage:
         """Report what a failed Builder left behind, without changing anything.
 
         Read-only by construction. It resolves an existing worktree, reads the
-        committed change set, and recomputes the snapshot digest. It never creates
-        a workspace, stages a file, commits, resets, cleans, or deletes anything,
-        so a `recover-builder` refusal can never have damaged the work it refused.
+        change set, screens it, and recomputes the snapshot digest. It never
+        creates a workspace, stages a file, commits, resets, cleans, or deletes
+        anything, so a `recover-builder` refusal can never have damaged the work
+        it refused.
+
+        Two shapes of preserved work are reported. A Builder that failed while the
+        process was alive had its work committed at the moment of failure, so the
+        change set is read from that commit. A process that died took the failure
+        path with it and left the files uncommitted; those are read and screened
+        here the same way, and the snapshot says the commit has not been written
+        yet, because writing it is what `recover-builder` does.
         """
 
         engine = self.engine
@@ -425,40 +439,66 @@ class ImplementationStage:
         snapshot: dict[str, Any] | None = None
         changeset: ChangeSet | None = None
         snapshot_error: str | None = None
-        if iteration is not None and iteration.get("commit_sha"):
+        preserved = False
+        has_commit = iteration is not None and bool(iteration.get("commit_sha"))
+        # A failed Builder either committed its work when the failure was recorded,
+        # or the process died before it could. The second case is still inspectable:
+        # the files are there and screening them is read-only.
+        uncommitted = (
+            iteration is not None
+            and not has_commit
+            and builder_run is not None
+            and builder_run.get("failure_reason") in RECOVERABLE_FAILURES
+        )
+        if iteration is not None and (has_commit or uncommitted):
             path = workspace_path_for(engine.workspace_root, task_id)
             if is_worktree(path):
-                view["workspace"] = {
-                    "path": str(path),
-                    "branch": iteration.get("branch"),
-                    "recorded_path": iteration.get("workspace_path"),
-                }
                 try:
-                    resume_task_workspace(engine.workspace_root, task_id)
-                    changeset = inspect_change_set(
-                        path,
-                        base_commit=iteration["base_commit"],
-                        reviewed_commit=str(iteration.get("commit_sha")),
-                    )
+                    resumed = resume_task_workspace(engine.workspace_root, task_id)
+                    view["workspace"] = {
+                        "path": str(path),
+                        "branch": resumed.branch,
+                        "recorded_branch": iteration.get("branch"),
+                        "recorded_path": iteration.get("workspace_path"),
+                    }
+                    if has_commit:
+                        changeset = inspect_change_set(
+                            path,
+                            base_commit=iteration["base_commit"],
+                            reviewed_commit=str(iteration.get("commit_sha")),
+                        )
                     digest, entries = recoverable_inventory(path, iteration["base_commit"])
+                    if not has_commit:
+                        screen_change_set(
+                            path, [entry["path"] for entry in entries]
+                        )
+                        preserved = True
                 except WorkspaceError as error:
                     snapshot_error = f"{error.code}: {error.message}"
+                    preserved = False
                 else:
-                    snapshot = {"digest": digest, "files": entries}
-                    view["change_set"] = {
-                        "base_commit": changeset.base_commit,
-                        "head_commit": changeset.head_commit,
-                        "workspace_digest": changeset.workspace_digest,
-                        "changed_files": changeset.changed_files,
-                        # The failed Builder never produced a report, so there is
-                        # no claimed file list to compare against the change set.
-                        "reported_files": None,
+                    snapshot = {
+                        "digest": digest,
+                        "files": entries,
+                        "committed": has_commit,
                     }
+                    if changeset is not None:
+                        view["change_set"] = {
+                            "base_commit": changeset.base_commit,
+                            "head_commit": changeset.head_commit,
+                            "workspace_digest": changeset.workspace_digest,
+                            "changed_files": changeset.changed_files,
+                            # The failed Builder never produced a report, so there is
+                            # no claimed file list to compare against the change set.
+                            "reported_files": None,
+                        }
 
         if snapshot is None:
             # No digest can be shown, so report why from the same list
             # `recover-builder` enforces rather than inventing a reason here.
-            obstacles = self._recovery_obstacles(task, iteration, builder_run, None)
+            obstacles = self._recovery_obstacles(
+                task, iteration, builder_run, None, preserved=preserved
+            )
             if snapshot_error is not None:
                 obstacles.append(snapshot_error)
             elif not obstacles:
@@ -469,7 +509,9 @@ class ImplementationStage:
             return view
 
         view["snapshot"] = snapshot
-        view["obstacles"] = self._recovery_obstacles(task, iteration, builder_run, changeset)
+        view["obstacles"] = self._recovery_obstacles(
+            task, iteration, builder_run, changeset, preserved=preserved
+        )
         view["eligible"] = not view["obstacles"]
         if view["eligible"]:
             view["next"] = (
@@ -486,11 +528,24 @@ class ImplementationStage:
         exactly as it stands, and then validated, QA-checked, and reviewed by the
         same stages a normal iteration uses. The original failed run, its failure
         reason, and the iteration's own failure record are never rewritten.
+
+        The whole recovery is taken under an exclusive lease on the task, so a
+        second process running a repair pass cannot mistake this live recovery
+        for an interrupted stage and close it underneath.
         """
 
         engine = self.engine
         store = self.store
         task = engine._task(task_id)
+        with store.recovery_lease(task_id):
+            return self._recover_builder_under_lease(task, snapshot_digest=snapshot_digest)
+
+    def _recover_builder_under_lease(
+        self, task: dict[str, Any], *, snapshot_digest: str
+    ) -> dict[str, Any]:
+        task_id = task["id"]
+        engine = self.engine
+        store = self.store
         iteration = store.iteration(task_id)
         runs = store.runs(task_id)
         builder_run = self._failed_builder_run(runs)
@@ -504,11 +559,25 @@ class ImplementationStage:
                 "`inspect-recovery`."
             )
 
+        # A process that died took the freeze with it, so the work is still loose
+        # in the worktree and no commit records it. Preserving it now, under the
+        # same screen, is the only way an interrupted Builder can be recovered.
+        # Everything that disqualifies the task is checked first, so a refused
+        # recovery still leaves the worktree byte-for-byte as it found it.
+        if not iteration.get("commit_sha"):
+            blocked = self._recovery_obstacles(
+                task, iteration, builder_run, None, preserved=True
+            )
+            if blocked:
+                self._refuse_recovery(" ".join(blocked))
+            iteration = self._preserve_interrupted_work(task, iteration, builder_run)
+
         obstacles = self._recovery_obstacles(task, iteration, builder_run, None)
         if obstacles:
             self._refuse_recovery(" ".join(obstacles))
 
-        # The approval must still bind the exact proposal the contract comes from.
+        # The approval must still bind the exact proposal the contract comes from,
+        # and the same repository commit the loop is building on.
         proposal = store.proposal(task_id)
         approval = store.approval(task_id)
         if (
@@ -521,9 +590,17 @@ class ImplementationStage:
             or _document_digest(proposal["document"]) != proposal["digest"]
         ):
             self._refuse_recovery("The original approval no longer matches the proposal.")
+        if approval.get("repo_commit") not in (None, task["repo_commit"]) or (
+            iteration["base_commit"] != task["repo_commit"]
+        ):
+            self._refuse_recovery(
+                "The approved repository commit does not match the iteration base, so "
+                "the preserved work would be recovered on top of the wrong commit."
+            )
         contract, criteria_lines = self._contract(task_id)
 
-        # The worktree must still hold exactly the commit the failure recorded.
+        # The worktree must still hold exactly the commit the failure recorded, on
+        # the branch the record names.
         path = workspace_path_for(engine.workspace_root, task_id)
         recorded = iteration.get("workspace_path")
         if not is_worktree(path) or not recorded or Path(recorded).resolve() != path.resolve():
@@ -531,6 +608,12 @@ class ImplementationStage:
         try:
             workspace = resume_task_workspace(engine.workspace_root, task_id)
             commit = str(iteration.get("commit_sha") or "")
+            if workspace.branch != iteration.get("branch"):
+                self._refuse_recovery(
+                    f"The worktree has branch {workspace.branch!r} checked out, not the "
+                    f"recorded {iteration.get('branch')!r}; the recovered work would be "
+                    "committed somewhere the record does not describe."
+                )
             if workspace.commit != commit:
                 self._refuse_recovery(
                     "The worktree head has moved since the change set was committed; "
@@ -601,6 +684,76 @@ class ImplementationStage:
             # closed here rather than left open.
             self._close_open_recovery(task_id, iteration["id"])
             raise
+
+    def _preserve_interrupted_work(
+        self,
+        task: dict[str, Any],
+        iteration: dict[str, Any],
+        builder_run: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit the work an interrupted Builder left uncommitted, under the screen.
+
+        The failure path only freezes work while a process is alive to run it. A
+        crash stops before that, so the files are still loose in the worktree and
+        the iteration records no commit — which would otherwise make the
+        interrupted case inspectable but never recoverable.
+
+        Discovery, screening, staging, and the commit cover the same exact set, the
+        same way the live failure path does. Nothing is deleted, and the failure
+        record is not rewritten: only the preserved change set is written, so the
+        preserved content is identical to what an inspection of the same worktree
+        reported before this ran.
+        """
+
+        engine = self.engine
+        store = self.store
+        task_id = task["id"]
+        path = workspace_path_for(engine.workspace_root, task_id)
+        recorded = iteration.get("workspace_path")
+        if not is_worktree(path) or not recorded or Path(recorded).resolve() != path.resolve():
+            self._refuse_recovery(
+                "The task worktree is missing, so none of the interrupted work survived."
+            )
+        base_commit = iteration["base_commit"]
+        try:
+            names = changed_paths(path, base_commit)
+            if not names:
+                self._refuse_recovery(
+                    "The interrupted run left no change set to preserve, so there is "
+                    "nothing to authorize."
+                )
+            screen_change_set(path, names)
+            commit = commit_worktree(
+                path,
+                COMMIT_MESSAGE.format(task=task_id, number=iteration["number"])
+                + " [unfinished Builder work preserved after interruption]",
+                expected=names,
+            )
+            changeset = inspect_change_set(
+                path, base_commit=base_commit, reviewed_commit=commit
+            )
+        except WorkspaceError as error:
+            self._refuse_recovery(
+                "The work the interrupted run left behind could not be preserved "
+                f"({error.code}: {error.message})"
+            )
+
+        store.update_iteration(
+            iteration_id=iteration["id"], actor=engine.identity.current().id,
+            event="recovery.preserved",
+            fields={
+                "commit_sha": changeset.head_commit,
+                "workspace_digest": changeset.workspace_digest,
+                "diff_excerpt": diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
+            },
+            detail={
+                "commit": changeset.head_commit,
+                "files": len(changeset.changed_files),
+                "builder_run_id": builder_run["id"],
+                "failure_reason": builder_run.get("failure_reason"),
+            },
+        )
+        return store.iteration(task_id)
 
     def _close_open_recovery(self, task_id: str, iteration_id: str) -> None:
         """Close a claimed recovery that did not reach a decision of its own."""
@@ -771,11 +924,17 @@ class ImplementationStage:
         iteration: dict[str, Any] | None,
         builder_run: dict[str, Any] | None,
         changeset: ChangeSet | None,
+        *,
+        preserved: bool = False,
     ) -> list[str]:
         """Every reason the preserved work cannot be recovered, in one place.
 
         `inspect-recovery` reports these and `recover-builder` refuses on the same
         list, so what a human is shown and what the gate enforces cannot drift.
+
+        ``preserved`` says the work set aside by an interrupted run has been read
+        and screened but is not committed yet, which is the state a crash leaves
+        behind: the commit is written by the preservation step, not by the failure.
         """
 
         store = self.store
@@ -793,7 +952,7 @@ class ImplementationStage:
                     f"Iteration {iteration['number']} is {iteration['status']}; "
                     "only a failed iteration can be recovered."
                 )
-            if not iteration.get("commit_sha"):
+            if not iteration.get("commit_sha") and not preserved:
                 obstacles.append(
                     "The failed run never committed a change set, so there is nothing "
                     "to authorize."
@@ -1140,9 +1299,16 @@ class ImplementationStage:
 
         # 3. Record the change set: one commit, then the gate that proves the
         #    worktree is clean, at the reviewed commit, and free of credentials.
+        #    Discovery, screening, staging, and the commit describe the same set:
+        #    staging runs with ``--force``, so anything discovery left out (an
+        #    ignored file, say) would be committed without ever being screened.
         try:
+            expected = changed_paths(workspace.path, iteration["base_commit"])
+            screen_change_set(workspace.path, expected)
             commit = commit_worktree(
-                workspace.path, COMMIT_MESSAGE.format(task=task_id, number=number)
+                workspace.path,
+                COMMIT_MESSAGE.format(task=task_id, number=number),
+                expected=expected,
             )
             changeset = inspect_change_set(
                 workspace.path,
@@ -1733,6 +1899,10 @@ class ImplementationStage:
         the work further. A change set that looks like a credential is left on disk
         untouched and is deliberately not committed, so it cannot be recovered.
         A freeze that fails changes nothing about the recorded failure.
+
+        Discovery, screening, and the commit cover the same exact set: the commit
+        is told which paths were screened and refuses anything else, including the
+        ignored files that ``git add --force`` would otherwise sweep in.
         """
 
         path = workspace.path
@@ -1746,6 +1916,7 @@ class ImplementationStage:
                 path,
                 COMMIT_MESSAGE.format(task=task_id, number=iteration["number"])
                 + " [unfinished Builder work preserved after failure]",
+                expected=names,
             )
             changeset = inspect_change_set(path, base_commit=base_commit, reviewed_commit=commit)
         except WorkspaceError:

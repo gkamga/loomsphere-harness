@@ -77,7 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     retry_review.add_argument("task")
     inspect_recovery = sub.add_parser(
         "inspect-recovery",
-        help="show what a failed Builder preserved, without changing anything")
+        help="show what a failed Builder preserved, without changing anything "
+             "(read-only: unlike `status` it does not repair interrupted stages)")
     inspect_recovery.add_argument("task")
     recover_builder = sub.add_parser(
         "recover-builder",
@@ -100,7 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     reject_delivery.add_argument("task")
     reject_delivery.add_argument("--digest", required=True)
     reject_delivery.add_argument("--reason", required=True)
-    status = sub.add_parser("status", help="task state and execution evidence")
+    status = sub.add_parser(
+        "status",
+        help="task state and execution evidence; also repairs stages whose process died "
+             "(a live recovery is left alone)")
     status.add_argument("task", nargs="?")
     audit = sub.add_parser("audit", help="audit trail (verifies the hash chain)")
     audit.add_argument("task", nargs="?")

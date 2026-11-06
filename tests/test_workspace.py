@@ -23,6 +23,7 @@ from loomsphere_harness.workspace import (
     changed_paths,
     commit_worktree,
     create_task_workspace,
+    current_branch,
     ensure_task_workspace,
     head_commit,
     inspect_change_set,
@@ -95,7 +96,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_creating_again_preserves_the_previous_attempt(self) -> None:
         first = self.workspace()
         (first.path / "scratch.txt").write_text("attempt one\n", encoding="utf-8")
-        attempt = commit_worktree(first.path, "attempt one")
+        attempt = commit_worktree(first.path, "attempt one", expected=["scratch.txt"])
 
         with self.assertRaises(WorkspaceError) as caught:
             self.workspace()
@@ -114,7 +115,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_replacing_requires_an_explicit_decision(self) -> None:
         first = self.workspace()
         (first.path / "scratch.txt").write_text("attempt one\n", encoding="utf-8")
-        commit_worktree(first.path, "attempt one")
+        commit_worktree(first.path, "attempt one", expected=["scratch.txt"])
 
         second = create_task_workspace(
             self.repo, self.root, "task-1", self.base, replace_existing=True
@@ -127,7 +128,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_an_existing_worktree_is_reused_so_rework_builds_on_it(self) -> None:
         first = self.workspace()
         (first.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(first.path, "attempt one")
+        attempt = commit_worktree(first.path, "attempt one", expected=["change.py"])
 
         again = ensure_task_workspace(self.repo, self.root, "task-1", self.base)
 
@@ -147,11 +148,19 @@ class CreateWorkspaceTests(WorkspaceCase):
 
 
 class CommitTests(WorkspaceCase):
+    def committed_paths(self, path: Path, commit: str) -> list[str]:
+        shown = subprocess.run(
+            ["git", "-C", str(path), *GIT_ENV, "show", "--pretty=format:",
+             "--name-only", "-z", commit],
+            capture_output=True, text=True, check=True,
+        )
+        return sorted(name for name in shown.stdout.split("\0") if name)
+
     def test_a_commit_records_the_modification_and_returns_the_new_head(self) -> None:
         workspace = self.workspace()
         (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-        committed = commit_worktree(workspace.path, "add hello")
+        committed = commit_worktree(workspace.path, "add hello", expected=["hello.py"])
 
         self.assertNotEqual(committed, self.base)
         self.assertEqual(head_commit(workspace.path), committed)
@@ -161,16 +170,45 @@ class CommitTests(WorkspaceCase):
         workspace = self.workspace()
 
         with self.assertRaises(WorkspaceError) as caught:
-            commit_worktree(workspace.path, "nothing")
+            commit_worktree(workspace.path, "nothing", expected=[])
 
         self.assertEqual(caught.exception.code, "no-changes")
+
+    def test_a_commit_covers_exactly_the_set_it_was_given(self) -> None:
+        workspace = self.workspace()
+        (workspace.path / "reported.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        committed = commit_worktree(
+            workspace.path, "add reported", expected=["reported.py"]
+        )
+
+        self.assertEqual(
+            self.committed_paths(workspace.path, committed), ["reported.py"]
+        )
+        self.assertTrue(is_clean(workspace.path))
+
+    def test_a_file_outside_the_screened_set_is_never_committed(self) -> None:
+        # The commit stages with --force, so a path the caller did not screen must
+        # stop the commit rather than ride along with it. Nothing is left behind
+        # but the untouched working tree.
+        workspace = self.workspace()
+        (workspace.path / "screened.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (workspace.path / "smuggled.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            commit_worktree(workspace.path, "add screened", expected=["screened.py"])
+
+        self.assertEqual(caught.exception.code, "staged-set-mismatch")
+        self.assertEqual(head_commit(workspace.path), self.base)
+        self.assertFalse(is_clean(workspace.path))
+        self.assertTrue((workspace.path / "smuggled.py").is_file())
 
 
 class ChangeSetTests(WorkspaceCase):
     def reviewed(self, task_key: str = "task-1"):
         workspace = self.workspace(task_key)
         (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add hello")
+        commit = commit_worktree(workspace.path, "add hello", expected=["hello.py"])
         return workspace, commit
 
     def test_the_reviewed_commit_is_reported_in_full(self) -> None:
@@ -247,7 +285,7 @@ class ChangeSetTests(WorkspaceCase):
     def test_a_credential_path_blocks_delivery_even_when_reported(self) -> None:
         workspace = self.workspace()
         (workspace.path / ".env").write_text("TOKEN=placeholder\n", encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add env")
+        commit = commit_worktree(workspace.path, "add env", expected=[".env"])
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -264,7 +302,7 @@ class ChangeSetTests(WorkspaceCase):
         (workspace.path / "credentials.txt").write_text(
             "AKIA" + "A" * 16 + "\n", encoding="utf-8"
         )
-        commit = commit_worktree(workspace.path, "add credentials")
+        commit = commit_worktree(workspace.path, "add credentials", expected=["credentials.txt"])
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -279,7 +317,7 @@ class ChangeSetTests(WorkspaceCase):
     def test_a_file_too_large_to_screen_blocks_delivery(self) -> None:
         workspace = self.workspace()
         (workspace.path / "big.txt").write_text("x" * 2048, encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add big file")
+        commit = commit_worktree(workspace.path, "add big file", expected=["big.txt"])
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -295,7 +333,9 @@ class ChangeSetTests(WorkspaceCase):
         workspace = self.workspace()
         for index in range(3):
             (workspace.path / f"file{index}.txt").write_text("x\n", encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add files")
+        commit = commit_worktree(
+            workspace.path, "add files", expected=[f"file{index}.txt" for index in range(3)]
+        )
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -327,7 +367,7 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_resuming_reports_the_worktree_that_already_exists(self) -> None:
         workspace = self.workspace()
         (workspace.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(workspace.path, "attempt one")
+        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"])
 
         resumed = resume_task_workspace(self.root, "task-1")
 
@@ -338,7 +378,7 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_changed_paths_sees_committed_and_untracked_work(self) -> None:
         workspace = self.workspace()
         (workspace.path / "committed.py").write_text("VALUE = 1\n", encoding="utf-8")
-        commit_worktree(workspace.path, "attempt one")
+        commit_worktree(workspace.path, "attempt one", expected=["committed.py"])
         (workspace.path / "untracked.py").write_text("VALUE = 2\n", encoding="utf-8")
 
         self.assertEqual(
@@ -443,11 +483,112 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_ancestry_is_checked_against_the_approved_base(self) -> None:
         workspace = self.workspace()
         (workspace.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(workspace.path, "attempt one")
+        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"])
 
         self.assertTrue(is_ancestor(workspace.path, self.base, attempt))
         self.assertFalse(is_ancestor(workspace.path, attempt, self.base))
         self.assertFalse(is_ancestor(workspace.path, "not-a-commit", attempt))
+
+
+class ScreeningBoundaryTests(WorkspaceCase):
+    """What discovery, screening, and the commit must agree on.
+
+    The commit stages with ``--force`` so that Builders can add files a consumer
+    repository ignores. Staging and screening therefore have to enumerate the
+    same set, or a change could be screened as one list and committed as
+    another.
+    """
+
+    def freeze(self, workspace, names: list[str]) -> str:
+        """The exact sequence the Builder freeze runs: screen, then commit."""
+
+        screen_change_set(workspace.path, names)
+        return commit_worktree(workspace.path, "freeze", expected=names)
+
+    def test_discovery_reports_a_git_ignored_file(self) -> None:
+        workspace = self.workspace()
+        (workspace.path / ".gitignore").write_text("*.local\n", encoding="utf-8")
+        (workspace.path / "deploy.local").write_text("VALUE = 1\n", encoding="utf-8")
+
+        self.assertEqual(
+            changed_paths(workspace.path, self.base), [".gitignore", "deploy.local"]
+        )
+
+    def test_an_ignored_credential_is_screened_and_never_committed(self) -> None:
+        workspace = self.workspace()
+        (workspace.path / ".gitignore").write_text("*.local\n", encoding="utf-8")
+        (workspace.path / "deploy.local").write_text(
+            "AWS_KEY=AKIA" + "A" * 16 + "\n", encoding="utf-8"
+        )
+
+        names = changed_paths(workspace.path, self.base)
+
+        with self.assertRaises(WorkspaceError) as caught:
+            self.freeze(workspace, names)
+
+        self.assertEqual(caught.exception.code, "secret-content")
+        self.assertEqual(head_commit(workspace.path), self.base)
+        # Nothing reached the history: the credential is still only on disk.
+        self.assertTrue((workspace.path / "deploy.local").is_file())
+        self.assertNotIn(
+            "deploy.local", self.committed_files(workspace.path)
+        )
+
+    def committed_files(self, path: Path) -> list[str]:
+        listed = subprocess.run(
+            ["git", "-C", str(path), *GIT_ENV, "ls-tree", "-r", "--name-only", "HEAD"],
+            capture_output=True, text=True, check=True,
+        )
+        return listed.stdout.splitlines()
+
+    def test_a_symlink_in_the_change_set_is_refused(self) -> None:
+        workspace = self.workspace()
+        (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (workspace.path / "link.py").symlink_to("hello.py")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            screen_change_set(workspace.path, ["link.py"])
+
+        self.assertEqual(caught.exception.code, "symlink-refused")
+
+    def test_a_symlink_that_escapes_the_worktree_is_refused(self) -> None:
+        workspace = self.workspace()
+        outside = self.tmp / "outside.txt"
+        outside.write_text("VALUE = 1\n", encoding="utf-8")
+        (workspace.path / "escape.py").symlink_to(outside)
+
+        with self.assertRaises(WorkspaceError) as caught:
+            screen_change_set(workspace.path, ["escape.py"])
+
+        self.assertEqual(caught.exception.code, "symlink-refused")
+
+    def test_the_recovery_inventory_refuses_a_symlink_too(self) -> None:
+        workspace = self.workspace()
+        (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (workspace.path / "link.py").symlink_to("hello.py")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            recoverable_inventory(workspace.path, self.base)
+
+        self.assertEqual(caught.exception.code, "symlink-refused")
+
+    def test_the_branch_is_read_from_the_worktree_itself(self) -> None:
+        workspace = self.workspace()
+
+        self.assertEqual(current_branch(workspace.path), "loomsphere/task-task-1")
+        self.assertEqual(workspace.branch, current_branch(workspace.path))
+
+    def test_a_detached_head_has_no_branch_to_report(self) -> None:
+        workspace = self.workspace()
+        subprocess.run(
+            ["git", "-C", str(workspace.path), *GIT_ENV, "checkout", "--detach"],
+            capture_output=True, text=True, check=True,
+        )
+
+        with self.assertRaises(WorkspaceError) as caught:
+            current_branch(workspace.path)
+
+        self.assertEqual(caught.exception.code, "detached-head")
 
 
 class RepositoryRootTests(TempCase):

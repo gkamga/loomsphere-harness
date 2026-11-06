@@ -10,6 +10,7 @@ transition, and recorded artefact is the production one.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -19,6 +20,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
+from unittest import mock
 
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelResponse, TextPart
@@ -27,6 +29,7 @@ from pydantic_ai.models.function import FunctionModel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from runtime_support import (  # noqa: E402
+    HARNESS_ROOT,
     INTAKE_ASSESSMENT,
     PROPOSAL,
     RuntimeCase,
@@ -36,10 +39,12 @@ from runtime_support import (  # noqa: E402
 from loomsphere_harness.cli import render_recovery  # noqa: E402
 from loomsphere_harness.config import SandboxConfig, ValidationConfig  # noqa: E402
 from loomsphere_harness.engine import Engine, EngineError  # noqa: E402
+from loomsphere_harness.implementation import ImplementationStage  # noqa: E402
 from loomsphere_harness.pydantic_harness import PydanticHarnessRunner  # noqa: E402
 from loomsphere_harness.repository import GitRepository, OsUserIdentity  # noqa: E402
 from loomsphere_harness.sandbox import SandboxExecutor, SandboxPolicy  # noqa: E402
 from loomsphere_harness.store import SqliteStore, StoreError  # noqa: E402
+from loomsphere_harness.workspace import changed_paths, ensure_task_workspace  # noqa: E402
 
 IMAGE_ID = "sha256:" + "b" * 64
 CRITERION_ID = "AC-1"
@@ -941,6 +946,67 @@ class BuilderRecovery(LoopCase):
         self.assertEqual(self.porcelain(self.repo), "")
         return raised.exception
 
+    def crashed_builder(self):
+        """The state a process that died during the Builder stage leaves behind.
+
+        A crash cannot be raised from inside the scripted model: the runtime turns
+        every exception a model raises into a recorded failure, so an in-process
+        raise would produce the *recorded* case, not the interrupted one. The state
+        is therefore built from the store calls the loop itself makes, up to and
+        including the moment the process stops: the worktree exists on its branch,
+        the iteration is `building`, the Builder run is `running`, the Builder's
+        files are on disk, and nothing has been committed.
+        """
+
+        engine, task_id, _ = self.approved_task()
+        task = engine._task(task_id)
+        iteration = engine.store.open_iteration(
+            task_id=task_id, base_commit=task["repo_commit"], actor="alice"
+        )
+        workspace = ensure_task_workspace(
+            engine.repo_path, engine.workspace_root, task_id, task["repo_commit"]
+        )
+        engine.store.update_iteration(
+            iteration_id=iteration["id"],
+            actor="alice",
+            event="workspace.ready",
+            fields={"branch": workspace.branch, "workspace_path": str(workspace.path)},
+        )
+        engine.store.begin_run(
+            task_id=task_id,
+            role="builder",
+            expect=("implementation_running",),
+            running_status="implementation_running",
+            actor="alice",
+            evidence={},
+        )
+        half_written = workspace.path / "tests" / "test_hello.py"
+        half_written.parent.mkdir(parents=True, exist_ok=True)
+        half_written.write_text("def test_hello():\n    assert True\n", encoding="utf-8")
+        return engine, task_id
+
+    def recover_interrupted_elsewhere(self, engine) -> list[str]:
+        """Repair interrupted stages from a second process, as a second CLI would.
+
+        A real second invocation is the only thing that can show a lease is
+        process-scoped: an in-process call would share the file descriptor that
+        holds it.
+        """
+
+        script = (
+            "import json, sys\n"
+            "from loomsphere_harness.store import SqliteStore\n"
+            "print(json.dumps(SqliteStore(sys.argv[1]).recover_interrupted(sys.argv[2])))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(self.state), "bob"],
+            capture_output=True,
+            text=True,
+            cwd=str(HARNESS_ROOT),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
     # -- the failure preserves usable work ------------------------------------
     def test_a_builder_that_runs_out_of_budget_leaves_its_work_behind(self) -> None:
         engine, task_id, calls = self.failed_builder()
@@ -1254,6 +1320,273 @@ class BuilderRecovery(LoopCase):
         )
         digest = inspection["snapshot"]["digest"]
         self.assertRefused(engine, task_id, digest=digest)
+
+    # -- a Git-ignored file cannot escape the screen --------------------------
+    def test_a_git_ignored_credential_is_discovered_and_never_frozen(self) -> None:
+        """The freeze screens and commits the same set, ignored files included.
+
+        `git add --all --force` stages ignored files, so a Builder that writes a
+        credential to an ignored path would have it committed by anyone who only
+        screened the paths Git reports as changed. Discovery has to see the file
+        for the screen to read it, and the commit has to be told which paths the
+        screen covered.
+        """
+
+        engine, task_id, _ = self.failed_builder(
+            unreported_files={
+                ".gitignore": "*.local\n",
+                "deploy.local": "AWS_KEY=AKIA" + "A" * 16 + "\n",
+            }
+        )
+        worktree = self.worktree(engine, task_id)
+        iteration = engine.store.iteration(task_id)
+
+        # Discovery reports the ignored file, so the screen is asked to read it.
+        self.assertEqual(
+            changed_paths(worktree, iteration["base_commit"]),
+            [".gitignore", "deploy.local", "tests/test_hello.py"],
+        )
+        # The screen refused the whole set, so nothing was frozen at all.
+        self.assertIsNone(iteration["commit_sha"])
+        self.assertEqual(self.head_of(worktree), iteration["base_commit"])
+        tracked = subprocess.run(
+            ["git", "-C", str(worktree), "ls-tree", "-r", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertEqual(sorted(tracked), ["README.md"])
+        self.assertNotIn("deploy.local", tracked)
+        self.assertNotIn("tests/test_hello.py", tracked)
+        # Refusing to freeze the work did not delete it.
+        self.assertTrue((worktree / "deploy.local").exists())
+        self.assertTrue((worktree / "tests" / "test_hello.py").exists())
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertIsNone(inspection["snapshot"])
+        self.assertTrue(
+            any("never committed a change set" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+        # Nothing was committed by the refusal either.
+        self.assertEqual(self.head_of(worktree), iteration["base_commit"])
+
+    # -- a Builder whose process died is still recoverable --------------------
+    def test_an_interrupted_builder_is_preserved_and_recovered(self) -> None:
+        engine, task_id = self.crashed_builder()
+        worktree = self.worktree(engine, task_id)
+
+        # Before anything reaps the dead stage the record still says it is running,
+        # and the inspection reports that without changing it.
+        iteration = engine.store.iteration(task_id)
+        self.assertEqual(engine._task(task_id)["status"], "implementation_running")
+        self.assertEqual(iteration["status"], "building")
+        self.assertIsNone(iteration["commit_sha"])
+
+        before = self.inspection(engine, task_id)
+
+        self.assertEqual(engine._task(task_id)["status"], "implementation_running")
+        self.assertEqual(engine.store.iteration(task_id), iteration)
+        self.assertIsNone(before["snapshot"])
+        self.assertFalse(before["eligible"])
+        self.assertTrue(
+            any("only implementation_failed" in item for item in before["obstacles"]),
+            before["obstacles"],
+        )
+        self.assertTrue(
+            any("is building;" in item for item in before["obstacles"]),
+            before["obstacles"],
+        )
+
+        # A second process repairs the dead stage: the run becomes interrupted, the
+        # task reopens as a failed implementation, and the Builder's iteration is
+        # closed where the process stopped instead of staying open for ever.
+        repaired = self.recover_interrupted_elsewhere(engine)
+
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        iteration = engine.store.iteration(task_id)
+        self.assertEqual(iteration["status"], "failed")
+        self.assertEqual(iteration["failure_reason"], "interrupted")
+        self.assertIsNone(iteration["commit_sha"])
+        builder_runs = [run for run in engine.store.runs(task_id) if run["role"] == "builder"]
+        self.assertEqual(len(builder_runs), 1)
+        self.assertEqual(builder_runs[0]["status"], "interrupted")
+        self.assertEqual(builder_runs[0]["failure_reason"], "interrupted")
+
+        # The uncommitted work is now inspectable, and the snapshot says the commit
+        # it would be recovered from has not been written yet.
+        inspection = self.inspection(engine, task_id)
+        self.assertTrue(inspection["eligible"], inspection["obstacles"])
+        self.assertFalse(inspection["snapshot"]["committed"])
+        self.assertEqual(
+            [entry["path"] for entry in inspection["snapshot"]["files"]],
+            ["tests/test_hello.py"],
+        )
+        self.assertEqual(inspection["iteration"]["status"], "failed")
+        self.assertEqual(inspection["builder_run"]["status"], "interrupted")
+        self.assertEqual(inspection["builder_run"]["failure_reason"], "interrupted")
+
+        view = engine.recover_builder(
+            task_id, snapshot_digest=inspection["snapshot"]["digest"]
+        )
+
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(len(engine.store.recoveries(task_id)), 1)
+        recovered = engine.store.iteration(task_id)
+        self.assertEqual(recovered["status"], "ready")
+        self.assertTrue(recovered["commit_sha"])
+        self.assertIsNone(recovered["build_report"])
+        # The preserved work was frozen under a message that says so.
+        subject = subprocess.run(
+            ["git", "-C", str(worktree), "log", "-1", "--format=%B"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertIn("preserved after interruption", subject)
+        self.assertEqual(self.porcelain(worktree), "")
+        # The Builder was never invoked again and its failure record is unchanged.
+        self.assertEqual(
+            [run["role"] for run in engine.store.runs(task_id)],
+            ["intake", "architect", "builder", "qa", "reviewer"],
+        )
+        self.assertEqual(
+            [run["status"] for run in engine.store.runs(task_id) if run["role"] == "builder"],
+            ["interrupted"],
+        )
+
+    # -- a live recovery is not an interrupted stage ---------------------------
+    def test_a_second_process_cannot_close_a_live_recovery(self) -> None:
+        """A recovery holds the task in a running status with no run row.
+
+        From the outside that is indistinguishable from a stage whose process died,
+        so a second `status` or `inspect-recovery` call would close the live
+        recovery unless the recovery holds something only a live process can hold.
+        The companion test for an interrupted Builder shows this same call reaping
+        the task when nothing holds it, which is what makes the empty result here
+        meaningful.
+        """
+
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+        seen: dict[str, object] = {}
+        original = ImplementationStage._recover_after_build
+
+        def watched(stage, **kwargs):
+            # The exact window the finding is about: claimed, running, nothing
+            # running, and the validation about to start.
+            seen["status"] = engine._task(task_id)["status"]
+            seen["running"] = [
+                run["role"] for run in engine.store.runs(task_id) if run["status"] == "running"
+            ]
+            seen["repaired"] = self.recover_interrupted_elsewhere(engine)
+            seen["status_after"] = engine._task(task_id)["status"]
+            seen["events_after"] = [
+                event["event"] for event in engine.store.audit_events(task_id)
+            ]
+            return original(stage, **kwargs)
+
+        with mock.patch.object(ImplementationStage, "_recover_after_build", watched):
+            view = engine.recover_builder(task_id, snapshot_digest=digest)
+
+        self.assertEqual(seen["status"], "implementation_running")
+        self.assertEqual(seen["running"], [])
+        self.assertEqual(seen["repaired"], [])
+        self.assertEqual(seen["status_after"], "implementation_running")
+        self.assertNotIn("run.interrupted", seen["events_after"])
+        # The recovery finished on its own terms.
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(len(engine.store.recoveries(task_id)), 1)
+        # And the lease is released once the work is done.
+        with engine.store.recovery_lease(task_id):
+            pass
+
+    # -- the authorisation must still bind this task ---------------------------
+    def test_an_approval_recorded_against_another_commit_is_refused(self) -> None:
+        """The approval names the repository commit the human actually approved.
+
+        A decision recorded against a different commit authorises that commit, not
+        this work, so recovery has to compare `approval.repo_commit` with the task
+        before it freezes anything. Append-only approvals and the submit/run guards
+        make this divergence unreachable through the public API, so the record is
+        corrupted here the same way a tampered or foreign store would be.
+        """
+
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+        with closing(sqlite3.connect(self.state)) as database:
+            # The approvals table is append-only by trigger; drop the guard to
+            # write the record the check is there to catch.
+            triggers = [
+                row[0]
+                for row in database.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'trigger' AND tbl_name = 'approvals'"
+                )
+            ]
+            self.assertTrue(triggers)
+            for name in triggers:
+                database.execute(f'DROP TRIGGER "{name}"')
+            database.execute(
+                "UPDATE approvals SET repo_commit = ? WHERE task_id = ?",
+                ("c" * 40, task_id),
+            )
+            database.commit()
+
+        error = self.assertRefused(engine, task_id, digest=digest)
+
+        self.assertIn("recovered on top of the wrong commit", str(error))
+
+    def test_a_worktree_on_another_branch_is_refused(self) -> None:
+        """The branch is read from the worktree, not trusted from the record."""
+
+        engine, task_id, _ = self.failed_builder()
+        digest = self.snapshot_digest(engine, task_id)
+        worktree = self.worktree(engine, task_id)
+        recorded = engine.store.iteration(task_id)["branch"]
+        subprocess.run(
+            ["git", "-C", str(worktree), "checkout", "-q", "-b", "somewhere-else"],
+            check=True,
+        )
+
+        error = self.assertRefused(engine, task_id, digest=digest)
+
+        self.assertIn("checked out", str(error))
+        self.assertIn("somewhere-else", str(error))
+        self.assertIn(recorded, str(error))
+
+    def test_a_symlink_in_the_preserved_work_is_refused(self) -> None:
+        """A link can point the screen at bytes the commit would not contain.
+
+        Reading through the link and committing the path are two different reads of
+        the worktree, so a symlink is refused rather than followed: in inspection,
+        where the snapshot is withheld, and in recovery, where it is a refusal.
+        """
+
+        engine, task_id = self.crashed_builder()
+        worktree = self.worktree(engine, task_id)
+        self.recover_interrupted_elsewhere(engine)
+        (worktree / "tests" / "linked.py").symlink_to("/etc/passwd")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertIsNone(inspection["snapshot"])
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("symlink-refused" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+
+        error = self.assertRefused(engine, task_id)
+
+        self.assertIn("symlink-refused", str(error))
+        # Refusing did not commit the link and did not remove the work either.
+        self.assertIsNone(engine.store.iteration(task_id)["commit_sha"])
+        self.assertTrue((worktree / "tests" / "test_hello.py").exists())
+        self.assertTrue((worktree / "tests" / "linked.py").is_symlink())
 
 
 if __name__ == "__main__":  # pragma: no cover

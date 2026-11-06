@@ -239,6 +239,32 @@ def head_commit(path: Path) -> str:
     return commit
 
 
+def current_branch(path: Path) -> str:
+    """The branch the worktree actually has checked out.
+
+    Recovery and delivery are recorded against a branch name, so the name is read
+    from git instead of being assumed: a worktree on a different branch, or on a
+    detached HEAD, is not the worktree the record describes.
+    """
+
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    try:
+        branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD").strip()
+    except WorkspaceError as error:
+        raise WorkspaceError(
+            "detached-head", "The task worktree has no branch checked out."
+        ) from error
+    if not branch:
+        raise WorkspaceError(
+            "detached-head", "The task worktree has no branch checked out."
+        )
+    return branch
+
+
 def create_task_workspace(
     repository_root: str | Path,
     workspace_root: str | Path,
@@ -311,7 +337,7 @@ def ensure_task_workspace(
     if is_worktree(path):
         return TaskWorkspace(
             path=path,
-            branch=task_branch_name(task_key),
+            branch=current_branch(path),
             commit=head_commit(path),
             base_commit=base_commit,
         )
@@ -337,7 +363,7 @@ def resume_task_workspace(workspace_root: str | Path, task_key: str) -> TaskWork
         )
     return TaskWorkspace(
         path=path,
-        branch=task_branch_name(task_key),
+        branch=current_branch(path),
         commit=head_commit(path),
         base_commit=head_commit(path),
     )
@@ -369,21 +395,58 @@ def remove_task_workspace(
     return removed
 
 
-def commit_worktree(path: Path, message: str) -> str:
-    """Stage every change and record one commit. Returns the new HEAD.
+def _split_names(raw: bytes) -> set[str]:
+    return {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
+
+
+def commit_worktree(path: Path, message: str, *, expected: list[str]) -> str:
+    """Stage exactly the screened paths and record one commit. Returns the new HEAD.
+
+    ``expected`` is the set of paths discovery reported and `screen_change_set`
+    approved, and it is not advisory: staging and the recorded commit must both
+    contain that exact set. `git add --all --force` writes ignored files to the
+    index, so a caller that screened only the non-ignored files would otherwise
+    commit material no screen ever read. A mismatch unstages the worktree, leaves
+    every file on disk untouched, and fails closed.
 
     Raises ``WorkspaceError('no-changes')`` when the agent produced no modification,
     so an empty iteration can never be recorded as an implementation.
     """
 
+    wanted = set(expected)
     _git(path, "add", "--all", "--force")
-    staged = _git(path, "diff", "--cached", "--name-only").strip()
+    staged = _split_names(
+        _git_bytes(path, "diff", "--cached", "--name-only", "-z")
+    )
     if not staged:
         raise WorkspaceError(
             "no-changes",
             "The Builder left the worktree unmodified; nothing could be committed.",
         )
+    if staged != wanted:
+        # Unstaging does not touch the working tree, so the work is still there
+        # for a human to look at; only the index is reset.
+        _git(path, "reset", "-q")
+        raise WorkspaceError(
+            "staged-set-mismatch",
+            "The staged change set is not the set that was screened "
+            f"({len(staged)} staged, {len(wanted)} screened: "
+            f"unscreened {sorted(staged - wanted)}, missing {sorted(wanted - staged)}).",
+        )
     _git(path, *GIT_IDENTITY, "commit", "--no-verify", "-m", message)
+
+    # The commit is the thing that gets delivered, so it is verified against the
+    # screened set too rather than trusted because staging agreed.
+    committed = _split_names(
+        _git_bytes(path, "show", "--pretty=format:", "--name-only", "-z", "HEAD")
+    )
+    if committed != wanted:
+        raise WorkspaceError(
+            "committed-set-mismatch",
+            "The recorded commit does not contain the screened change set "
+            f"(committed {len(committed)}, screened {len(wanted)}: "
+            f"unscreened {sorted(committed - wanted)}, missing {sorted(wanted - committed)}).",
+        )
     return head_commit(path)
 
 
@@ -483,13 +546,26 @@ def is_ancestor(path: Path, ancestor: str, descendant: str) -> bool:
 
 
 def _entry_path(root: Path, name: str) -> Path:
-    """Resolve one git-reported path inside the worktree, refusing escapes."""
+    """Resolve one git-reported path inside the worktree, refusing escapes.
+
+    Symbolic links are refused outright. Every content screen reads the resolved
+    target, so a link is a way to publish bytes under a name no screen inspected:
+    a dangling link has no readable content at all, and a link to a file elsewhere
+    in the tree publishes content attributed to the wrong path. Neither can be
+    screened honestly, so neither is allowed into a change set.
+    """
 
     if not name or Path(name).is_absolute() or ".." in Path(name).parts:
         raise WorkspaceError(
             "invalid-path", f"The worktree reported an unusable path: {name!r}"
         )
     candidate = root / name
+    if candidate.is_symlink():
+        raise WorkspaceError(
+            "symlink-refused",
+            f"{name!r} is a symbolic link; a change set may not contain links "
+            "because their content cannot be screened as the path it is recorded under.",
+        )
     try:
         candidate.resolve().relative_to(root.resolve())
     except ValueError as error:
@@ -502,9 +578,16 @@ def _entry_path(root: Path, name: str) -> Path:
 def changed_paths(path: Path, base_commit: str) -> list[str]:
     """Every path that differs from ``base_commit``, committed or not.
 
-    Read-only: it compares the worktree against the base commit and adds the
-    untracked, non-ignored files, so a Builder that wrote files and then died
-    before committing is still fully visible.
+    Read-only: it compares the worktree against the base commit and adds every
+    untracked file, so a Builder that wrote files and then died before committing
+    is still fully visible.
+
+    Ignored, untracked files are included on purpose. ``commit_worktree`` stages
+    with ``git add --all --force``, which does not consult ``.gitignore``, so an
+    ignored file can reach the commit; leaving it out of discovery would let a
+    Builder write a credential to an ignored path and have it committed without
+    any screen reading it. Discovery, screening, staging, and the recorded commit
+    therefore all describe this one set.
     """
 
     if not COMMIT_SHA_PATTERN.fullmatch(base_commit):
@@ -512,9 +595,9 @@ def changed_paths(path: Path, base_commit: str) -> list[str]:
             "invalid-commit", f"The base commit is not a commit hash: {base_commit!r}"
         )
     raw = _git_bytes(path, "diff", "--name-only", "-z", base_commit)
-    names = {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
-    raw = _git_bytes(path, "ls-files", "--others", "--exclude-standard", "-z")
-    names |= {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
+    names = _split_names(raw)
+    raw = _git_bytes(path, "ls-files", "--others", "-z")
+    names |= _split_names(raw)
     return sorted(names)
 
 
@@ -672,6 +755,7 @@ __all__ = [
     "changed_paths",
     "commit_worktree",
     "create_task_workspace",
+    "current_branch",
     "diff_excerpt",
     "diff_text",
     "ensure_task_workspace",

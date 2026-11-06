@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+try:  # pragma: no cover - the fallback exists only for platforms without POSIX locks
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 SCHEMA_VERSION = 3
 #: Versions this build can open. A v1 or v2 database is migrated forward by
 #: ``initialize``; ``check`` refuses anything else so no stage runs on data it
@@ -663,7 +668,18 @@ class SqliteStore:
         return proposal_id
 
     def recover_interrupted(self, actor: str) -> list[str]:
-        """Mark runs left 'running' by a crashed process and reopen their stage."""
+        """Mark runs left 'running' by a crashed process and reopen their stage.
+
+        A stage that a live recovery is holding open is left completely alone.
+        A recovery keeps the task in a running status across its sandbox
+        validation, its QA run, and its Reviewer run, and the validation phase
+        has no run row at all, so from the outside it looks exactly like a stage
+        whose process died. The recovering process therefore holds an exclusive
+        lease on the task for the whole recovery, and any task holding a lease
+        is skipped here. The operating system releases the lease when the owning
+        process exits, including when it is killed, so a recovery that really
+        died is still repaired by the next call.
+        """
 
         running_status = {
             "intake": ("intake_failed", "intake_running"),
@@ -674,7 +690,24 @@ class SqliteStore:
         }
         recovered: list[str] = []
         with self._tx() as db:
+            in_play = {
+                row["task_id"]
+                for row in db.execute(
+                    "SELECT DISTINCT task_id FROM runs WHERE status = 'running'"
+                ).fetchall()
+            }
+            placeholders = ",".join("?" for _ in running_status.values())
+            in_play |= {
+                row["id"]
+                for row in db.execute(
+                    f"SELECT id FROM tasks WHERE status IN ({placeholders})",
+                    tuple(running for _, running in running_status.values()),
+                ).fetchall()
+            }
+            leased = {task_id for task_id in in_play if self._recovery_in_progress(task_id)}
             for run in db.execute("SELECT id, task_id, role FROM runs WHERE status='running'").fetchall():
+                if run["task_id"] in leased:
+                    continue
                 db.execute("UPDATE runs SET status='interrupted', failure_reason='interrupted',"
                            " failure_detail='The process stopped before the run finished.',"
                            " finished_at=? WHERE id=?", (now(), run["id"]))
@@ -690,6 +723,8 @@ class SqliteStore:
                     continue
                 self._set_status(db, run["task_id"], failed, actor, (running,), "run.interrupted",
                                  {"run_id": run["id"]})
+                if run["role"] == "builder":
+                    self._close_interrupted_iteration(db, run["task_id"])
                 recovered.append(run["id"])
             # A stage can also be claimed before its run row exists: the claim and
             # the run are written together, but a recovery claim holds the stage
@@ -702,10 +737,96 @@ class SqliteStore:
                     " (SELECT task_id FROM runs WHERE status = 'running')",
                     (running,),
                 ).fetchall():
+                    if task["id"] in leased:
+                        continue
                     self._set_status(db, task["id"], failed, actor, (running,),
                                      "stage.interrupted", {"run_id": None})
+                    if running == "implementation_running":
+                        self._close_interrupted_iteration(db, task["id"])
                     recovered.append(task["id"])
         return recovered
+
+    @staticmethod
+    def _close_interrupted_iteration(db: sqlite3.Connection, task_id: str) -> None:
+        """Stop the Builder's open iteration where the interrupted run stopped.
+
+        An iteration left ``building`` by a dead process describes a stage that is
+        not running, and every recovery path requires a failed iteration, so
+        leaving it open would make the preserved work inspectable but permanently
+        unrecoverable.
+        """
+
+        db.execute(
+            "UPDATE iterations SET status = 'failed', failure_reason = 'interrupted',"
+            " failure_detail = 'The process stopped before the run finished.',"
+            " updated_at = ? WHERE task_id = ? AND status = 'building'",
+            (now(), task_id),
+        )
+
+    # -- recovery leases -------------------------------------------------------
+    def _recovery_lease_path(self, task_id: str) -> Path:
+        """Where the exclusive lease for one task's live recovery is kept."""
+
+        return self.path.with_name(f"{self.path.name}.{task_id}.recovery.lock")
+
+    def _recovery_in_progress(self, task_id: str) -> bool:
+        """Whether another process currently holds the recovery lease.
+
+        The check takes the lease and drops it again, so it observes the same
+        kernel state a recovering process depends on. It never waits.
+        """
+
+        if fcntl is None:  # pragma: no cover - POSIX-only fallback
+            return False
+        path = self._recovery_lease_path(task_id)
+        if not path.exists():
+            return False
+        try:
+            handle = open(path, "a+b")
+        except OSError:  # pragma: no cover - unreadable lock file is not a recovery
+            return False
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+        return False
+
+    @contextmanager
+    def recovery_lease(self, task_id: str) -> Iterator[None]:
+        """Hold the exclusive lease for the whole of one task's recovery.
+
+        The lease is a kernel lock, not a recorded fact: it is released the
+        moment the holding process dies, so `recover_interrupted` never has to
+        guess whether a running stage belongs to a live recovery or to a dead
+        one. Holding it is also what makes two concurrent recoveries of the same
+        task impossible rather than merely unlikely.
+        """
+
+        if fcntl is None:  # pragma: no cover - POSIX-only fallback
+            raise StoreError(
+                "recovery-unsupported",
+                "Recoveries need POSIX file locks, which this platform does not provide.",
+            )
+        path = self._recovery_lease_path(task_id)
+        try:
+            handle = open(path, "a+b")
+        except OSError as error:
+            raise StoreError(
+                "recovery-unsupported", f"The recovery lease could not be opened: {error}"
+            ) from error
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise StoreError(
+                    "recovery-active",
+                    f"Another process is already recovering task {task_id}.",
+                ) from error
+            yield
+        finally:
+            handle.close()
 
     def runs(self, task_id: str) -> list[dict[str, Any]]:
         db = self._connect()
