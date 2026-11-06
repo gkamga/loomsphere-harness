@@ -583,6 +583,31 @@ class Engine:
         outcome = ImplementationStage(self).retry_review(task_id)
         return {"implementation": outcome, **self.describe(task_id)}
 
+    def inspect_recovery(self, task_id: str) -> dict[str, Any]:
+        """Report what a failed Builder preserved, without changing anything.
+
+        Deliberately does not call `recover()`. Reaping interrupted runs writes run
+        and task statuses and appends audit events, so an inspection that reaped
+        first would mutate the state it promises to describe and would make a
+        read-only command depend on which process happened to run it.
+        """
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        inspection = ImplementationStage(self).inspect_recovery(task_id)
+        return {"recovery": inspection, **self.describe(task_id)}
+
+    def recover_builder(self, task_id: str, *, snapshot_digest: str) -> dict[str, Any]:
+        """Recover a failed Builder's preserved change set under human authorization."""
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        self.recover()
+        outcome = ImplementationStage(self).recover_builder(
+            task_id, snapshot_digest=snapshot_digest
+        )
+        return {"implementation": outcome, **self.describe(task_id)}
+
     def accept_delivery(
         self, task_id: str, *, deliverable_digest: str, reason: str | None = None
     ) -> dict[str, Any]:

@@ -239,13 +239,47 @@ def head_commit(path: Path) -> str:
     return commit
 
 
+def current_branch(path: Path) -> str:
+    """The branch the worktree actually has checked out.
+
+    Recovery and delivery are recorded against a branch name, so the name is read
+    from git instead of being assumed: a worktree on a different branch, or on a
+    detached HEAD, is not the worktree the record describes.
+    """
+
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    try:
+        branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD").strip()
+    except WorkspaceError as error:
+        raise WorkspaceError(
+            "detached-head", "The task worktree has no branch checked out."
+        ) from error
+    if not branch:
+        raise WorkspaceError(
+            "detached-head", "The task worktree has no branch checked out."
+        )
+    return branch
+
+
 def create_task_workspace(
     repository_root: str | Path,
     workspace_root: str | Path,
     task_key: str,
     base_commit: str,
+    *,
+    replace_existing: bool = False,
 ) -> TaskWorkspace:
-    """Create a fresh worktree pinned to ``base_commit`` on a private branch."""
+    """Create a fresh worktree pinned to ``base_commit`` on a private branch.
+
+    ``replace_existing`` is off by default, so a leftover directory or branch is
+    reported instead of being deleted. Deleting a worktree can destroy work a
+    failed Builder already produced, and recovery depends on those bytes still
+    being there; only an explicit ``replace_existing=True`` discards them.
+    """
 
     root = resolve_repository_root(repository_root)
     resolved_root_dir = Path(workspace_root).expanduser().resolve()
@@ -257,13 +291,23 @@ def create_task_workspace(
 
     resolved_root_dir.mkdir(parents=True, exist_ok=True)
 
-    # Predictable recovery: a leftover directory or branch from an earlier attempt
-    # is discarded before the new worktree is created.
-    if path.exists():
-        shutil.rmtree(path)
     _git_succeeds(root, ["worktree", "prune"])
-    if _git_succeeds(root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
-        _git(root, "branch", "-D", branch)
+    branch_exists = _git_succeeds(
+        root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]
+    )
+    if path.exists() or branch_exists:
+        if not replace_existing:
+            raise WorkspaceError(
+                "workspace-exists",
+                "A previous workspace or branch for this task still exists; it is "
+                "kept rather than replaced so recorded work is never destroyed.",
+            )
+        # Only reachable from an explicit caller decision to start over.
+        if path.exists():
+            shutil.rmtree(path)
+        _git_succeeds(root, ["worktree", "prune"])
+        if branch_exists:
+            _git(root, "branch", "-D", branch)
 
     _git(root, "worktree", "add", "--force", "-B", branch, str(path), commit)
     if not path.is_dir():
@@ -293,11 +337,36 @@ def ensure_task_workspace(
     if is_worktree(path):
         return TaskWorkspace(
             path=path,
-            branch=task_branch_name(task_key),
+            branch=current_branch(path),
             commit=head_commit(path),
             base_commit=base_commit,
         )
     return create_task_workspace(repository_root, workspace_root, task_key, base_commit)
+
+
+def resume_task_workspace(workspace_root: str | Path, task_key: str) -> TaskWorkspace:
+    """Return the worktree a failed Builder left behind, never creating or deleting.
+
+    Recovery must operate on the bytes that already exist. This helper therefore
+    refuses when nothing usable is present instead of falling back to worktree
+    creation, which is the only path that can discard recorded work.
+    """
+
+    path = assert_within(
+        Path(workspace_root).expanduser().resolve(),
+        workspace_path_for(workspace_root, task_key),
+    )
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    return TaskWorkspace(
+        path=path,
+        branch=current_branch(path),
+        commit=head_commit(path),
+        base_commit=head_commit(path),
+    )
 
 
 def remove_task_workspace(
@@ -326,21 +395,66 @@ def remove_task_workspace(
     return removed
 
 
-def commit_worktree(path: Path, message: str) -> str:
-    """Stage every change and record one commit. Returns the new HEAD.
+def _split_names(raw: bytes) -> set[str]:
+    return {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
+
+
+def commit_worktree(
+    path: Path, message: str, *, expected: list[str], base_commit: str
+) -> str:
+    """Stage exactly the screened paths and record one commit. Returns the new HEAD.
+
+    ``expected`` is the cumulative set of paths that differ from ``base_commit``,
+    as discovery reported and `screen_change_set` approved. It is not advisory:
+    after staging, the index must differ from the base by exactly that set. The
+    commit itself is incremental (index against HEAD), so a second Builder
+    iteration that sits on top of an earlier commit is legitimate; the recorded
+    commit must contain exactly what was staged. `git add --all --force` writes ignored files to the
+    index, so a caller that screened only the non-ignored files would otherwise
+    commit material no screen ever read. A mismatch unstages the worktree, leaves
+    every file on disk untouched, and fails closed.
 
     Raises ``WorkspaceError('no-changes')`` when the agent produced no modification,
     so an empty iteration can never be recorded as an implementation.
     """
 
+    wanted = set(expected)
     _git(path, "add", "--all", "--force")
-    staged = _git(path, "diff", "--cached", "--name-only").strip()
+    staged = _split_names(
+        _git_bytes(path, "diff", "--cached", "--name-only", "-z")
+    )
+    cumulative = _split_names(
+        _git_bytes(path, "diff", "--cached", "--name-only", "-z", base_commit)
+    )
     if not staged:
         raise WorkspaceError(
             "no-changes",
             "The Builder left the worktree unmodified; nothing could be committed.",
         )
+    if cumulative != wanted:
+        # Unstaging does not touch the working tree, so the work is still there
+        # for a human to look at; only the index is reset.
+        _git(path, "reset", "-q")
+        raise WorkspaceError(
+            "staged-set-mismatch",
+            "The staged change set is not the set that was screened "
+            f"({len(cumulative)} staged, {len(wanted)} screened: "
+            f"unscreened {sorted(cumulative - wanted)}, missing {sorted(wanted - cumulative)}).",
+        )
     _git(path, *GIT_IDENTITY, "commit", "--no-verify", "-m", message)
+
+    # The commit is the thing that gets delivered, so it is verified against the
+    # screened set too rather than trusted because staging agreed.
+    committed = _split_names(
+        _git_bytes(path, "show", "--pretty=format:", "--name-only", "-z", "HEAD")
+    )
+    if committed != staged:
+        raise WorkspaceError(
+            "committed-set-mismatch",
+            "The recorded commit does not contain the screened change set "
+            f"(committed {len(committed)}, staged {len(staged)}: "
+            f"unscreened {sorted(committed - staged)}, missing {sorted(staged - committed)}).",
+        )
     return head_commit(path)
 
 
@@ -429,6 +543,147 @@ def is_clean(path: Path) -> bool:
     return not _git(path, "status", "--porcelain").strip()
 
 
+def is_ancestor(path: Path, ancestor: str, descendant: str) -> bool:
+    """True when ``ancestor`` is reachable from ``descendant``."""
+
+    if not COMMIT_SHA_PATTERN.fullmatch(ancestor) or not COMMIT_SHA_PATTERN.fullmatch(
+        descendant
+    ):
+        return False
+    return _git_succeeds(path, ["merge-base", "--is-ancestor", ancestor, descendant])
+
+
+def _entry_path(root: Path, name: str) -> Path:
+    """Resolve one git-reported path inside the worktree, refusing escapes.
+
+    Symbolic links are refused outright. Every content screen reads the resolved
+    target, so a link is a way to publish bytes under a name no screen inspected:
+    a dangling link has no readable content at all, and a link to a file elsewhere
+    in the tree publishes content attributed to the wrong path. Neither can be
+    screened honestly, so neither is allowed into a change set.
+    """
+
+    if not name or Path(name).is_absolute() or ".." in Path(name).parts:
+        raise WorkspaceError(
+            "invalid-path", f"The worktree reported an unusable path: {name!r}"
+        )
+    candidate = root / name
+    if candidate.is_symlink():
+        raise WorkspaceError(
+            "symlink-refused",
+            f"{name!r} is a symbolic link; a change set may not contain links "
+            "because their content cannot be screened as the path it is recorded under.",
+        )
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError as error:
+        raise WorkspaceError(
+            "invalid-path", f"{name!r} resolves outside the task worktree."
+        ) from error
+    return candidate
+
+
+def changed_paths(path: Path, base_commit: str) -> list[str]:
+    """Every path that differs from ``base_commit``, committed or not.
+
+    Read-only: it compares the worktree against the base commit and adds every
+    untracked file, so a Builder that wrote files and then died before committing
+    is still fully visible.
+
+    Ignored, untracked files are included on purpose. ``commit_worktree`` stages
+    with ``git add --all --force``, which does not consult ``.gitignore``, so an
+    ignored file can reach the commit; leaving it out of discovery would let a
+    Builder write a credential to an ignored path and have it committed without
+    any screen reading it. Discovery, screening, staging, and the recorded commit
+    therefore all describe this one set.
+    """
+
+    if not COMMIT_SHA_PATTERN.fullmatch(base_commit):
+        raise WorkspaceError(
+            "invalid-commit", f"The base commit is not a commit hash: {base_commit!r}"
+        )
+    raw = _git_bytes(path, "diff", "--name-only", "-z", base_commit)
+    names = _split_names(raw)
+    raw = _git_bytes(path, "ls-files", "--others", "-z")
+    names |= _split_names(raw)
+    return sorted(names)
+
+
+def recoverable_inventory(
+    path: Path,
+    base_commit: str,
+    *,
+    max_files: int = 200,
+    max_scan_bytes: int = 1_000_000,
+) -> tuple[str, list[dict[str, str]]]:
+    """Digest exactly the content a failed Builder left in the worktree.
+
+    The digest covers path, mode, and content of every path that differs from the
+    base commit, sorted by path, so two inspections of the same bytes agree and a
+    single byte of drift changes the value a human is asked to authorise. Nothing
+    is written, staged, committed, reset, or cleaned.
+    """
+
+    if not is_worktree(path):
+        raise WorkspaceError(
+            "workspace-missing",
+            "The task worktree is missing or is not a usable git worktree.",
+        )
+    names = changed_paths(path, base_commit)
+    if len(names) > max_files:
+        raise WorkspaceError(
+            "too-many-files", f"The recoverable change set changes more than {max_files} files."
+        )
+    entries: list[dict[str, str]] = []
+    for name in names:
+        file_path = _entry_path(path, name)
+        if not file_path.is_file():
+            entries.append({"path": name, "mode": "deleted", "sha256": ""})
+            continue
+        if file_path.stat().st_size > max_scan_bytes:
+            raise WorkspaceError(
+                "file-too-large", f"{name} is too large to inspect before recovery."
+            )
+        try:
+            payload = file_path.read_bytes()
+        except OSError as error:
+            raise WorkspaceError(
+                "unreadable-file", f"{name} could not be read: {error}"
+            ) from error
+        mode = "executable" if file_path.stat().st_mode & 0o111 else "file"
+        entries.append({"path": name, "mode": mode, "sha256": sha256_hex(payload)})
+    hasher = hashlib.sha256()
+    for entry in entries:
+        hasher.update(f"{entry['path']}\0{entry['mode']}\0{entry['sha256']}\n".encode("utf-8"))
+    return hasher.hexdigest(), entries
+
+
+def screen_change_set(
+    path: Path, names: list[str], *, max_scan_bytes: int = 1_000_000
+) -> None:
+    """Refuse a change set that contains a credential or an unscreenable file."""
+
+    for name in names:
+        if SECRET_PATH_PATTERN.search(name):
+            raise WorkspaceError(
+                "secret-path",
+                f"The change set contains a file that must never be published: {name}",
+            )
+        file_path = _entry_path(path, name)
+        if not file_path.is_file():
+            continue
+        if file_path.stat().st_size > max_scan_bytes:
+            raise WorkspaceError(
+                "file-too-large",
+                f"{name} is too large to screen before delivery.",
+            )
+        if SECRET_CONTENT_PATTERN.search(file_path.read_bytes()):
+            raise WorkspaceError(
+                "secret-content",
+                f"{name} contains content that looks like a credential.",
+            )
+
+
 def inspect_change_set(
     path: Path,
     *,
@@ -477,26 +732,9 @@ def inspect_change_set(
                 "unauthorized-path",
                 f"The reviewed commit contains a path the implementation did not report: {name}",
             )
-        if SECRET_PATH_PATTERN.search(name):
-            raise WorkspaceError(
-                "secret-path",
-                f"The reviewed commit contains a file that must never be published: {name}",
-            )
-        if entry["status"].startswith("D"):
-            continue
-        file_path = path / name
-        if not file_path.is_file():
-            continue
-        if file_path.stat().st_size > max_scan_bytes:
-            raise WorkspaceError(
-                "file-too-large",
-                f"{name} is too large to screen before delivery.",
-            )
-        if SECRET_CONTENT_PATTERN.search(file_path.read_bytes()):
-            raise WorkspaceError(
-                "secret-content",
-                f"{name} contains content that looks like a credential.",
-            )
+    screen_change_set(
+        path, [entry["path"] for entry in changes], max_scan_bytes=max_scan_bytes
+    )
 
     return ChangeSet(
         base_commit=base_commit,
@@ -522,20 +760,26 @@ __all__ = [
     "assert_disjoint",
     "assert_within",
     "changed_files",
+    "changed_paths",
     "commit_worktree",
     "create_task_workspace",
+    "current_branch",
     "diff_excerpt",
     "diff_text",
     "ensure_task_workspace",
     "head_commit",
     "inspect_change_set",
     "inventory",
+    "is_ancestor",
     "is_clean",
     "is_worktree",
+    "recoverable_inventory",
     "remove_task_workspace",
+    "resume_task_workspace",
     "resolve_commit",
     "resolve_repository_root",
     "retain_commit",
+    "screen_change_set",
     "sha256_hex",
     "task_branch_name",
     "validate_task_key",

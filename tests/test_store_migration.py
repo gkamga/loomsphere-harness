@@ -1,11 +1,13 @@
-"""The schema v1 -> v2 migration must keep every recorded row readable.
+"""Schema migrations must keep every recorded row readable.
 
 Phase 2C.1 wrote schema v1: two roles (``intake``, ``architect``) and no
 implementation tables. Phase 2C.2 needs five roles, the delivery statuses, and the
-iteration/deliverable/acceptance tables. SQLite cannot alter a ``CHECK``
-constraint, so the migration rebuilds ``tasks`` and ``runs``; these tests prove the
-rebuild preserves the recorded evidence, widens exactly the intended constraints,
-and stays fail-closed on a version it does not know.
+iteration/deliverable/acceptance tables. Phase 2C.3 adds the ``recoveries`` table
+that records a human's authorization to continue a failed Builder's work. SQLite
+cannot alter a ``CHECK`` constraint, so v1 -> v2 rebuilds ``tasks`` and ``runs``;
+these tests prove the rebuild preserves recorded evidence, that a v1 database ends
+at the current version, and that everything stays fail-closed on a version it does
+not know.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from loomsphere_harness.store import SqliteStore, StoreError
+from loomsphere_harness.store import SCHEMA_VERSION, SqliteStore, StoreError
 
 V1_SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -125,7 +127,10 @@ class Migration(unittest.TestCase):
         store = SqliteStore(self.path)
         store.check()
 
-        self.assertEqual(self._scalar("SELECT value FROM meta WHERE key='schema_version'"), "2")
+        self.assertEqual(
+            self._scalar("SELECT value FROM meta WHERE key='schema_version'"),
+            str(SCHEMA_VERSION),
+        )
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM tasks"), 1)
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM runs"), 1)
         self.assertEqual(self._scalar("SELECT status FROM tasks WHERE id=?", (TASK_ID,)), "approved")
@@ -133,7 +138,7 @@ class Migration(unittest.TestCase):
         self.assertEqual(self._scalar("SELECT response_text FROM runs WHERE id=?", (RUN_ID,)), "body")
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM proposals"), 1)
         self.assertEqual(self._scalar("SELECT COUNT(*) FROM approvals"), 1)
-        for table in ("iterations", "deliverables", "acceptances"):
+        for table in ("iterations", "deliverables", "acceptances", "recoveries"):
             self.assertEqual(
                 self._scalar("SELECT COUNT(*) FROM sqlite_master WHERE name=?", (table,)),
                 1,
@@ -201,13 +206,69 @@ class Migration(unittest.TestCase):
         store.initialize(
             repo_path="/repo", harness_root="/harness", suite_digest="suite", actor="tester"
         )
-        self.assertEqual(self._scalar("SELECT value FROM meta WHERE key='schema_version'"), "2")
+        self.assertEqual(
+            self._scalar("SELECT value FROM meta WHERE key='schema_version'"),
+            str(SCHEMA_VERSION),
+        )
 
         with self.assertRaises(StoreError) as caught:
             store.initialize(
                 repo_path="/other", harness_root="/harness", suite_digest="suite", actor="tester"
             )
         self.assertEqual(caught.exception.code, "project-mismatch")
+
+    def test_a_v2_database_gains_only_the_recovery_table(self) -> None:
+        self._v1_database()
+        SqliteStore(self.path).check()
+        # Roll the version back to what a 2C.2 database recorded, with its rows intact.
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TABLE recoveries")
+            connection.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = SqliteStore(self.path)
+        store.check()
+
+        self.assertEqual(
+            self._scalar("SELECT value FROM meta WHERE key='schema_version'"),
+            str(SCHEMA_VERSION),
+        )
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM tasks"), 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM runs"), 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM proposals"), 1)
+        self.assertEqual(
+            self._scalar("SELECT COUNT(*) FROM sqlite_master WHERE name='recoveries'"), 1
+        )
+        self.assertEqual(store.verify_audit_chain(), 0)
+
+    def test_a_recovery_record_cannot_be_rewritten_or_deleted(self) -> None:
+        self._v1_database()
+        SqliteStore(self.path).check()
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "INSERT INTO iterations (id, task_id, number, status, base_commit,"
+                " workspace_digest, created_at, updated_at) VALUES"
+                " ('I-1', ?, 1, 'failed', ?, 'd', 'now', 'now')",
+                (TASK_ID, "a" * 40),
+            )
+            connection.execute(
+                "INSERT INTO recoveries VALUES ('RC-1', ?, 'I-1', NULL, 'r', 'd', ?, ?, 's',"
+                " 'r', '[]', 'c', 'tester', 'now')",
+                (TASK_ID, "a" * 40, "b" * 40),
+            )
+            connection.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE recoveries SET actor='other' WHERE id='RC-1'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM recoveries WHERE id='RC-1'")
+        finally:
+            connection.close()
 
     def test_an_unknown_version_fails_closed_without_touching_the_database(self) -> None:
         self._v1_database(version="9")

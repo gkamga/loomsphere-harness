@@ -174,9 +174,17 @@ Delivered in phase 2C.2 (this release):
   matching evidence fails closed. `protected-pytest` is not implemented in this
   runtime; such a criterion resolves to `unsupported` and blocks acceptance
   rather than passing by default.
-- **Store schema v2:** an existing v1 SQLite state file migrates in place.
+- **Store schema v3:** an existing v1 or v2 SQLite state file migrates in place,
+  gaining the append-only `recoveries` table.
 - **Reviewer retry** (`retry-review`): one retry of only the Reviewer after an
   `invalid-review-report` failure.
+- **Builder recovery** (`inspect-recovery`, `recover-builder`): a Builder that
+  fails after writing usable files no longer strands them. The runtime screens and
+  commits the surviving work at failure time, `inspect-recovery` shows it without
+  changing anything, and `recover-builder --snapshot-digest` lets a human authorize
+  one recovery of exactly that change set. The Builder is not re-run; the recorded
+  work goes through the same validation, QA, Reviewer, and human acceptance gates,
+  and the deliverable states that no Builder report or Builder test run exists.
 
 Not delivered, and not implied by this release:
 

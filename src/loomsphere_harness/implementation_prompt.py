@@ -13,7 +13,8 @@ the same ones the Architect prompt uses, so a report parser can rely on them.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from loomsphere_harness.architect_prompt import ComposedPrompt, load_persona_text
 from loomsphere_harness.skills import SkillDocument, render_skills_block
@@ -219,6 +220,43 @@ def scope_block(
     )
 
 
+def recovery_block(recovery: Mapping[str, Any] | None) -> str:
+    """The provenance note a recovered change set carries into QA and review.
+
+    A recovered change set has no Builder report: the Builder stopped before it
+    wrote one. Rather than invent one, the stage tells QA and the Reviewer exactly
+    what exists and what does not, so neither role can be misled into quoting a
+    summary or a test run that was never recorded.
+    """
+
+    if not recovery:
+        return ""
+    files = recovery.get("changed_files") or []
+    listed = "\n".join(
+        f"- {entry['path']} ({entry['mode']}, sha256 {entry['sha256'] or 'not-tracked'})"
+        for entry in files
+        if isinstance(entry, dict) and entry.get("path")
+    ) or "- (none)"
+    detail = str(recovery.get("failure_detail") or "").strip()
+    return (
+        "## Recovery provenance\n\n"
+        "This change set was recovered from a failed Builder run and authorised "
+        "by a recorded human decision. The evidence available to you is different "
+        "from a normal iteration, and the difference is deliberate:\n\n"
+        f"- The Builder run failed with `{recovery.get('failure_reason') or 'unknown'}`"
+        f" (run `{recovery.get('builder_run_id') or 'not-recorded'}`)\n"
+        "- No Builder build report exists. Do not expect a Builder summary, a "
+        "claimed file list, or a claimed test run; none of them was recorded, and "
+        "none of them has been invented.\n"
+        "- The change set was frozen by the recovery at commit "
+        f"`{recovery.get('head_commit') or 'unknown'}` from base "
+        f"`{recovery.get('base_commit') or 'unknown'}`.\n"
+        f"- Recovered file inventory (snapshot digest `{recovery.get('snapshot_digest') or 'unknown'}`,"
+        f" recovery digest `{recovery.get('recovery_digest') or 'unknown'}`):\n\n{listed}\n\n"
+        + (f"Recorded failure detail:\n```\n{detail[:800]}\n```\n\n" if detail else "")
+    )
+
+
 def compose_builder_prompt(
     *,
     persona: str,
@@ -280,11 +318,19 @@ def compose_qa_prompt(
     validation_output: str,
     approved_criteria: Sequence[str] = (),
     skills: Sequence[SkillDocument] = (),
+    recovery: Mapping[str, Any] | None = None,
 ) -> ComposedPrompt:
     files = "\n".join(f"- {path}" for path in implementation_files) or "- (none reported)"
     command = " ".join(validation_command) or "(no validation command was executed)"
+    builder_summary = (
+        "(no Builder report exists; this change set was recovered from a failed "
+        "Builder run and authorised by a human)"
+        if recovery
+        else implementation_summary.strip()
+    )
     body = "\n\n".join(
-        [
+        part
+        for part in [
             "# Role: QA\n\n"
             "You verify one recorded implementation against its acceptance criteria "
             "before it reaches review.",
@@ -295,9 +341,10 @@ def compose_qa_prompt(
                 task_identifier=task_identifier,
                 approved_criteria=approved_criteria,
             ),
+            recovery_block(recovery),
             (
                 "## Recorded implementation\n\n"
-                f"Builder summary:\n{implementation_summary.strip()}\n\n"
+                f"Builder summary:\n{builder_summary}\n\n"
                 f"Changed files:\n{files}\n"
             ),
             f"## Diff\n\n```diff\n{diff_excerpt.strip()}\n```",
@@ -310,6 +357,7 @@ def compose_qa_prompt(
             f"## Rules\n\n{QA_RULES}",
             f"## Response contract\n\n{QA_CONTRACT}",
         ]
+        if part
     )
     return _compose(persona, body, skills)
 
@@ -330,11 +378,19 @@ def compose_reviewer_prompt(
     qa_findings: Sequence[str],
     approved_criteria: Sequence[str] = (),
     skills: Sequence[SkillDocument] = (),
+    recovery: Mapping[str, Any] | None = None,
 ) -> ComposedPrompt:
     findings = "\n".join(f"- {finding}" for finding in qa_findings) or "- (none)"
     command = " ".join(validation_command) or "(no validation command was executed)"
+    builder_summary = (
+        "(no Builder report exists; this change set was recovered from a failed "
+        "Builder run and authorised by a human)"
+        if recovery
+        else implementation_summary.strip()
+    )
     body = "\n\n".join(
-        [
+        part
+        for part in [
             "# Role: Reviewer\n\n"
             "You decide whether one recorded implementation may go to a human for "
             "final approval.",
@@ -345,9 +401,10 @@ def compose_reviewer_prompt(
                 task_identifier=task_identifier,
                 approved_criteria=approved_criteria,
             ),
+            recovery_block(recovery),
             (
                 "## Recorded implementation\n\n"
-                f"Builder summary:\n{implementation_summary.strip()}\n"
+                f"Builder summary:\n{builder_summary}\n"
             ),
             f"## Diff\n\n```diff\n{diff_excerpt.strip()}\n```",
             (
@@ -364,6 +421,7 @@ def compose_reviewer_prompt(
             f"## Rules\n\n{REVIEWER_RULES}",
             f"## Response contract\n\n{REVIEWER_CONTRACT}",
         ]
+        if part
     )
     return _compose(persona, body, skills)
 
@@ -392,5 +450,6 @@ __all__ = [
     "compose_qa_prompt",
     "compose_reviewer_prompt",
     "load_role_persona",
+    "recovery_block",
     "scope_block",
 ]

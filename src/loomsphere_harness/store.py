@@ -17,11 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 2
-#: Versions this build can open. A v1 database is migrated forward by
+try:  # pragma: no cover - the fallback exists only for platforms without POSIX locks
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+SCHEMA_VERSION = 3
+#: Versions this build can open. A v1 or v2 database is migrated forward by
 #: ``initialize``; ``check`` refuses anything else so no stage runs on data it
 #: cannot read.
-SUPPORTED_SCHEMA_VERSIONS = (1, SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, SCHEMA_VERSION)
 GENESIS = "0" * 64
 
 #: Every role that can own a run row in schema v2.
@@ -30,6 +35,14 @@ RUN_ROLES = ("intake", "architect", "builder", "qa", "reviewer")
 #: Audit event that records one authorised Reviewer-only retry. Counting these
 #: events is the durable retry limit; no schema column is needed.
 REVIEW_RETRY_EVENT = "review.retry-authorised"
+
+#: Audit event that records one human authorisation of a failed Builder's
+#: preserved change set. The row it accompanies is what the recovery reads back.
+RECOVERY_EVENT = "recovery.authorized"
+
+#: Iteration statuses a Builder recovery may claim: ``failed`` is the normal
+#: shape, ``building`` is what an interrupted process leaves behind.
+RECOVERABLE_ITERATION_STATUSES = ("failed", "building")
 
 
 class StoreError(RuntimeError):
@@ -112,6 +125,16 @@ CREATE TABLE deliverables (
   iteration_id TEXT NOT NULL REFERENCES iterations(id),
   digest TEXT NOT NULL, document TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE recoveries (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  builder_run_id TEXT REFERENCES runs(id),
+  failure_reason TEXT NOT NULL, failure_detail TEXT,
+  base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL, recovery_digest TEXT NOT NULL,
+  changed_files TEXT NOT NULL, contract_digest TEXT NOT NULL,
+  actor TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE acceptances (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
   deliverable_id TEXT NOT NULL UNIQUE REFERENCES deliverables(id),
@@ -141,6 +164,10 @@ CREATE TRIGGER acceptances_no_update BEFORE UPDATE ON acceptances
   BEGIN SELECT RAISE(ABORT, 'a delivery decision is append-only'); END;
 CREATE TRIGGER acceptances_no_delete BEFORE DELETE ON acceptances
   BEGIN SELECT RAISE(ABORT, 'a delivery decision is append-only'); END;
+CREATE TRIGGER recoveries_no_update BEFORE UPDATE ON recoveries
+  BEGIN SELECT RAISE(ABORT, 'a recovery record is immutable'); END;
+CREATE TRIGGER recoveries_no_delete BEFORE DELETE ON recoveries
+  BEGIN SELECT RAISE(ABORT, 'a recovery record cannot be deleted'); END;
 """
 
 #: Tables added by schema v2. Kept separate so the v1→v2 migration applies exactly
@@ -182,6 +209,26 @@ CREATE TRIGGER IF NOT EXISTS acceptances_no_update BEFORE UPDATE ON acceptances
   BEGIN SELECT RAISE(ABORT, 'a delivery decision is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS acceptances_no_delete BEFORE DELETE ON acceptances
   BEGIN SELECT RAISE(ABORT, 'a delivery decision is append-only'); END;
+"""
+
+#: Objects added by schema v3: the human-authorised recovery of a failed
+#: Builder's preserved change set. The row is immutable and holds the digest the
+#: human quoted, so a later stage can prove what exactly was authorised.
+V3_TABLES = """
+CREATE TABLE IF NOT EXISTS recoveries (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  builder_run_id TEXT REFERENCES runs(id),
+  failure_reason TEXT NOT NULL, failure_detail TEXT,
+  base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL, recovery_digest TEXT NOT NULL,
+  changed_files TEXT NOT NULL, contract_digest TEXT NOT NULL,
+  actor TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS recoveries_no_update BEFORE UPDATE ON recoveries
+  BEGIN SELECT RAISE(ABORT, 'a recovery record is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS recoveries_no_delete BEFORE DELETE ON recoveries
+  BEGIN SELECT RAISE(ABORT, 'a recovery record cannot be deleted'); END;
 """
 
 
@@ -316,8 +363,38 @@ class SqliteStore:
         if version == 1:
             self._migrate_v1_to_v2(connection)
             version = 2
+        if version == 2:
+            self._migrate_v2_to_v3(connection)
+            version = 3
         if version != SCHEMA_VERSION:  # pragma: no cover - unreachable by construction
             raise StoreError("state-version", "The state database version is unsupported.")
+
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        """Add the builder-recovery table without touching a recorded row.
+
+        v3 only creates objects, so unlike v1→v2 there is no table rebuild: the
+        existing evidence is read back unchanged and compared by row count.
+        """
+
+        previous = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("tasks", "runs", "iterations")
+        }
+        connection.executescript(V3_TABLES)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        for table, count in previous.items():
+            now_count = connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            if now_count != count:
+                raise StoreError(
+                    "state-corrupt", "The schema migration did not preserve every recorded row."
+                )
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         """Widen the role and status constraints and add the implementation tables.
@@ -591,7 +668,27 @@ class SqliteStore:
         return proposal_id
 
     def recover_interrupted(self, actor: str) -> list[str]:
-        """Mark runs left 'running' by a crashed process and reopen their stage."""
+        """Mark runs left 'running' by a crashed process and reopen their stage.
+
+        A stage that a live recovery is holding open is left completely alone.
+        A recovery keeps the task in a running status across its sandbox
+        validation, its QA run, and its Reviewer run, and the validation phase
+        has no run row at all, so from the outside it looks exactly like a stage
+        whose process died. The recovering process therefore holds an exclusive
+        lease on the task for the whole recovery, and any task holding a lease
+        is skipped here. The operating system releases the lease when the owning
+        process exits, including when it is killed, so a recovery that really
+        died is still repaired by the next call.
+
+        Repairing a running status with no run row at all requires positive
+        evidence that the stage was an authorised recovery claim. A normal
+        implementation has the same shape between its stages — the Builder run
+        has already succeeded while validation holds the stage, and QA has
+        already succeeded while the Reviewer prompt is composed — so repairing
+        on the shape alone would fail a live implementation whenever another
+        process happened to run ``status``. Only a ``recoveries`` row for the
+        task's current iteration identifies the runless stage as a claim.
+        """
 
         running_status = {
             "intake": ("intake_failed", "intake_running"),
@@ -602,7 +699,24 @@ class SqliteStore:
         }
         recovered: list[str] = []
         with self._tx() as db:
+            in_play = {
+                row["task_id"]
+                for row in db.execute(
+                    "SELECT DISTINCT task_id FROM runs WHERE status = 'running'"
+                ).fetchall()
+            }
+            placeholders = ",".join("?" for _ in running_status.values())
+            in_play |= {
+                row["id"]
+                for row in db.execute(
+                    f"SELECT id FROM tasks WHERE status IN ({placeholders})",
+                    tuple(running for _, running in running_status.values()),
+                ).fetchall()
+            }
+            leased = {task_id for task_id in in_play if self._recovery_in_progress(task_id)}
             for run in db.execute("SELECT id, task_id, role FROM runs WHERE status='running'").fetchall():
+                if run["task_id"] in leased:
+                    continue
                 db.execute("UPDATE runs SET status='interrupted', failure_reason='interrupted',"
                            " failure_detail='The process stopped before the run finished.',"
                            " finished_at=? WHERE id=?", (now(), run["id"]))
@@ -618,8 +732,126 @@ class SqliteStore:
                     continue
                 self._set_status(db, run["task_id"], failed, actor, (running,), "run.interrupted",
                                  {"run_id": run["id"]})
+                if run["role"] == "builder":
+                    self._close_interrupted_iteration(db, run["task_id"])
                 recovered.append(run["id"])
+            # A stage can also be claimed before its run row exists: the claim and
+            # the run are written together, but a recovery claim holds the stage
+            # open across validation. A process that stops in that window leaves a
+            # task in a running status with nothing running, which nothing else
+            # would ever reopen.
+            #
+            # Only an authorised recovery claim can be repaired this way, so the
+            # claim itself is required before anything is changed. A normal
+            # implementation is runless in exactly the same way between its
+            # stages — the Builder run has succeeded while validation runs, and QA
+            # has succeeded while the Reviewer prompt is composed — but it has no
+            # ``recoveries`` row for its current iteration. Matching on the shape
+            # alone would fail a live implementation whose validation merely
+            # overlapped another process's ``status``.
+            for failed, running in running_status.values():
+                for task in db.execute(
+                    "SELECT t.id FROM tasks t"
+                    " WHERE t.status = ?"
+                    " AND t.id NOT IN (SELECT task_id FROM runs WHERE status = 'running')"
+                    " AND EXISTS ("
+                    "  SELECT 1 FROM iterations i"
+                    "  JOIN recoveries r ON r.iteration_id = i.id"
+                    "  WHERE i.task_id = t.id"
+                    "  AND i.number = (SELECT MAX(number) FROM iterations"
+                    "                  WHERE task_id = t.id))",
+                    (running,),
+                ).fetchall():
+                    if task["id"] in leased:
+                        continue
+                    self._set_status(db, task["id"], failed, actor, (running,),
+                                     "stage.interrupted", {"run_id": None})
+                    if running == "implementation_running":
+                        self._close_interrupted_iteration(db, task["id"])
+                    recovered.append(task["id"])
         return recovered
+
+    @staticmethod
+    def _close_interrupted_iteration(db: sqlite3.Connection, task_id: str) -> None:
+        """Stop the Builder's open iteration where the interrupted run stopped.
+
+        An iteration left ``building`` by a dead process describes a stage that is
+        not running, and every recovery path requires a failed iteration, so
+        leaving it open would make the preserved work inspectable but permanently
+        unrecoverable.
+        """
+
+        db.execute(
+            "UPDATE iterations SET status = 'failed', failure_reason = 'interrupted',"
+            " failure_detail = 'The process stopped before the run finished.',"
+            " updated_at = ? WHERE task_id = ? AND status = 'building'",
+            (now(), task_id),
+        )
+
+    # -- recovery leases -------------------------------------------------------
+    def _recovery_lease_path(self, task_id: str) -> Path:
+        """Where the exclusive lease for one task's live recovery is kept."""
+
+        return self.path.with_name(f"{self.path.name}.{task_id}.recovery.lock")
+
+    def _recovery_in_progress(self, task_id: str) -> bool:
+        """Whether another process currently holds the recovery lease.
+
+        The check takes the lease and drops it again, so it observes the same
+        kernel state a recovering process depends on. It never waits.
+        """
+
+        if fcntl is None:  # pragma: no cover - POSIX-only fallback
+            return False
+        path = self._recovery_lease_path(task_id)
+        if not path.exists():
+            return False
+        try:
+            handle = open(path, "a+b")
+        except OSError:  # pragma: no cover - unreadable lock file is not a recovery
+            return False
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+        return False
+
+    @contextmanager
+    def recovery_lease(self, task_id: str) -> Iterator[None]:
+        """Hold the exclusive lease for the whole of one task's recovery.
+
+        The lease is a kernel lock, not a recorded fact: it is released the
+        moment the holding process dies, so `recover_interrupted` never has to
+        guess whether a running stage belongs to a live recovery or to a dead
+        one. Holding it is also what makes two concurrent recoveries of the same
+        task impossible rather than merely unlikely.
+        """
+
+        if fcntl is None:  # pragma: no cover - POSIX-only fallback
+            raise StoreError(
+                "recovery-unsupported",
+                "Recoveries need POSIX file locks, which this platform does not provide.",
+            )
+        path = self._recovery_lease_path(task_id)
+        try:
+            handle = open(path, "a+b")
+        except OSError as error:
+            raise StoreError(
+                "recovery-unsupported", f"The recovery lease could not be opened: {error}"
+            ) from error
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise StoreError(
+                    "recovery-active",
+                    f"Another process is already recovering task {task_id}.",
+                ) from error
+            yield
+        finally:
+            handle.close()
 
     def runs(self, task_id: str) -> list[dict[str, Any]]:
         db = self._connect()
@@ -815,6 +1047,119 @@ class SqliteStore:
                 {"iteration_id": iteration_id, "attempt": used + 1, "limit": limit, **detail},
             )
         return used + 1
+
+    def recovery(self, task_id: str) -> dict[str, Any] | None:
+        """The most recent authorisation of a failed Builder's change set."""
+
+        db = self._connect()
+        try:
+            return _row(db.execute(
+                "SELECT * FROM recoveries WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,)).fetchone(), "changed_files")
+        finally:
+            db.close()
+
+    def recovery_for_iteration(self, iteration_id: str) -> dict[str, Any] | None:
+        db = self._connect()
+        try:
+            return _row(db.execute(
+                "SELECT * FROM recoveries WHERE iteration_id = ?", (iteration_id,)
+            ).fetchone(), "changed_files")
+        finally:
+            db.close()
+
+    def recoveries(self, task_id: str) -> list[dict[str, Any]]:
+        db = self._connect()
+        try:
+            rows = db.execute(
+                "SELECT * FROM recoveries WHERE task_id = ? ORDER BY created_at", (task_id,)
+            ).fetchall()
+        finally:
+            db.close()
+        return [_row(row, "changed_files") for row in rows]  # type: ignore[misc]
+
+    def authorize_builder_recovery(
+        self, *, task_id: str, iteration_id: str, actor: str, recovery_digest: str,
+        snapshot_digest: str, base_commit: str, head_commit: str,
+        changed_files: list[dict[str, str]], contract_digest: str,
+        failure: dict[str, Any], builder_run_id: str | None, limit: int,
+    ) -> dict[str, Any]:
+        """Claim the one authorised recovery of a failed Builder, atomically.
+
+        The task status check, the per-iteration limit, the immutable recovery
+        row, the audit event, and the reopening of the iteration commit together,
+        so two concurrent recoveries cannot both proceed. The failed Builder's
+        run row, its failure reason, and the iteration's own ``failure_reason``
+        and ``failure_detail`` are never modified: the original failure stays
+        visible next to the recovery that followed it.
+        """
+
+        recovery_id = str(uuid.uuid4())
+        with self._tx() as db:
+            task = db.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task is None:
+                raise StoreError("task-not-found", f"No task {task_id}.")
+            if task["status"] != "implementation_failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Task {task_id} is {task['status']}; expected implementation_failed.",
+                )
+            used = db.execute(
+                "SELECT COUNT(*) AS n FROM recoveries WHERE iteration_id = ?", (iteration_id,)
+            ).fetchone()["n"]
+            if used >= limit:
+                raise StoreError(
+                    "recovery-exhausted",
+                    f"Iteration {iteration_id} already used its {limit} authorised recovery.",
+                )
+            cursor = db.execute(
+                "UPDATE tasks SET status = 'implementation_running', updated_at = ?"
+                " WHERE id = ? AND status = 'implementation_failed'",
+                (now(), task_id),
+            )
+            if cursor.rowcount == 0:
+                raise StoreError(
+                    "invalid-transition", f"Task {task_id} is no longer implementation_failed."
+                )
+            placeholders = ",".join("?" for _ in RECOVERABLE_ITERATION_STATUSES)
+            cursor = db.execute(
+                "UPDATE iterations SET status = 'building', updated_at = ?"
+                f" WHERE id = ? AND task_id = ? AND status IN ({placeholders})",
+                (now(), iteration_id, task_id, *RECOVERABLE_ITERATION_STATUSES),
+            )
+            if cursor.rowcount == 0:
+                raise StoreError(
+                    "invalid-transition",
+                    f"Iteration {iteration_id} is not in a recoverable state.",
+                )
+            db.execute(
+                "INSERT INTO recoveries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    recovery_id, task_id, iteration_id, builder_run_id,
+                    str(failure.get("reason") or "unknown"),
+                    failure.get("detail"), base_commit, head_commit,
+                    snapshot_digest, recovery_digest, _dump(changed_files),
+                    contract_digest, actor, now(),
+                ),
+            )
+            self._audit(
+                db, task_id, actor, RECOVERY_EVENT,
+                {
+                    "recovery_id": recovery_id,
+                    "iteration_id": iteration_id,
+                    "builder_run_id": builder_run_id,
+                    "failure_reason": failure.get("reason"),
+                    "recovery_digest": recovery_digest,
+                    "snapshot_digest": snapshot_digest,
+                    "contract_digest": contract_digest,
+                    "base_commit": base_commit,
+                    "head_commit": head_commit,
+                    "changed_files": [entry["path"] for entry in changed_files],
+                    "limit": limit,
+                    "attempt": used + 1,
+                },
+            )
+        return self.recovery_for_iteration(iteration_id)  # type: ignore[return-value]
 
     def iteration(self, task_id: str) -> dict[str, Any] | None:
         db = self._connect()
