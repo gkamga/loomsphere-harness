@@ -190,6 +190,7 @@ def loop_model(
     unreported_files: dict[str, str] | None = None,
     proposal: dict | None = None,
     builder_failures: dict[int, Exception] | None = None,
+    attempt_files: dict[int, dict[str, str]] | None = None,
 ) -> FunctionModel:
     """Answer as Intake, Architect, Builder, QA, and Reviewer, in that order.
 
@@ -227,6 +228,8 @@ def loop_model(
             files = dict(BUILT_FILES)
             files["tests/test_hello.py"] += f"# attempt {counts['builder']}\n"
             files.update(unreported_files or {})
+            if attempt_files is not None:
+                files = dict(attempt_files.get(counts["builder"], {}))
             for relative, content in files.items():
                 target = Path(worktree) / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -628,6 +631,41 @@ class ImplementationLoop(LoopCase):
         self.assertNotEqual(first["commit_sha"], second["commit_sha"])
         self.assertEqual(second["base_commit"], first["base_commit"])
         self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertIsNotNone(view["deliverable"])
+
+    def test_a_second_iteration_that_adds_a_different_file_is_committed(self) -> None:
+        # Iteration 2 stages only b.py, while the change set since the approved
+        # base is test_hello.py, a.py, and b.py. Both scopes must be honoured.
+        report = {
+            **BUILD_REPORT,
+            "files": [
+                {"path": name, "change": "add"}
+                for name in ("tests/test_hello.py", "a.py", "b.py")
+            ],
+        }
+        engine, task_id, _ = self.approved_task(
+            qa_reports=[QA_FAILED, QA_REPORT],
+            build_report=report,
+            attempt_files={
+                1: {**BUILT_FILES, "a.py": "A = 1\n"},
+                2: {"b.py": "B = 2\n"},
+            },
+        )
+
+        view = engine.implement(task_id)
+
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        first, second = view["iterations"]
+        self.assertEqual([first["status"], second["status"]], ["changes_required", "ready"])
+        worktree = engine.workspace_root / f"task-{task_id.lower()}"
+        incremental = subprocess.run(
+            ["git", "-C", str(worktree), "show", "--pretty=format:", "--name-only",
+             second["commit_sha"]],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        self.assertEqual(incremental, ["b.py"])
+        self.assertEqual(self.porcelain(worktree), "")
         self.assertIsNotNone(view["deliverable"])
 
     def test_exhausting_the_allowed_iterations_fails_the_task(self) -> None:
@@ -1539,6 +1577,82 @@ class BuilderRecovery(LoopCase):
         error = self.assertRefused(engine, task_id, digest=digest)
 
         self.assertIn("recovered on top of the wrong commit", str(error))
+
+    def interrupted_and_repaired(self):
+        engine, task_id = self.crashed_builder()
+        self.recover_interrupted_elsewhere(engine)
+        inspection = self.inspection(engine, task_id)
+        self.assertTrue(inspection["eligible"], inspection["obstacles"])
+        return engine, task_id, inspection["snapshot"]["digest"]
+
+    def assertNothingPreserved(self, engine, task_id):
+        self.assertIsNone(engine.store.iteration(task_id)["commit_sha"])
+        self.assertEqual(engine.store.recoveries(task_id), [])
+
+    def test_an_interrupted_recovery_with_a_wrong_digest_changes_nothing(self) -> None:
+        engine, task_id, _ = self.interrupted_and_repaired()
+
+        error = self.assertRefused(engine, task_id, digest="f" * 64)
+
+        self.assertIn("not the digest", str(error))
+        self.assertNothingPreserved(engine, task_id)
+
+    def test_an_interrupted_recovery_with_an_invalid_approval_changes_nothing(self) -> None:
+        engine, task_id, digest = self.interrupted_and_repaired()
+        with closing(sqlite3.connect(self.state)) as database:
+            for (name,) in database.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'approvals'"
+            ).fetchall():
+                database.execute(f'DROP TRIGGER "{name}"')
+            database.execute(
+                "UPDATE approvals SET proposal_digest = ? WHERE task_id = ?",
+                ("d" * 64, task_id),
+            )
+            database.commit()
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        error = self.assertRefused(engine, task_id, digest=digest)
+
+        self.assertIn("approval no longer matches", str(error))
+        self.assertNothingPreserved(engine, task_id)
+
+    def test_an_interrupted_recovery_on_another_branch_changes_nothing(self) -> None:
+        engine, task_id, digest = self.interrupted_and_repaired()
+        worktree = self.worktree(engine, task_id)
+        subprocess.run(
+            ["git", "-C", str(worktree), "checkout", "-q", "-b", "somewhere-else"],
+            check=True,
+        )
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(any("somewhere-else" in item for item in inspection["obstacles"]))
+        error = self.assertRefused(engine, task_id, digest=digest)
+
+        self.assertIn("somewhere-else", str(error))
+        self.assertNothingPreserved(engine, task_id)
+
+    def test_inspection_reports_an_approval_commit_that_differs(self) -> None:
+        engine, task_id, _ = self.failed_builder()
+        with closing(sqlite3.connect(self.state)) as database:
+            for (name,) in database.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'approvals'"
+            ).fetchall():
+                database.execute(f'DROP TRIGGER "{name}"')
+            database.execute(
+                "UPDATE approvals SET repo_commit = ? WHERE task_id = ?",
+                ("c" * 40, task_id),
+            )
+            database.commit()
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("wrong commit" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
 
     def test_a_worktree_on_another_branch_is_refused(self) -> None:
         """The branch is read from the worktree, not trusted from the record."""

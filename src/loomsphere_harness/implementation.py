@@ -74,6 +74,7 @@ from loomsphere_harness.workspace import (
     WorkspaceError,
     changed_paths,
     commit_worktree,
+    current_branch,
     diff_excerpt,
     ensure_task_workspace,
     inspect_change_set,
@@ -570,6 +571,22 @@ class ImplementationStage:
             )
             if blocked:
                 self._refuse_recovery(" ".join(blocked))
+            # The submitted digest is compared to the loose work before anything
+            # is committed or recorded.
+            try:
+                current_digest, _ = recoverable_inventory(
+                    workspace_path_for(engine.workspace_root, task_id),
+                    iteration["base_commit"],
+                )
+            except WorkspaceError as error:
+                self._refuse_recovery(
+                    f"The interrupted work cannot be inspected ({error.code})."
+                )
+            if current_digest != snapshot_digest:
+                self._refuse_recovery(
+                    "The supplied digest is not the digest of the work that would be "
+                    f"recovered (current snapshot {current_digest})."
+                )
             iteration = self._preserve_interrupted_work(task, iteration, builder_run)
 
         obstacles = self._recovery_obstacles(task, iteration, builder_run, None)
@@ -728,6 +745,7 @@ class ImplementationStage:
                 COMMIT_MESSAGE.format(task=task_id, number=iteration["number"])
                 + " [unfinished Builder work preserved after interruption]",
                 expected=names,
+                base_commit=base_commit,
             )
             changeset = inspect_change_set(
                 path, base_commit=base_commit, reviewed_commit=commit
@@ -995,7 +1013,52 @@ class ImplementationStage:
                 obstacles.append(
                     "The preserved worktree content differs from the recorded change set."
                 )
+        obstacles.extend(self._approval_obstacles(task, iteration))
         return obstacles
+
+    def _approval_obstacles(
+        self, task: dict[str, Any], iteration: dict[str, Any] | None
+    ) -> list[str]:
+        """Approval and worktree-branch blockers, read-only.
+
+        Shared by inspection and by recovery before any mutation, so a candidate is
+        never reported eligible, or preserved, when authorization would refuse it.
+        """
+
+        store = self.store
+        task_id = task["id"]
+        found: list[str] = []
+        proposal = store.proposal(task_id)
+        approval = store.approval(task_id)
+        if (
+            proposal is None
+            or approval is None
+            or approval["decision"] != "approved"
+            or proposal["status"] != "approved"
+            or approval["proposal_id"] != proposal["id"]
+            or approval["proposal_digest"] != proposal["digest"]
+            or _document_digest(proposal["document"]) != proposal["digest"]
+        ):
+            found.append("The original approval no longer matches the proposal.")
+        elif approval.get("repo_commit") not in (None, task["repo_commit"]):
+            found.append(
+                "The approved repository commit does not match the iteration base, so "
+                "the preserved work would be recovered on top of the wrong commit."
+            )
+        if iteration is not None and iteration.get("branch"):
+            path = workspace_path_for(self.engine.workspace_root, task_id)
+            if is_worktree(path):
+                try:
+                    actual = current_branch(path)
+                except WorkspaceError as error:
+                    found.append(f"The worktree branch cannot be read ({error.code}).")
+                else:
+                    if actual != iteration["branch"]:
+                        found.append(
+                            f"The worktree has branch {actual!r} checked out, not the "
+                            f"recorded {iteration['branch']!r}."
+                        )
+        return found
 
     @staticmethod
     def _failed_builder_run(runs: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1309,6 +1372,7 @@ class ImplementationStage:
                 workspace.path,
                 COMMIT_MESSAGE.format(task=task_id, number=number),
                 expected=expected,
+                base_commit=iteration["base_commit"],
             )
             changeset = inspect_change_set(
                 workspace.path,
@@ -1917,6 +1981,7 @@ class ImplementationStage:
                 COMMIT_MESSAGE.format(task=task_id, number=iteration["number"])
                 + " [unfinished Builder work preserved after failure]",
                 expected=names,
+                base_commit=base_commit,
             )
             changeset = inspect_change_set(path, base_commit=base_commit, reviewed_commit=commit)
         except WorkspaceError:

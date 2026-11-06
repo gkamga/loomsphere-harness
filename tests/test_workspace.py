@@ -96,7 +96,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_creating_again_preserves_the_previous_attempt(self) -> None:
         first = self.workspace()
         (first.path / "scratch.txt").write_text("attempt one\n", encoding="utf-8")
-        attempt = commit_worktree(first.path, "attempt one", expected=["scratch.txt"])
+        attempt = commit_worktree(first.path, "attempt one", expected=["scratch.txt"], base_commit=self.base)
 
         with self.assertRaises(WorkspaceError) as caught:
             self.workspace()
@@ -115,7 +115,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_replacing_requires_an_explicit_decision(self) -> None:
         first = self.workspace()
         (first.path / "scratch.txt").write_text("attempt one\n", encoding="utf-8")
-        commit_worktree(first.path, "attempt one", expected=["scratch.txt"])
+        commit_worktree(first.path, "attempt one", expected=["scratch.txt"], base_commit=self.base)
 
         second = create_task_workspace(
             self.repo, self.root, "task-1", self.base, replace_existing=True
@@ -128,7 +128,7 @@ class CreateWorkspaceTests(WorkspaceCase):
     def test_an_existing_worktree_is_reused_so_rework_builds_on_it(self) -> None:
         first = self.workspace()
         (first.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(first.path, "attempt one", expected=["change.py"])
+        attempt = commit_worktree(first.path, "attempt one", expected=["change.py"], base_commit=self.base)
 
         again = ensure_task_workspace(self.repo, self.root, "task-1", self.base)
 
@@ -160,7 +160,7 @@ class CommitTests(WorkspaceCase):
         workspace = self.workspace()
         (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-        committed = commit_worktree(workspace.path, "add hello", expected=["hello.py"])
+        committed = commit_worktree(workspace.path, "add hello", expected=["hello.py"], base_commit=self.base)
 
         self.assertNotEqual(committed, self.base)
         self.assertEqual(head_commit(workspace.path), committed)
@@ -170,7 +170,7 @@ class CommitTests(WorkspaceCase):
         workspace = self.workspace()
 
         with self.assertRaises(WorkspaceError) as caught:
-            commit_worktree(workspace.path, "nothing", expected=[])
+            commit_worktree(workspace.path, "nothing", expected=[], base_commit=self.base)
 
         self.assertEqual(caught.exception.code, "no-changes")
 
@@ -179,7 +179,7 @@ class CommitTests(WorkspaceCase):
         (workspace.path / "reported.py").write_text("VALUE = 1\n", encoding="utf-8")
 
         committed = commit_worktree(
-            workspace.path, "add reported", expected=["reported.py"]
+            workspace.path, "add reported", expected=["reported.py"], base_commit=self.base
         )
 
         self.assertEqual(
@@ -196,7 +196,7 @@ class CommitTests(WorkspaceCase):
         (workspace.path / "smuggled.py").write_text("VALUE = 2\n", encoding="utf-8")
 
         with self.assertRaises(WorkspaceError) as caught:
-            commit_worktree(workspace.path, "add screened", expected=["screened.py"])
+            commit_worktree(workspace.path, "add screened", expected=["screened.py"], base_commit=self.base)
 
         self.assertEqual(caught.exception.code, "staged-set-mismatch")
         self.assertEqual(head_commit(workspace.path), self.base)
@@ -208,7 +208,7 @@ class ChangeSetTests(WorkspaceCase):
     def reviewed(self, task_key: str = "task-1"):
         workspace = self.workspace(task_key)
         (workspace.path / "hello.py").write_text("VALUE = 1\n", encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add hello", expected=["hello.py"])
+        commit = commit_worktree(workspace.path, "add hello", expected=["hello.py"], base_commit=self.base)
         return workspace, commit
 
     def test_the_reviewed_commit_is_reported_in_full(self) -> None:
@@ -285,7 +285,7 @@ class ChangeSetTests(WorkspaceCase):
     def test_a_credential_path_blocks_delivery_even_when_reported(self) -> None:
         workspace = self.workspace()
         (workspace.path / ".env").write_text("TOKEN=placeholder\n", encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add env", expected=[".env"])
+        commit = commit_worktree(workspace.path, "add env", expected=[".env"], base_commit=self.base)
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -302,7 +302,7 @@ class ChangeSetTests(WorkspaceCase):
         (workspace.path / "credentials.txt").write_text(
             "AKIA" + "A" * 16 + "\n", encoding="utf-8"
         )
-        commit = commit_worktree(workspace.path, "add credentials", expected=["credentials.txt"])
+        commit = commit_worktree(workspace.path, "add credentials", expected=["credentials.txt"], base_commit=self.base)
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -317,7 +317,7 @@ class ChangeSetTests(WorkspaceCase):
     def test_a_file_too_large_to_screen_blocks_delivery(self) -> None:
         workspace = self.workspace()
         (workspace.path / "big.txt").write_text("x" * 2048, encoding="utf-8")
-        commit = commit_worktree(workspace.path, "add big file", expected=["big.txt"])
+        commit = commit_worktree(workspace.path, "add big file", expected=["big.txt"], base_commit=self.base)
 
         with self.assertRaises(WorkspaceError) as caught:
             inspect_change_set(
@@ -334,7 +334,7 @@ class ChangeSetTests(WorkspaceCase):
         for index in range(3):
             (workspace.path / f"file{index}.txt").write_text("x\n", encoding="utf-8")
         commit = commit_worktree(
-            workspace.path, "add files", expected=[f"file{index}.txt" for index in range(3)]
+            workspace.path, "add files", expected=[f"file{index}.txt" for index in range(3)], base_commit=self.base
         )
 
         with self.assertRaises(WorkspaceError) as caught:
@@ -367,7 +367,7 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_resuming_reports_the_worktree_that_already_exists(self) -> None:
         workspace = self.workspace()
         (workspace.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"])
+        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"], base_commit=self.base)
 
         resumed = resume_task_workspace(self.root, "task-1")
 
@@ -378,7 +378,7 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_changed_paths_sees_committed_and_untracked_work(self) -> None:
         workspace = self.workspace()
         (workspace.path / "committed.py").write_text("VALUE = 1\n", encoding="utf-8")
-        commit_worktree(workspace.path, "attempt one", expected=["committed.py"])
+        commit_worktree(workspace.path, "attempt one", expected=["committed.py"], base_commit=self.base)
         (workspace.path / "untracked.py").write_text("VALUE = 2\n", encoding="utf-8")
 
         self.assertEqual(
@@ -483,7 +483,7 @@ class RecoveryInventoryTests(WorkspaceCase):
     def test_ancestry_is_checked_against_the_approved_base(self) -> None:
         workspace = self.workspace()
         (workspace.path / "change.py").write_text("VALUE = 1\n", encoding="utf-8")
-        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"])
+        attempt = commit_worktree(workspace.path, "attempt one", expected=["change.py"], base_commit=self.base)
 
         self.assertTrue(is_ancestor(workspace.path, self.base, attempt))
         self.assertFalse(is_ancestor(workspace.path, attempt, self.base))

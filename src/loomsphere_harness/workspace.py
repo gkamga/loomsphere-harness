@@ -399,12 +399,17 @@ def _split_names(raw: bytes) -> set[str]:
     return {item.decode("utf-8", "replace") for item in raw.split(b"\0") if item}
 
 
-def commit_worktree(path: Path, message: str, *, expected: list[str]) -> str:
+def commit_worktree(
+    path: Path, message: str, *, expected: list[str], base_commit: str
+) -> str:
     """Stage exactly the screened paths and record one commit. Returns the new HEAD.
 
-    ``expected`` is the set of paths discovery reported and `screen_change_set`
-    approved, and it is not advisory: staging and the recorded commit must both
-    contain that exact set. `git add --all --force` writes ignored files to the
+    ``expected`` is the cumulative set of paths that differ from ``base_commit``,
+    as discovery reported and `screen_change_set` approved. It is not advisory:
+    after staging, the index must differ from the base by exactly that set. The
+    commit itself is incremental (index against HEAD), so a second Builder
+    iteration that sits on top of an earlier commit is legitimate; the recorded
+    commit must contain exactly what was staged. `git add --all --force` writes ignored files to the
     index, so a caller that screened only the non-ignored files would otherwise
     commit material no screen ever read. A mismatch unstages the worktree, leaves
     every file on disk untouched, and fails closed.
@@ -418,20 +423,23 @@ def commit_worktree(path: Path, message: str, *, expected: list[str]) -> str:
     staged = _split_names(
         _git_bytes(path, "diff", "--cached", "--name-only", "-z")
     )
+    cumulative = _split_names(
+        _git_bytes(path, "diff", "--cached", "--name-only", "-z", base_commit)
+    )
     if not staged:
         raise WorkspaceError(
             "no-changes",
             "The Builder left the worktree unmodified; nothing could be committed.",
         )
-    if staged != wanted:
+    if cumulative != wanted:
         # Unstaging does not touch the working tree, so the work is still there
         # for a human to look at; only the index is reset.
         _git(path, "reset", "-q")
         raise WorkspaceError(
             "staged-set-mismatch",
             "The staged change set is not the set that was screened "
-            f"({len(staged)} staged, {len(wanted)} screened: "
-            f"unscreened {sorted(staged - wanted)}, missing {sorted(wanted - staged)}).",
+            f"({len(cumulative)} staged, {len(wanted)} screened: "
+            f"unscreened {sorted(cumulative - wanted)}, missing {sorted(wanted - cumulative)}).",
         )
     _git(path, *GIT_IDENTITY, "commit", "--no-verify", "-m", message)
 
@@ -440,12 +448,12 @@ def commit_worktree(path: Path, message: str, *, expected: list[str]) -> str:
     committed = _split_names(
         _git_bytes(path, "show", "--pretty=format:", "--name-only", "-z", "HEAD")
     )
-    if committed != wanted:
+    if committed != staged:
         raise WorkspaceError(
             "committed-set-mismatch",
             "The recorded commit does not contain the screened change set "
-            f"(committed {len(committed)}, screened {len(wanted)}: "
-            f"unscreened {sorted(committed - wanted)}, missing {sorted(wanted - committed)}).",
+            f"(committed {len(committed)}, staged {len(staged)}: "
+            f"unscreened {sorted(committed - staged)}, missing {sorted(staged - committed)}).",
         )
     return head_commit(path)
 
