@@ -2,20 +2,26 @@
 
 Each stage answers with one fenced ``json`` payload. This module turns that text
 into a typed, validated record: an unreadable, ambiguous, or incomplete report is a
-contract failure, never a silent partial success. The parsers share
-``extract_payload`` with the Architect, so a quoted example inside the prose cannot
-override the payload the model actually declared.
+contract failure, never a silent partial success. Payload selection is shared with
+the Architect and the Intake, so a quoted example inside the prose cannot override
+the payload the model actually declared, and two candidate reports are refused
+rather than silently ranked.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
-from loomsphere_harness.schemas.architect_proposal import extract_payload
+from loomsphere_harness.schemas.architect_proposal import (
+    PAYLOAD_AMBIGUOUS,
+    ProposalValidationError,
+    select_payload,
+)
 
 REPORT_SCHEMA_VERSION = "1.0.0"
 
@@ -148,6 +154,33 @@ def _text_list(payload: dict[str, Any], key: str) -> list[str]:
     return [item.strip() for item in value if item.strip()]
 
 
+def _entry_text(entry: dict[str, Any], key: str, *, context: str,
+                required: bool = False) -> str:
+    """Read one nested field strictly: a wrong type is a contract failure.
+
+    Stringifying whatever the model sent would record a report the agent did not
+    mean, so a non-string value is refused instead of coerced.
+    """
+
+    if key not in entry:
+        if required:
+            raise ReportError(
+                "report-invalid", f"{context} is missing the required field {key!r}."
+            )
+        return ""
+    value = entry[key]
+    if not isinstance(value, str):
+        raise ReportError(
+            "report-invalid", f"{context} field {key!r} must be a string."
+        )
+    stripped = value.strip()
+    if required and not stripped:
+        raise ReportError(
+            "report-invalid", f"{context} field {key!r} must not be empty."
+        )
+    return stripped
+
+
 def _relative_path(raw: str) -> str:
     """A reported path must stay inside the worktree and stay a plain path."""
 
@@ -168,9 +201,12 @@ def _relative_path(raw: str) -> str:
 
 
 def _criteria(payload: dict[str, Any]) -> list[CriterionClaim]:
-    raw = payload.get("acceptance_criteria", [])
-    if raw is None:
-        return []
+    if "acceptance_criteria" not in payload:
+        raise ReportError(
+            "report-invalid",
+            "The report is missing the required field 'acceptance_criteria'.",
+        )
+    raw = payload["acceptance_criteria"]
     if not isinstance(raw, list):
         raise ReportError(
             "report-invalid", "acceptance_criteria must be a list of objects."
@@ -186,28 +222,26 @@ def _criteria(payload: dict[str, Any]) -> list[CriterionClaim]:
             raise ReportError(
                 "report-invalid", "Each acceptance criterion must be an object."
             )
-        identifier = str(entry.get("criterion_id", "")).strip()
-        if not identifier:
-            raise ReportError(
-                "report-invalid", "Each acceptance criterion needs a criterion_id."
-            )
-        status = str(entry.get("status", "")).strip().lower()
+        identifier = _entry_text(
+            entry, "criterion_id", context="An acceptance criterion", required=True
+        )
+        context = f"Criterion {identifier!r}"
+        status = _entry_text(entry, "status", context=context, required=True).lower()
         if status not in CRITERION_STATUSES:
             raise ReportError(
-                "report-invalid",
-                f"Criterion {identifier!r} has an unknown status {status!r}.",
+                "report-invalid", f"{context} has an unknown status {status!r}."
             )
         if identifier in seen:
             raise ReportError(
-                "report-invalid", f"Criterion {identifier!r} is reported twice."
+                "report-invalid", f"{context} is reported twice."
             )
         seen.add(identifier)
         claims.append(
             CriterionClaim(
                 criterion_id=identifier,
-                criterion=str(entry.get("criterion", "")).strip(),
+                criterion=_entry_text(entry, "criterion", context=context),
                 status=status,
-                evidence=str(entry.get("evidence", "")).strip(),
+                evidence=_entry_text(entry, "evidence", context=context),
             )
         )
     return claims
@@ -225,19 +259,18 @@ def _findings(payload: dict[str, Any]) -> list[Finding]:
     for entry in raw:
         if not isinstance(entry, dict):
             raise ReportError("report-invalid", "Each finding must be an object.")
-        severity = str(entry.get("severity", "")).strip().lower()
+        severity = _entry_text(entry, "severity", context="A finding").lower()
         if severity not in SEVERITIES:
             raise ReportError(
                 "report-invalid", f"A finding has an unknown severity {severity!r}."
             )
-        description = str(entry.get("description", "")).strip()
-        if not description:
-            raise ReportError("report-invalid", "A finding needs a description.")
+        description = _entry_text(entry, "description", context="A finding",
+                                  required=True)
         findings.append(
             Finding(
                 severity=severity,
                 description=description,
-                evidence=str(entry.get("evidence", "")).strip(),
+                evidence=_entry_text(entry, "evidence", context="A finding"),
             )
         )
     return findings
@@ -255,30 +288,55 @@ def _files(payload: dict[str, Any]) -> list[ChangedFileClaim]:
     for entry in raw:
         if not isinstance(entry, dict):
             raise ReportError("report-invalid", "Each file entry must be an object.")
-        path = _relative_path(str(entry.get("path", "")))
+        path = _relative_path(
+            _entry_text(entry, "path", context="A file entry", required=True)
+        )
         files.append(
             ChangedFileClaim(
-                path=path, change=str(entry.get("change", "")).strip()
+                path=path,
+                change=_entry_text(entry, "change", context="A file entry"),
             )
         )
     return files
 
 
-def _payload(text: str, *, role: str) -> dict[str, Any]:
+def _build_shape(payload: dict[str, Any]) -> bool:
+    """Whether an object has the shape of a build report rather than an example."""
+
+    return (
+        isinstance(payload.get("summary"), str)
+        and isinstance(payload.get("acceptance_criteria"), list)
+    )
+
+
+def _verdict_shape(payload: dict[str, Any]) -> bool:
+    """Whether an object has the shape of a QA report or a review verdict."""
+
+    return (
+        isinstance(payload.get("verdict"), str)
+        and isinstance(payload.get("summary"), str)
+        and isinstance(payload.get("acceptance_criteria"), list)
+    )
+
+
+def _payload(
+    text: str, *, role: str, matches: Callable[[dict[str, Any]], bool]
+) -> dict[str, Any]:
+    """The one payload the response declares, or a classified contract failure."""
+
     try:
-        return extract_payload(text)
-    except Exception as error:  # noqa: BLE001 - normalised into one contract failure
-        raise ReportError(
-            "report-unreadable",
-            f"The {role} response did not contain a JSON object: {error}",
-        ) from error
+        candidate = select_payload(text, role=role, matches=matches)
+    except ProposalValidationError as error:
+        code = "report-ambiguous" if error.code == PAYLOAD_AMBIGUOUS else "report-unreadable"
+        raise ReportError(code, error.message) from error
+    return candidate.payload
 
 
 # -- parsers -------------------------------------------------------------------
 
 
 def parse_build_report(text: str) -> BuildReport:
-    payload = _payload(text, role="Builder")
+    payload = _payload(text, role="Builder", matches=_build_shape)
     return BuildReport(
         summary=_text(payload, "summary"),
         files=_files(payload),
@@ -290,7 +348,7 @@ def parse_build_report(text: str) -> BuildReport:
 
 
 def parse_qa_report(text: str) -> QaReport:
-    payload = _payload(text, role="QA")
+    payload = _payload(text, role="QA", matches=_verdict_shape)
     verdict = _text(payload, "verdict").lower()
     if verdict not in QA_VERDICTS:
         raise ReportError(
@@ -307,7 +365,7 @@ def parse_qa_report(text: str) -> QaReport:
 
 
 def parse_review_verdict(text: str) -> ReviewVerdict:
-    payload = _payload(text, role="Reviewer")
+    payload = _payload(text, role="Reviewer", matches=_verdict_shape)
     verdict = _text(payload, "verdict").lower()
     if verdict not in REVIEW_VERDICTS:
         raise ReportError(

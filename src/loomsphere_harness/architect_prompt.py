@@ -302,11 +302,45 @@ def compose_architect_prompt(
     )
 
 
+#: The most a parser complaint may add to the correction prompt.
+FORMAT_CORRECTION_EXCERPT_CHARS = 800
+
+
+def with_format_correction(
+    composed: ComposedPrompt, *, role: str, detail: str
+) -> ComposedPrompt:
+    """Return the same request plus the exact reason the last answer was refused.
+
+    Recovery from a formatting mistake is a prompt problem, not a new decision: the
+    original request is unchanged, and only the structural complaint is appended.
+    The correction text is deterministic, so its digest is recordable evidence.
+    """
+
+    excerpt = " ".join(str(detail).split())[:FORMAT_CORRECTION_EXCERPT_CHARS]
+    section = (
+        "\n\n## Format correction\n"
+        f"The previous reply was refused because it was not a valid {role} document.\n"
+        f"The parser reported: {excerpt}\n"
+        "Answer the same request again. Decide the same thing you already decided and "
+        "correct only the structure, the field names, and the types the contract "
+        "requires. Reply with exactly one fenced json block and nothing else: no second "
+        "JSON object, no restated example, and no prose before or after it."
+    )
+    text = composed.text.rstrip() + section + "\n"
+    return ComposedPrompt(
+        text=text,
+        digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        persona_digest=composed.persona_digest,
+    )
+
+
 __all__ = [
     "ArchitectPromptError",
     "ComposedPrompt",
+    "FORMAT_CORRECTION_EXCERPT_CHARS",
     "compose_architect_prompt",
     "intake_block",
     "load_persona",
     "load_persona_text",
+    "with_format_correction",
 ]

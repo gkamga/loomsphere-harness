@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -19,9 +21,21 @@ from loomsphere_harness.schemas.acceptance_contract import AcceptanceVerificatio
 FENCED_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL)
 REVISION_REASON_MAX_LENGTH = 2_000
 
+#: Why a response was not accepted as a structured document. The vocabulary is
+#: shared by every role so a recorded failure says *which kind* of problem the
+#: response had, and so the one bounded format-correction retry can name it back.
+PAYLOAD_MISSING = "payload-missing"
+PAYLOAD_AMBIGUOUS = "payload-ambiguous"
+PAYLOAD_INVALID = "payload-invalid"
+
 
 class ProposalValidationError(ValueError):
     """The agent response did not contain a valid scope proposal."""
+
+    def __init__(self, message: str, *, code: str = PAYLOAD_INVALID) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class ProposalComponent(BaseModel):
@@ -256,6 +270,95 @@ def payload_candidates(text: str) -> list[str]:
     ]
 
 
+@dataclass(frozen=True)
+class PayloadCandidate:
+    """One JSON object a response offers, with where it was found."""
+
+    payload: dict[str, Any]
+    source: str
+    text: str
+
+
+def _canonical_payload_key(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      default=str)
+
+
+def _as_object(raw: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def payload_objects(text: str) -> list[PayloadCandidate]:
+    """Every distinct JSON object a response offers, most trustworthy first.
+
+    Fenced blocks are the agent's declared answer and come first, last block
+    first, exactly as :func:`payload_candidates` orders them. Prose spans are only
+    a fallback for a response that fences nothing parseable. Byte-identical
+    repeats collapse, because a restated object is not a second answer.
+    """
+
+    candidates: list[PayloadCandidate] = []
+    seen: set[str] = set()
+
+    def offer(source: str, raw: str) -> None:
+        payload = _as_object(raw)
+        if payload is None:
+            return
+        key = _canonical_payload_key(payload)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(PayloadCandidate(payload=payload, source=source, text=raw))
+
+    fenced = [match.group(1) for match in FENCED_BLOCK_PATTERN.finditer(text)]
+    for raw in reversed(fenced):
+        offer("fenced", raw)
+    if candidates:
+        return candidates
+    for raw in reversed(_balanced_objects(text)):
+        offer("document", raw)
+    return candidates
+
+
+def select_payload(
+    text: str,
+    *,
+    role: str,
+    matches: Callable[[dict[str, Any]], bool],
+) -> PayloadCandidate:
+    """Pick the one object that can be the role's document, or fail closed.
+
+    A response is accepted only when exactly one object could be the document and
+    it is the one the agent declared. Two different documents, or a declared
+    object that is not a document while another object is, is ambiguity: choosing
+    one would silently record a report the agent may not have meant.
+    """
+
+    candidates = payload_objects(text)
+    if not candidates:
+        raise ProposalValidationError(
+            f"The {role} response did not contain a JSON object.", code=PAYLOAD_MISSING
+        )
+    matching = [candidate for candidate in candidates if matches(candidate.payload)]
+    if len(matching) > 1:
+        raise ProposalValidationError(
+            f"The {role} response contains {len(matching)} different documents that could "
+            "each be the answer; reply with exactly one.",
+            code=PAYLOAD_AMBIGUOUS,
+        )
+    if matching and matching[0] is not candidates[0]:
+        raise ProposalValidationError(
+            f"The {role} response declares a JSON object that is not a {role} document and "
+            "also contains one that is; reply with exactly one document.",
+            code=PAYLOAD_AMBIGUOUS,
+        )
+    return candidates[0]
+
+
 def extract_payload(text: str) -> dict[str, Any]:
     for candidate in payload_candidates(text):
         try:
@@ -266,14 +369,24 @@ def extract_payload(text: str) -> dict[str, Any]:
             return payload
 
     raise ProposalValidationError(
-        "The agent response did not contain a JSON object."
+        "The agent response did not contain a JSON object.", code=PAYLOAD_MISSING
+    )
+
+
+def is_proposal_payload(payload: dict[str, Any]) -> bool:
+    """Whether an object has the shape of a scope proposal rather than an example."""
+
+    return (
+        isinstance(payload.get("summary"), str)
+        and isinstance(payload.get("components"), list)
+        and isinstance(payload.get("acceptance_criteria_mapping"), list)
     )
 
 
 def parse_architect_proposal(text: str) -> ArchitectProposal:
-    payload = extract_payload(text)
+    candidate = select_payload(text, role="Architect", matches=is_proposal_payload)
     try:
-        return ArchitectProposal.model_validate(payload)
+        return ArchitectProposal.model_validate(candidate.payload)
     except Exception as error:  # pydantic.ValidationError
         raise ProposalValidationError(
             f"The scope proposal did not match the contract: {error}"
@@ -336,16 +449,23 @@ def revision_coverage_error(
 
 
 __all__ = [
+    "PAYLOAD_AMBIGUOUS",
+    "PAYLOAD_INVALID",
+    "PAYLOAD_MISSING",
     "ArchitectProposal",
     "ArchitectRevisionCriterion",
     "ArchitectRevisionRequest",
+    "PayloadCandidate",
     "ProposalComponent",
     "ProposalCriterion",
     "ProposalValidationError",
     "canonical_proposal",
     "extract_payload",
+    "is_proposal_payload",
     "parse_architect_proposal",
     "payload_candidates",
+    "payload_objects",
     "proposal_digest",
     "revision_coverage_error",
+    "select_payload",
 ]

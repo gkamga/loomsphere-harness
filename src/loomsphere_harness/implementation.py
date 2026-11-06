@@ -53,6 +53,7 @@ from loomsphere_harness.reports import (
     unmet_criteria,
 )
 from loomsphere_harness.schemas.architect_proposal import extract_payload
+from loomsphere_harness.architect_prompt import with_format_correction
 from loomsphere_harness.schemas.acceptance_contract import (
     AcceptanceContract,
     AcceptanceContractError,
@@ -104,6 +105,13 @@ MAX_REVIEW_RETRIES = 1
 REASON_REVIEW_RETRY_REFUSED = "review-retry-refused"
 #: Verdicts that already carry a Reviewer decision; they are never re-asked.
 ADVERSE_VERDICTS = ("rejected", "changes-required")
+
+#: A QA report-format failure may be corrected this many times per iteration, in
+#: the same iteration and against the same recorded evidence. A corrected report
+#: that is merely adverse is a decision, not a format failure, and is never
+#: re-asked. The bound is a constant so no configuration can lengthen it.
+MAX_QA_FORMAT_ATTEMPTS = 2
+QA_FORMAT_RETRY_EVENT = "iteration.qa-format-retry"
 
 #: A failed Builder's preserved change set may be recovered this many times per
 #: iteration. Authorization is recorded, so the limit survives a restart.
@@ -1448,24 +1456,57 @@ class ImplementationStage:
             iteration_id=iteration_id, actor=actor, event="iteration.qa-started",
             fields={"status": ITERATION_QA_RUNNING}, detail={"iteration": number},
         )
-        qa_outcome = engine.invoke_role(
-            task=task, role=QA, composed=qa_prompt, selection=selection,
-            expect=("implementation_running",), running="qa_running",
-            failed="qa_failed", workspace_path=workspace.path, writable=False,
-        )
-        if not qa_outcome.succeeded:
-            return self._failed_run(qa_outcome, task_id, iteration_id, running="implementation_running")
-
-        try:
-            qa = parse_qa_report(qa_outcome.response_text)
-        except ReportError as error:
-            self._fail_run(
-                qa_outcome, task_id, running="qa_running", failed="qa_failed",
-                reason=REASON_INVALID_QA_REPORT, detail=error.message,
+        # QA may be asked once more when its answer is unreadable. The evidence it
+        # reads, the change set, and the contract are unchanged: only the complaint
+        # about the answer's structure is added, so a second answer cannot be a
+        # second opinion manufactured out of new material. An adverse verdict is a
+        # decision and is never re-asked.
+        qa_outcome: RoleOutcome | None = None
+        qa: QaReport | None = None
+        qa_prompt_current = qa_prompt
+        qa_expect: tuple[str, ...] = ("implementation_running",)
+        for attempt in range(1, MAX_QA_FORMAT_ATTEMPTS + 1):
+            qa_outcome = engine.invoke_role(
+                task=task, role=QA, composed=qa_prompt_current, selection=selection,
+                expect=qa_expect, running="qa_running",
+                failed="qa_failed", workspace_path=workspace.path, writable=False,
             )
-            return self._record_failure(
-                task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
-                detail=error.message, expect=None, iteration_status=ITERATION_QA_FAILED,
+            if not qa_outcome.succeeded:
+                return self._failed_run(
+                    qa_outcome, task_id, iteration_id, running="implementation_running"
+                )
+            try:
+                qa = parse_qa_report(qa_outcome.response_text)
+            except ReportError as error:
+                self._fail_run(
+                    qa_outcome, task_id, running="qa_running", failed="qa_failed",
+                    reason=REASON_INVALID_QA_REPORT, detail=error.message,
+                )
+                if attempt == MAX_QA_FORMAT_ATTEMPTS:
+                    return self._record_failure(
+                        task_id, iteration_id, reason=REASON_INVALID_QA_REPORT,
+                        detail=error.message, expect=None, iteration_status=ITERATION_QA_FAILED,
+                    )
+                # The refused answer stays recorded on its own run; the correction
+                # is a separate run, and the audit trail says why it exists.
+                self.store.audit(
+                    task_id, actor, QA_FORMAT_RETRY_EVENT,
+                    {
+                        "iteration_id": iteration_id, "attempt": attempt,
+                        "max_attempts": MAX_QA_FORMAT_ATTEMPTS,
+                        "failed_run_id": qa_outcome.run_id, "code": error.code,
+                        "remedy": "format-correction",
+                    },
+                )
+                qa_expect = ("qa_failed",)
+                qa_prompt_current = with_format_correction(
+                    qa_prompt, role="QA", detail=error.message
+                )
+                continue
+            break
+        if qa is None or qa_outcome is None:  # pragma: no cover - the loop assigns both
+            raise EngineError(
+                REASON_INVALID_QA_REPORT, "The QA report could not be recorded."
             )
         self.store.succeed_run(
             run_id=qa_outcome.run_id, response_text=qa_outcome.response_text,
@@ -2068,7 +2109,9 @@ __all__ = [
     "DELIVERABLE_SCHEMA_VERSION",
     "ImplementationStage",
     "MAX_BUILDER_RECOVERIES",
+    "MAX_QA_FORMAT_ATTEMPTS",
     "MAX_REVIEW_RETRIES",
+    "QA_FORMAT_RETRY_EVENT",
     "RECOVERABLE_FAILURES",
     "REASON_BUILDER_INTERRUPTED",
     "REASON_RECOVERY_ELIGIBLE",
