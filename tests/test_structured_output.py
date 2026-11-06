@@ -40,7 +40,9 @@ from loomsphere_harness.architect_prompt import (  # noqa: E402
     with_format_correction,
 )
 from loomsphere_harness.reports import (  # noqa: E402
+    REQUIRED_ARRAYS,
     ReportError,
+    declared_verdict,
     parse_build_report,
     parse_qa_report,
     parse_review_verdict,
@@ -96,6 +98,112 @@ def sequence_model(*, intake: list[str] | None = None,
         return ModelResponse(parts=[TextPart(next_text(name, default))])
 
     return FunctionModel(respond)
+
+
+class RequiredFields(unittest.TestCase):
+    """An omitted array is not the same answer as an explicit empty one."""
+
+    CASES = (
+        (parse_build_report, BUILD_REPORT, "Builder"),
+        (parse_qa_report, QA_REPORT, "QA"),
+        (parse_review_verdict, REVIEW_VERDICT, "Reviewer"),
+    )
+
+    def refused(self, parser, text: str) -> ReportError:
+        with self.assertRaises(ReportError) as raised:
+            parser(text)
+        return raised.exception
+
+    def test_every_declared_array_is_actually_required(self) -> None:
+        # "The agent found nothing" and "the agent never answered the field" are
+        # different claims, and only the first is evidence the gate may rely on.
+        for parser, payload, role in self.CASES:
+            for key in REQUIRED_ARRAYS[role]:
+                with self.subTest(role=role, field=key):
+                    trimmed = {name: value for name, value in payload.items()
+                               if name != key}
+                    error = self.refused(parser, fenced(trimmed))
+                    self.assertIn(error.code, ("report-invalid", "report-unreadable"))
+
+    def test_a_missing_findings_array_is_refused_by_name(self) -> None:
+        for parser, payload, role in self.CASES[1:]:
+            with self.subTest(role=role):
+                trimmed = {name: value for name, value in payload.items()
+                           if name != "findings"}
+                message = self.refused(parser, fenced(trimmed)).message
+                self.assertIn("'findings'", message)
+                self.assertIn("[]", message)
+
+    def test_a_missing_build_file_list_is_refused_by_name(self) -> None:
+        trimmed = {name: value for name, value in BUILD_REPORT.items()
+                   if name != "files"}
+        message = self.refused(parse_build_report, fenced(trimmed)).message
+        self.assertIn("'files'", message)
+
+    def test_an_explicit_empty_array_is_preserved_as_the_answer(self) -> None:
+        self.assertEqual(
+            parse_build_report(fenced({**BUILD_REPORT, "files": []})).files, []
+        )
+        self.assertEqual(
+            parse_build_report(fenced({**BUILD_REPORT, "tests_run": [], "notes": []})).tests_run,
+            [],
+        )
+        self.assertEqual(
+            parse_qa_report(
+                fenced({**QA_REPORT, "findings": [], "residual_risks": []})
+            ).findings,
+            [],
+        )
+        self.assertEqual(
+            parse_review_verdict(
+                fenced({**REVIEW_VERDICT, "findings": [], "follow_ups": []})
+            ).follow_ups,
+            [],
+        )
+
+    def test_a_report_that_omits_its_findings_never_becomes_clean_evidence(self) -> None:
+        # A parsed report is what the gate trusts, so the omission must never be
+        # laundered into "no findings" on the way in.
+        silent = {name: value for name, value in QA_REPORT.items()
+                  if name != "findings"}
+        with self.assertRaises(ReportError):
+            parse_qa_report(fenced(silent))
+        clean = parse_qa_report(fenced({**QA_REPORT, "findings": []}))
+        self.assertEqual(clean.blocking_findings, [])
+        self.assertEqual(clean.verdict, "passed")
+
+
+class DeclaredVerdict(unittest.TestCase):
+    """What an answer decided is read from its payload, never from its prose."""
+
+    def test_a_declared_verdict_is_read_whatever_its_case(self) -> None:
+        self.assertEqual(
+            declared_verdict(fenced({**QA_REPORT, "verdict": "FAILED"}), role="qa"),
+            "failed",
+        )
+        self.assertEqual(
+            declared_verdict(fenced(REVIEW_VERDICT), role="Reviewer"), "accepted"
+        )
+        self.assertEqual(
+            declared_verdict(fenced({**QA_REPORT, "verdict": "passed"}), role="QA"),
+            "passed",
+        )
+
+    def test_a_broken_payload_still_declares_its_verdict(self) -> None:
+        # The body is wrong; the decision is not. That is exactly the case the
+        # runtime must not ask again, so the verdict has to survive the failure.
+        broken = fenced({**QA_REPORT, "verdict": "failed",
+                         "findings": [{"severity": "info", "description": "x"}]})
+        with self.assertRaises(ReportError):
+            parse_qa_report(broken)
+        self.assertEqual(declared_verdict(broken, role="qa"), "failed")
+
+    def test_prose_is_never_read_as_a_verdict(self) -> None:
+        prose = "I would have failed this change. The verdict is failed."
+        self.assertIsNone(declared_verdict(prose, role="qa"))
+        self.assertIsNone(declared_verdict(fenced({**QA_REPORT, "verdict": "lgtm"}),
+                                          role="qa"))
+        self.assertIsNone(declared_verdict(fenced({**QA_REPORT, "verdict": 1}), role="qa"))
 
 
 class ReportClassification(unittest.TestCase):
@@ -344,6 +452,36 @@ class QaCorrection(LoopCase):
         self.assertEqual(self.qa_runs(view)[-1]["status"], "succeeded")
         self.assertEqual(view["iterations"][0]["qa_report"]["verdict"], "failed")
         self.assertEqual([run["role"] for run in view["runs"]][-1], "qa")
+
+    def test_an_adverse_verdict_is_never_re_asked_for_a_better_one(self) -> None:
+        # The first answer declares `failed` and gets a finding severity wrong. The
+        # formatting problem is not a reason to ask again: a second answer could
+        # only reverse the decision, so the refusal is final and the scripted
+        # `passed` answer behind it is never consumed.
+        malformed_failure = {
+            "verdict": "failed",
+            "summary": "The route is not registered.",
+            "findings": [{"severity": "info", "description": "No route."}],
+            "acceptance_criteria": QA_REPORT["acceptance_criteria"],
+            "residual_risks": [],
+        }
+        engine, task_id, _ = self.approved_task(
+            qa_reports=[malformed_failure, QA_REPORT]
+        )
+
+        view = engine.implement(task_id)
+
+        self.assertEqual([run["role"] for run in view["runs"]],
+                         ["intake", "architect", "builder", "qa"])
+        self.assertEqual(len(self.qa_runs(view)), 1)
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "invalid-qa-report")
+        self.assertIn("declared the verdict 'failed'", view["implementation"]["detail"])
+        self.assertEqual(view["task"]["status"], "qa_failed")
+        self.assertEqual(view["iterations"][0]["status"], "qa_failed")
+        self.assertIsNone(view["iterations"][0].get("qa_report"))
+        events = [entry["event"] for entry in view["audit"]]
+        self.assertNotIn("iteration.qa-format-retry", events)
 
 
 class BuilderIsNeverRerun(LoopCase):

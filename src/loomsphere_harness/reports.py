@@ -20,6 +20,7 @@ from typing import Any
 from loomsphere_harness.schemas.architect_proposal import (
     PAYLOAD_AMBIGUOUS,
     ProposalValidationError,
+    payload_objects,
     select_payload,
 )
 
@@ -33,6 +34,22 @@ REVIEW_VERDICTS = frozenset({"accepted", "changes-required", "rejected"})
 TEXT_MAX_LENGTH = 4_000
 LIST_MAX_ITEMS = 200
 MAX_CLAIMED_FILES = 200
+
+#: Top-level arrays each role's documented response contract declares. An omitted
+#: array is a contract failure, because the gate cannot tell "the agent found
+#: nothing" from "the agent never answered the field", and reading the second as
+#: the first turns a missing answer into clean evidence. An explicit ``[]`` is a
+#: real answer and is preserved exactly as sent.
+#:
+#: Nested fields stay optional and are documented where they are read: ``evidence``
+#: on a finding or a criterion claim, and ``change`` on a file entry. Both add
+#: detail to a value the report already asserts, so their absence cannot make an
+#: unsatisfied criterion look satisfied.
+REQUIRED_ARRAYS: dict[str, tuple[str, ...]] = {
+    "Builder": ("files", "acceptance_criteria", "tests_run", "notes"),
+    "QA": ("findings", "acceptance_criteria", "residual_risks"),
+    "Reviewer": ("findings", "acceptance_criteria", "follow_ups"),
+}
 
 
 class ReportError(RuntimeError):
@@ -142,16 +159,38 @@ def _text(payload: dict[str, Any], key: str, *, required: bool = True) -> str:
 
 
 def _text_list(payload: dict[str, Any], key: str) -> list[str]:
-    value = payload.get(key, [])
-    if value is None:
-        return []
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    raw = _declared_array(payload, key)
+    if not all(isinstance(item, str) for item in raw):
         raise ReportError(
             "report-invalid", f"The report field {key!r} must be a list of strings."
         )
-    if len(value) > LIST_MAX_ITEMS:
+    return [item.strip() for item in raw if item.strip()]
+
+
+def _declared_array(
+    payload: dict[str, Any], key: str, *, limit: int = LIST_MAX_ITEMS
+) -> list[Any]:
+    """Read a top-level array the role's response contract declares.
+
+    An omitted array is refused as a contract failure. An explicitly empty one is
+    returned as-is: ``findings: []`` is the agent saying it found nothing, which is
+    a claim the gate may rely on, while a missing ``findings`` is the agent not
+    making the claim at all.
+    """
+
+    if key not in payload:
+        raise ReportError(
+            "report-invalid",
+            f"The report is missing the required field {key!r}. Reply with every "
+            "field the response contract declares, and write [] when there is "
+            "nothing to report.",
+        )
+    value = payload[key]
+    if not isinstance(value, list):
+        raise ReportError("report-invalid", f"The report field {key!r} must be a list.")
+    if len(value) > limit:
         raise ReportError("report-invalid", f"The report field {key!r} has too many items.")
-    return [item.strip() for item in value if item.strip()]
+    return value
 
 
 def _entry_text(entry: dict[str, Any], key: str, *, context: str,
@@ -201,20 +240,7 @@ def _relative_path(raw: str) -> str:
 
 
 def _criteria(payload: dict[str, Any]) -> list[CriterionClaim]:
-    if "acceptance_criteria" not in payload:
-        raise ReportError(
-            "report-invalid",
-            "The report is missing the required field 'acceptance_criteria'.",
-        )
-    raw = payload["acceptance_criteria"]
-    if not isinstance(raw, list):
-        raise ReportError(
-            "report-invalid", "acceptance_criteria must be a list of objects."
-        )
-    if len(raw) > LIST_MAX_ITEMS:
-        raise ReportError(
-            "report-invalid", "acceptance_criteria has too many entries."
-        )
+    raw = _declared_array(payload, "acceptance_criteria")
     claims: list[CriterionClaim] = []
     seen: set[str] = set()
     for entry in raw:
@@ -248,13 +274,7 @@ def _criteria(payload: dict[str, Any]) -> list[CriterionClaim]:
 
 
 def _findings(payload: dict[str, Any]) -> list[Finding]:
-    raw = payload.get("findings", [])
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ReportError("report-invalid", "findings must be a list of objects.")
-    if len(raw) > LIST_MAX_ITEMS:
-        raise ReportError("report-invalid", "findings has too many entries.")
+    raw = _declared_array(payload, "findings")
     findings: list[Finding] = []
     for entry in raw:
         if not isinstance(entry, dict):
@@ -277,13 +297,7 @@ def _findings(payload: dict[str, Any]) -> list[Finding]:
 
 
 def _files(payload: dict[str, Any]) -> list[ChangedFileClaim]:
-    raw = payload.get("files", [])
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ReportError("report-invalid", "files must be a list of objects.")
-    if len(raw) > MAX_CLAIMED_FILES:
-        raise ReportError("report-invalid", "files has too many entries.")
+    raw = _declared_array(payload, "files", limit=MAX_CLAIMED_FILES)
     files: list[ChangedFileClaim] = []
     for entry in raw:
         if not isinstance(entry, dict):
@@ -327,9 +341,59 @@ def _payload(
     try:
         candidate = select_payload(text, role=role, matches=matches)
     except ProposalValidationError as error:
-        code = "report-ambiguous" if error.code == PAYLOAD_AMBIGUOUS else "report-unreadable"
-        raise ReportError(code, error.message) from error
+        if error.code == PAYLOAD_AMBIGUOUS:
+            raise ReportError("report-ambiguous", error.message) from error
+        # An answer that never became a document is unreadable, but the refusal
+        # names the fields it owed: the correction prompt is this message, so a
+        # vague complaint would cost the corrective attempt as well.
+        name = report_role_name(role)
+        required = ", ".join(repr(key) for key in REQUIRED_ARRAYS[name])
+        raise ReportError(
+            "report-unreadable",
+            f"{error.message} A {name} report must declare the fields {required}.",
+        ) from error
     return candidate.payload
+
+
+#: Verdicts each role may state, keyed by role, so a caller can ask what an answer
+#: declared without re-deriving the vocabulary.
+VERDICTS_BY_ROLE = {
+    "QA": QA_VERDICTS,
+    "Reviewer": REVIEW_VERDICTS,
+}
+
+#: The runtime names roles in lower case (``qa``), while a report is described by
+#: the role's documented name (``QA``). One table keeps both spellings usable so a
+#: lookup can never silently miss.
+REPORT_ROLE_NAMES = {"builder": "Builder", "qa": "QA", "reviewer": "Reviewer"}
+
+
+def report_role_name(role: str) -> str:
+    """The documented name of a role, accepting either spelling."""
+
+    return REPORT_ROLE_NAMES.get(role.lower(), role)
+
+
+def declared_verdict(text: str, *, role: str) -> str | None:
+    """The verdict an answer explicitly declares in a JSON object it offers.
+
+    Only parseable objects are inspected; the prose around them is never scanned
+    for words like "failed", so a summary sentence cannot be mistaken for the
+    verdict. This exists so a caller can refuse to re-ask an answer that already
+    reached an adverse decision, which is exactly the case where a second attempt
+    could only reverse it rather than clarify it.
+
+    It reads the payload, not a validated report: an answer whose verdict is
+    declared but whose body breaks the schema still made a decision, and that
+    decision is what the caller must not talk it out of.
+    """
+
+    known = VERDICTS_BY_ROLE[report_role_name(role)]
+    for candidate in payload_objects(text):
+        verdict = candidate.payload.get("verdict")
+        if isinstance(verdict, str) and verdict.strip().lower() in known:
+            return verdict.strip().lower()
+    return None
 
 
 # -- parsers -------------------------------------------------------------------
@@ -410,15 +474,20 @@ __all__ = [
     "QA_VERDICTS",
     "QaReport",
     "REPORT_SCHEMA_VERSION",
+    "REQUIRED_ARRAYS",
     "REVIEW_VERDICTS",
     "ReportError",
     "ReviewVerdict",
     "SEVERITIES",
     "BuildReport",
+    "REPORT_ROLE_NAMES",
+    "VERDICTS_BY_ROLE",
+    "declared_verdict",
     "missing_criteria",
     "parse_build_report",
     "parse_qa_report",
     "parse_review_verdict",
     "report_digest",
+    "report_role_name",
     "unmet_criteria",
 ]

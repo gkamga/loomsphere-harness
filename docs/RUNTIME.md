@@ -176,7 +176,9 @@ human makes:
   A recovery is allowed once per task.
 - The recovery does **not** call the Builder. It reuses the recorded change set and
   runs the existing validation, QA, and Reviewer stages unchanged, on the same
-  container-only, digest-checked path. A QA block returns the task to
+  container-only, digest-checked path — including QA's bounded single format
+  correction, so a recovered run cannot be held to a looser or stricter standard of
+  answer than a normal iteration. A QA block returns the task to
   `changes_required`, a rejection fails it, and a passing review reaches
   `awaiting_acceptance` — with the same human acceptance gate as any other delivery.
 - Nothing is rewritten to make the recovery look cleaner: the failed Builder run keeps
@@ -366,13 +368,35 @@ separate recorded run with its own prompt digest, plus an audit event
 names the class it is correcting. When the last attempt is refused the stage fails
 exactly as it did before: nothing is guessed, and nothing is retried forever.
 
-Three answers are deliberately never re-asked: an **unreadable Builder report** (the
+Both normal iterations and human-authorized recovered-Builder iterations reach QA
+through one method (`ImplementationStage._run_qa`), so a recovered run is held to
+the same standard of answer and the same number of attempts as any other, and the
+attempts stay separate runs with the same audit event.
+
+A report is also a shape contract: the arrays each role's documented response
+declares are **required**, and an omitted array is refused as an incomplete report
+while an explicit `[]` is accepted and preserved as the agent's answer. The parser
+cannot tell "the agent found nothing" from "the agent never answered the field",
+and only the second one is a reason to ask again. `files`, `acceptance_criteria`,
+`tests_run`, and `notes` are required for a Builder report; `findings`,
+`acceptance_criteria`, and `residual_risks` for QA; `findings`,
+`acceptance_criteria`, and `follow_ups` for the Reviewer. The nested fields `change`,
+`criterion`, and `evidence` stay optional, and the role prompts state which is which
+so the same rules are described to the model and enforced by the parser.
+
+Four answers are deliberately never re-asked: an **unreadable Builder report** (the
 files are already on disk, so a second Builder would build again rather than
 re-report), a **truncated turn** (re-sending without raising
-`model.max_output_tokens` would spend the same budget and fail the same way), and a
-**readable adverse verdict**. A QA `failed`, a Reviewer `changes-required`, and a
-Reviewer `rejected` are decisions; they are recorded and take their normal path. Only
-the Reviewer has an explicit retry, and it is the human-approved `retry-review`
+`model.max_output_tokens` would spend the same budget and fail the same way), a
+**readable adverse verdict**, and a **malformed answer whose payload already
+declares an adverse verdict**. A QA `failed`, a Reviewer `changes-required`, and a
+Reviewer `rejected` are decisions; they are recorded and take their normal path.
+When such a verdict is declared inside a report that breaks the schema, the answer is
+refused as `invalid-qa-report` or `invalid-review-report` and is *not* re-asked: a
+second answer could only reverse the decision, not clarify it. The verdict is read
+from the declared JSON payload and never scanned out of the surrounding prose, so a
+sentence like "this would have failed" is not treated as a verdict. Only the
+Reviewer has an explicit retry, and it is the human-approved `retry-review`
 command, not an automatic one.
 
 ## The implementation loop
@@ -400,7 +424,9 @@ iteration is:
    criterion. A `failed` verdict, a blocking finding, or a criterion the report
    never mentions sends the iteration back to the Builder with feedback. An
    unreadable QA report is corrected once, against the same recorded evidence; a
-   second unreadable report fails the iteration as `invalid-qa-report`.
+   second unreadable report fails the iteration as `invalid-qa-report`, and so does
+   an unreadable report that already declared `failed` — that verdict is not
+   re-requested.
 5. **Reviewer** reports `accepted`, `changes-required`, or `rejected`. Accepted
    freezes the deliverable and moves the task to `awaiting_acceptance`. An
    unreadable Reviewer answer is never turned into a verdict: it fails the

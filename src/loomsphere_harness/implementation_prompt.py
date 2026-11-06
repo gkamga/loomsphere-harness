@@ -39,7 +39,12 @@ Reply with exactly one fenced json block and nothing after it:
 ```
 `status` must be one of `met`, `unmet`, or `unknown`.
 `criterion_id` must repeat the approved identifier exactly. Report every approved
-criterion. A criterion you leave out is treated as omitted and blocks delivery."""
+criterion. A criterion you leave out is treated as omitted and blocks delivery.
+Every top-level field above is required. Declare each one even when you have
+nothing for it: write `[]` for an empty list, because an omitted field is refused
+as an incomplete report while an explicit empty list is accepted as your answer.
+Inside an entry, `path`, `criterion_id`, and `status` are required; `change`,
+`criterion`, and `evidence` are optional."""
 
 SEVERITY_GUIDE = """\
 `severity` is exactly one of these three values; any other value, including
@@ -73,7 +78,14 @@ Reply with exactly one fenced json block and nothing after it:
 """ + SEVERITY_GUIDE + """
 `status` must be one of `met`, `unmet`, or `unknown`.
 `criterion_id` must repeat the approved identifier exactly.
-Use `failed` when any acceptance criterion is unmet or any blocking finding exists."""
+Use `failed` when any acceptance criterion is unmet or any blocking finding exists.
+Every top-level field above is required. Declare each one even when you have
+nothing for it: write `[]` for `findings` or `residual_risks` when you found
+nothing and no risk remains, because an omitted field is refused as an incomplete
+report while an explicit empty list is accepted as your answer. Inside a finding,
+`description` is required and `evidence` is optional. A report that declares its
+verdict but breaks any other rule is refused, and an adverse verdict is never
+re-requested: state `failed` only when that is your decision."""
 
 REVIEWER_CONTRACT = """\
 Reply with exactly one fenced json block and nothing after it:
@@ -102,7 +114,12 @@ Reply with exactly one fenced json block and nothing after it:
 that is absent from your report is treated as omitted by the delivery gate.
 Use `accepted` only when the recorded validation evidence belongs to this exact
 change set and every acceptance criterion is supported by evidence.
-Use `rejected` when the change set cannot satisfy the requirement at all."""
+Use `rejected` when the change set cannot satisfy the requirement at all.
+Every top-level field above is required. Declare each one even when you have
+nothing for it: write `[]` for `findings` or `follow_ups` when you found nothing
+and have no follow-up, because an omitted field is refused as an incomplete
+report while an explicit empty list is accepted as your answer. Inside a finding,
+`description` is required and `evidence` is optional."""
 
 BUILDER_RULES = """\
 1. Work only inside the current working directory; it is an isolated git worktree.
