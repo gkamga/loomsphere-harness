@@ -36,6 +36,7 @@ from runtime_support import (  # noqa: E402
     fenced,
 )
 
+from loomsphere_harness import implementation as implementation_module  # noqa: E402
 from loomsphere_harness.cli import render_recovery  # noqa: E402
 from loomsphere_harness.config import SandboxConfig, ValidationConfig  # noqa: E402
 from loomsphere_harness.engine import Engine, EngineError  # noqa: E402
@@ -358,6 +359,29 @@ class LoopCase(RuntimeCase):
             text=True,
             check=True,
         ).stdout
+
+    def status_elsewhere(self, task_id: str) -> CompletedProcess:
+        """Run ``status`` from a second process, the way an operator would.
+
+        The command is pointed at this case's repository and state directory, so
+        it opens the same database and repairs whatever it finds there. Only a
+        real second process can show what a concurrent status check does to a live
+        implementation.
+        """
+
+        config = self.tmp / "status-config.toml"
+        config.write_text(
+            f'[harness]\nroot = "{HARNESS_ROOT}"\n'
+            f'[state]\ndir = "{self.state.parent}"\n',
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [sys.executable, "-m", "loomsphere_harness", "--config", str(config),
+             "--repo", str(self.repo), "status", task_id],
+            capture_output=True,
+            text=True,
+            cwd=str(HARNESS_ROOT),
+        )
 
 
 class ImplementationLoop(LoopCase):
@@ -721,6 +745,70 @@ class ImplementationLoop(LoopCase):
         self.assertEqual(view["implementation"]["reason"], "unauthorized-path")
         self.assertEqual(view["task"]["status"], "implementation_failed")
         self.assertIsNone(view["deliverable"])
+
+    # -- a concurrent status check is not a crashed process -------------------
+    def test_a_status_check_in_another_process_does_not_interrupt_validation(self) -> None:
+        """A second process's ``status`` must leave a live implementation alone.
+
+        Between the Builder's run and QA's run the task is ``implementation_running``
+        with no run row in flight, which is the same shape an abandoned recovery
+        claim leaves behind — and ``status`` repairs interrupted stages. A normal
+        implementation was never authorised for recovery, so the sweep must not
+        touch it: the task keeps its status, the open iteration keeps validating,
+        and QA and the Reviewer still decide the delivered outcome.
+        """
+
+        engine, task_id, _ = self.approved_task()
+        seen: dict[str, object] = {}
+        original = implementation_module.execute_validation
+
+        def watched(*args, **kwargs):
+            # Pause exactly where the window opens: validation has been recorded as
+            # started, the Builder run has succeeded, and nothing is running.
+            before_task = engine._task(task_id)
+            before_iteration = engine.store.iteration(task_id)
+            seen["status"] = before_task["status"]
+            seen["iteration"] = before_iteration["status"]
+            seen["running"] = [
+                run["role"] for run in engine.store.runs(task_id) if run["status"] == "running"
+            ]
+            completed = self.status_elsewhere(task_id)
+            seen["returncode"] = completed.returncode
+            seen["stdout"] = completed.stdout
+            seen["stderr"] = completed.stderr
+            seen["before_task"] = before_task
+            seen["before_iteration"] = before_iteration
+            seen["task_after"] = engine._task(task_id)
+            seen["iteration_after"] = engine.store.iteration(task_id)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(implementation_module, "execute_validation", watched):
+            view = engine.implement(task_id)
+
+        # The window the second process observed.
+        self.assertEqual(seen["status"], "implementation_running")
+        self.assertEqual(seen["iteration"], "validating")
+        self.assertEqual(seen["running"], [])
+
+        # The status check succeeded and changed nothing.
+        self.assertEqual(seen["returncode"], 0, seen["stderr"])
+        self.assertEqual(seen["task_after"], seen["before_task"])
+        self.assertEqual(seen["iteration_after"], seen["before_iteration"])
+        self.assertEqual(seen["task_after"]["status"], "implementation_running")
+        self.assertEqual(seen["iteration_after"]["status"], "validating")
+
+        # Validation finished, and QA and the Reviewer completed the loop.
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder", "qa", "reviewer"],
+        )
+        self.assertTrue(all(run["status"] == "succeeded" for run in view["runs"]))
+        self.assertEqual(view["iterations"][0]["review_report"]["verdict"], "accepted")
+        events = [event["event"] for event in engine.store.audit_events(task_id)]
+        self.assertNotIn("stage.interrupted", events)
+        self.assertNotIn("run.interrupted", events)
 
 
 class ReviewerFormatRecovery(LoopCase):

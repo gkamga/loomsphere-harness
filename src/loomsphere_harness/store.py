@@ -679,6 +679,15 @@ class SqliteStore:
         is skipped here. The operating system releases the lease when the owning
         process exits, including when it is killed, so a recovery that really
         died is still repaired by the next call.
+
+        Repairing a running status with no run row at all requires positive
+        evidence that the stage was an authorised recovery claim. A normal
+        implementation has the same shape between its stages — the Builder run
+        has already succeeded while validation holds the stage, and QA has
+        already succeeded while the Reviewer prompt is composed — so repairing
+        on the shape alone would fail a live implementation whenever another
+        process happened to run ``status``. Only a ``recoveries`` row for the
+        task's current iteration identifies the runless stage as a claim.
         """
 
         running_status = {
@@ -731,10 +740,26 @@ class SqliteStore:
             # open across validation. A process that stops in that window leaves a
             # task in a running status with nothing running, which nothing else
             # would ever reopen.
+            #
+            # Only an authorised recovery claim can be repaired this way, so the
+            # claim itself is required before anything is changed. A normal
+            # implementation is runless in exactly the same way between its
+            # stages — the Builder run has succeeded while validation runs, and QA
+            # has succeeded while the Reviewer prompt is composed — but it has no
+            # ``recoveries`` row for its current iteration. Matching on the shape
+            # alone would fail a live implementation whose validation merely
+            # overlapped another process's ``status``.
             for failed, running in running_status.values():
                 for task in db.execute(
-                    "SELECT id FROM tasks WHERE status = ? AND id NOT IN"
-                    " (SELECT task_id FROM runs WHERE status = 'running')",
+                    "SELECT t.id FROM tasks t"
+                    " WHERE t.status = ?"
+                    " AND t.id NOT IN (SELECT task_id FROM runs WHERE status = 'running')"
+                    " AND EXISTS ("
+                    "  SELECT 1 FROM iterations i"
+                    "  JOIN recoveries r ON r.iteration_id = i.id"
+                    "  WHERE i.task_id = t.id"
+                    "  AND i.number = (SELECT MAX(number) FROM iterations"
+                    "                  WHERE task_id = t.id))",
                     (running,),
                 ).fetchall():
                     if task["id"] in leased:
