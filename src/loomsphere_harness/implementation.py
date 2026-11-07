@@ -88,6 +88,7 @@ from loomsphere_harness.workspace import (
     screen_change_set,
     workspace_path_for,
 )
+from loomsphere_harness.store import MAX_BUILDER_RESTARTS, RESTARTABLE_FAILURES
 
 DELIVERABLE_SCHEMA_VERSION = "1.0.0"
 
@@ -154,18 +155,8 @@ RECOVERABLE_FAILURES = (
 #: Run statuses that mean the Builder did not finish its turn.
 RECOVERABLE_RUN_STATUSES = ("failed", "interrupted")
 
-#: A Builder that stopped having written nothing at all may be restarted this many
-#: times per task. The authorization is recorded in an immutable, single-row-per-
-#: failed-iteration table, so the limit survives a process restart and a concurrent
-#: invocation cannot exceed it.
-MAX_BUILDER_RESTARTS = 1
 REASON_RESTART_REFUSED = "restart-refused"
 REASON_RESTART_EXHAUSTED = "restart-exhausted"
-#: Failure reasons that mean the Builder's turn was cut short rather than answered:
-#: the pilot's timeout, plus the two spellings a dead process leaves behind. A
-#: model or provider fault is deliberately absent: it says the run was spent, not
-#: interrupted, and repeating it would only spend the same budget again.
-RESTARTABLE_FAILURES = ("timed-out", REASON_BUILDER_INTERRUPTED, REASON_RUN_INTERRUPTED)
 _SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
 COMMIT_MESSAGE = "loomsphere-harness: {task} iteration {number}"

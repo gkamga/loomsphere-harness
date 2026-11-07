@@ -164,9 +164,9 @@ human makes:
   uncommitted work where it is. `inspect-recovery` then shows the preserved inventory,
   and `recover-builder` screens and commits it at authorization time under the same
   exact-set rule before validating it. A stage that is genuinely running is never
-  treated this way: a recovery holds an exclusive lease on the task for its whole
-  duration, so a second process running `status` or `inspect-recovery` cannot close a
-  live recovery.
+  treated this way: implementation, recovery, and restart work hold an exclusive
+  lease on the task for their duration, so a second process running `status` or
+  `inspect-recovery` cannot close a live stage or consume a restart mid-handoff.
 - `inspect-recovery <task>` is read-only. It reports the failed Builder run, the
   preserved commit, the file inventory with a per-file mode and SHA-256, the snapshot
   digest, how many recoveries are left, every obstacle that would block a recovery,
@@ -222,6 +222,10 @@ refuses a task that already failed, so nothing but rewriting state could continu
   restarted CLI cannot authorize twice. The authorization carries the failed run,
   the approval and contract digests, and the digest of the empty change set it
   verified.
+- The authorizing process holds the task lease from the authorization through
+  opening the next iteration. Ordinary `implement` takes the same lease, so a
+  separate process cannot consume the temporary `approved` status during that
+  handoff.
 - Nothing existing is rewritten. The failed run keeps its `failed` status and reason,
   the failed iteration keeps its failure reason and detail, and the authorization is
   recorded beside them in an append-only `builder_restarts` table with the

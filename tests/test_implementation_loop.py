@@ -2005,6 +2005,47 @@ class BuilderRestart(LoopCase):
         )
         self.assertEqual(engine.describe(task_id)["task"]["status"], "delivered")
 
+    def test_a_restart_after_a_process_interruption_without_iteration_linkage(self) -> None:
+        engine, task_id, _ = self.approved_task(attempt_files={1: BUILT_FILES})
+        task = engine._task(task_id)
+        iteration = engine.store.open_iteration(
+            task_id=task_id, base_commit=task["repo_commit"], actor="alice"
+        )
+        workspace = ensure_task_workspace(
+            engine.repo_path, engine.workspace_root, task_id, task["repo_commit"]
+        )
+        engine.store.update_iteration(
+            iteration_id=iteration["id"],
+            actor="alice",
+            event="workspace.ready",
+            fields={"branch": workspace.branch, "workspace_path": str(workspace.path)},
+        )
+        failed_run_id = engine.store.begin_run(
+            task_id=task_id,
+            role="builder",
+            expect=("implementation_running",),
+            running_status="implementation_running",
+            actor="alice",
+            evidence={},
+        )
+        engine.recover()
+
+        failed_iteration = engine.store.iteration(task_id)
+        self.assertIsNone(failed_iteration["builder_run_id"])
+        self.assertEqual(failed_iteration["failure_reason"], "interrupted")
+        failed_run = next(
+            run for run in engine.store.runs(task_id) if run["id"] == failed_run_id
+        )
+        self.assertEqual(failed_run["status"], "interrupted")
+        self.assertEqual(failed_run["failure_reason"], "interrupted")
+
+        view = engine.restart_builder(task_id, failed_run_id=failed_run_id)
+
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(engine.store.builder_restarts(task_id)[0]["failure_reason"], "interrupted")
+        self.assertEqual(engine.store.iterations(task_id)[0]["failure_reason"], "interrupted")
+        self.assertEqual(engine.store.iterations(task_id)[1]["status"], "ready")
+
     def test_the_failed_run_and_its_audit_chain_are_preserved(self) -> None:
         engine, task_id, _ = self.timed_out(attempt_files={1: {}, 2: BUILT_FILES})
         iteration_before = engine.store.iteration(task_id)
@@ -2199,6 +2240,64 @@ class BuilderRestart(LoopCase):
         )
         self.assertRefused(engine, task_id)
 
+    def test_the_store_rejects_a_nonrestartable_builder_run(self) -> None:
+        engine, task_id, _ = self.approved_task(
+            builder_failures={1: out_of_budget()}, attempt_files={1: {}}
+        )
+        engine.implement(task_id)
+        values = self.authorization(engine, task_id)
+        before = engine.store.audit_events(task_id)
+
+        with self.assertRaises(StoreError) as raised:
+            engine.store.authorize_builder_restart(**values)
+
+        self.assertEqual(raised.exception.code, "restart-refused")
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        self.assertEqual(engine.store.audit_events(task_id), before)
+
+    def test_the_store_rejects_a_builder_run_from_another_iteration(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        values = self.authorization(engine, task_id)
+        iteration = engine.store.iteration(task_id)
+        unrelated_run_id = "unrelated-builder-run"
+        with closing(sqlite3.connect(self.state)) as connection:
+            connection.execute(
+                "INSERT INTO runs (id, task_id, role, status, failure_reason, started_at)"
+                " VALUES (?, ?, 'builder', 'failed', 'timed-out', ?)",
+                (
+                    unrelated_run_id,
+                    task_id,
+                    "2000-01-01T00:00:00.000000+00:00",
+                ),
+            )
+            connection.commit()
+        values["failed_run_id"] = unrelated_run_id
+        before = engine.store.audit_events(task_id)
+
+        with self.assertRaises(StoreError) as raised:
+            engine.store.authorize_builder_restart(**values)
+
+        self.assertEqual(raised.exception.code, "restart-refused")
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        self.assertEqual(engine.store.iteration(task_id), iteration)
+        self.assertEqual(engine.store.audit_events(task_id), before)
+
+    def test_the_store_does_not_accept_a_larger_restart_limit(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        values = self.authorization(engine, task_id)
+        values["limit"] = 2
+        before = engine.store.audit_events(task_id)
+
+        with self.assertRaises(StoreError) as raised:
+            engine.store.authorize_builder_restart(**values)
+
+        self.assertEqual(raised.exception.code, "restart-exhausted")
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        self.assertEqual(engine.store.audit_events(task_id), before)
+
     def test_a_restart_of_another_run_is_refused(self) -> None:
         engine, task_id, _ = self.timed_out()
 
@@ -2273,6 +2372,47 @@ class BuilderRestart(LoopCase):
         self.assertEqual(len(restarts), 1)
         self.assertEqual(engine._task(task_id)["status"], "approved")
 
+    def test_ordinary_implement_cannot_consume_a_live_restart_authorization(self) -> None:
+        """The authorizing process owns the task lease through the next iteration."""
+
+        engine, task_id, _ = self.timed_out()
+        values = self.authorization(engine, task_id)
+        iteration_before = engine.store.iteration(task_id)
+        runs_before = engine.store.runs(task_id)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _AUTHORIZE_AND_HOLD_SCRIPT,
+                str(self.state),
+                json.dumps(values),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(HARNESS_ROOT),
+        )
+        try:
+            assert process.stdout is not None
+            authorized = json.loads(process.stdout.readline())
+            self.assertIn("id", authorized)
+
+            with self.assertRaises(StoreError) as raised:
+                engine.implement(task_id)
+
+            self.assertEqual(raised.exception.code, "recovery-active")
+            self.assertEqual(engine._task(task_id)["status"], "approved")
+            self.assertEqual(engine.store.iteration(task_id), iteration_before)
+            self.assertEqual(engine.store.runs(task_id), runs_before)
+            self.assertEqual(len(engine.store.builder_restarts(task_id)), 1)
+        finally:
+            assert process.stdin is not None
+            process.stdin.write("continue\n")
+            process.stdin.flush()
+            _stdout, stderr = process.communicate()
+        self.assertEqual(process.returncode, 0, stderr)
+
     def test_a_live_restart_cannot_be_spent_twice(self) -> None:
         engine, task_id, _ = self.timed_out()
         failed_run_id = self.failed_run(engine, task_id)["id"]
@@ -2329,6 +2469,17 @@ _AUTHORIZE_SCRIPT = (
     "    print(json.dumps({'error': error.code}))\n"
     "else:\n"
     "    print(json.dumps({'id': row['id']}))\n"
+)
+
+_AUTHORIZE_AND_HOLD_SCRIPT = (
+    "import json, sys\n"
+    "from loomsphere_harness.store import SqliteStore\n"
+    "values = json.loads(sys.argv[2])\n"
+    "store = SqliteStore(sys.argv[1])\n"
+    "with store.recovery_lease(values['task_id']):\n"
+    "    row = store.authorize_builder_restart(**values)\n"
+    "    print(json.dumps({'id': row['id']}), flush=True)\n"
+    "    sys.stdin.readline()\n"
 )
 
 

@@ -604,7 +604,8 @@ class Engine:
         from loomsphere_harness.implementation import ImplementationStage
 
         self.recover()
-        outcome = ImplementationStage(self).run(task_id)
+        with self.store.implementation_lease(task_id):
+            outcome = ImplementationStage(self).run(task_id)
         return {"implementation": outcome, **self.describe(task_id)}
 
     def retry_review(self, task_id: str) -> dict[str, Any]:

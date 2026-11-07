@@ -53,6 +53,8 @@ BUILDER_RESTART_EVENT = "builder.restart-authorized"
 #: Run statuses that mean a Builder run did not finish its turn. A restart is
 #: only ever authorized against one of these.
 INTERRUPTED_RUN_STATUSES = ("failed", "interrupted")
+RESTARTABLE_FAILURES = ("timed-out", "builder-interrupted", "interrupted")
+MAX_BUILDER_RESTARTS = 1
 
 
 class StoreError(RuntimeError):
@@ -900,13 +902,14 @@ class SqliteStore:
 
     @contextmanager
     def recovery_lease(self, task_id: str) -> Iterator[None]:
-        """Hold the exclusive lease for the whole of one task's recovery.
+        """Hold the exclusive lease for the whole of one task's implementation.
 
         The lease is a kernel lock, not a recorded fact: it is released the
         moment the holding process dies, so `recover_interrupted` never has to
-        guess whether a running stage belongs to a live recovery or to a dead
-        one. Holding it is also what makes two concurrent recoveries of the same
-        task impossible rather than merely unlikely.
+        guess whether a running stage belongs to a live implementation or to a
+        dead one. Holding it also prevents a separate `implement` process from
+        consuming a restart while its authorizing process is opening the next
+        iteration.
         """
 
         if fcntl is None:  # pragma: no cover - POSIX-only fallback
@@ -932,6 +935,16 @@ class SqliteStore:
             yield
         finally:
             handle.close()
+
+    @contextmanager
+    def implementation_lease(self, task_id: str) -> Iterator[None]:
+        """Serialize ordinary implementation against restart and recovery work."""
+
+        if fcntl is None:  # pragma: no cover - restart/recovery are unsupported here
+            yield
+            return
+        with self.recovery_lease(task_id):
+            yield
 
     def runs(self, task_id: str) -> list[dict[str, Any]]:
         db = self._connect()
@@ -1291,6 +1304,12 @@ class SqliteStore:
             ).fetchone()
             if task is None:
                 raise StoreError("task-not-found", f"No task {task_id}.")
+            if limit != MAX_BUILDER_RESTARTS:
+                raise StoreError(
+                    "restart-exhausted",
+                    f"The authorized Builder restart limit is fixed at "
+                    f"{MAX_BUILDER_RESTARTS}.",
+                )
             # The authorization count is checked before the status so that a second
             # concurrent attempt reports exhaustion, which is what happened, rather
             # than the transition this attempt never reached.
@@ -1308,13 +1327,23 @@ class SqliteStore:
                     f"Task {task_id} is {task['status']}; expected implementation_failed.",
                 )
             iteration = db.execute(
-                "SELECT number, status, base_commit, commit_sha, build_report, build_digest"
+                "SELECT number, status, base_commit, commit_sha, build_report, build_digest,"
+                " builder_run_id, created_at"
                 " FROM iterations WHERE id = ? AND task_id = ?",
                 (failed_iteration_id, task_id),
             ).fetchone()
             if iteration is None:
                 raise StoreError(
                     "iteration-not-found", f"No iteration {failed_iteration_id} for {task_id}."
+                )
+            latest_iteration = db.execute(
+                "SELECT id FROM iterations WHERE task_id = ? ORDER BY number DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if latest_iteration is None or latest_iteration["id"] != failed_iteration_id:
+                raise StoreError(
+                    "restart-refused",
+                    "The supplied failed iteration is not the task's latest iteration.",
                 )
             if iteration["status"] != "failed":
                 raise StoreError(
@@ -1337,13 +1366,40 @@ class SqliteStore:
                 )
             placeholders = ",".join("?" for _ in INTERRUPTED_RUN_STATUSES)
             run = db.execute(
-                "SELECT role, status, failure_reason FROM runs"
+                "SELECT id, role, status, failure_reason, started_at FROM runs"
                 f" WHERE id = ? AND task_id = ? AND status IN ({placeholders})",
                 (failed_run_id, task_id, *INTERRUPTED_RUN_STATUSES),
             ).fetchone()
             if run is None or run["role"] != "builder":
                 raise StoreError(
                     "restart-refused", "The supplied id is not a failed Builder run."
+                )
+            if run["failure_reason"] not in RESTARTABLE_FAILURES:
+                raise StoreError(
+                    "restart-refused",
+                    "The failed Builder run did not stop for a restartable interruption.",
+                )
+            if (
+                iteration["builder_run_id"] is not None
+                and iteration["builder_run_id"] != failed_run_id
+            ):
+                raise StoreError(
+                    "restart-refused",
+                    "The supplied Builder run is not recorded on the failed iteration.",
+                )
+            latest_builder_run = db.execute(
+                "SELECT id FROM runs WHERE task_id = ? AND role = 'builder'"
+                " ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                run["started_at"] < iteration["created_at"]
+                or latest_builder_run is None
+                or latest_builder_run["id"] != failed_run_id
+            ):
+                raise StoreError(
+                    "restart-refused",
+                    "The supplied Builder run is not the failed run for this iteration.",
                 )
             if db.execute(
                 "SELECT 1 FROM deliverables WHERE task_id = ? LIMIT 1", (task_id,)
