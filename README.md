@@ -174,8 +174,8 @@ Delivered in phase 2C.2 (this release):
   matching evidence fails closed. `protected-pytest` is not implemented in this
   runtime; such a criterion resolves to `unsupported` and blocks acceptance
   rather than passing by default.
-- **Store schema v3:** an existing v1 or v2 SQLite state file migrates in place,
-  gaining the append-only `recoveries` table.
+- **Store schema v4:** an existing v1, v2, or v3 SQLite state file migrates in
+  place, gaining the append-only `builder_restarts` table.
 - **Reviewer retry** (`retry-review`): one retry of only the Reviewer after an
   `invalid-review-report` failure.
 - **Builder recovery** (`inspect-recovery`, `recover-builder`): a Builder that
@@ -185,6 +185,18 @@ Delivered in phase 2C.2 (this release):
   one recovery of exactly that change set. The Builder is not re-run; the recorded
   work goes through the same validation, QA, Reviewer, and human acceptance gates,
   and the deliverable states that no Builder report or Builder test run exists.
+- **Builder restart** (`restart-builder`): a Builder that timed out or was
+  interrupted *before writing anything* leaves no work to recover, so recovery is
+  the wrong tool. `restart-builder --failed-run` lets a human authorize exactly one
+  fresh Builder attempt for that task. It is refused unless the task is
+  `implementation_failed`, the original approval and acceptance contract are
+  unchanged, the failed run's reason is an interruption, no Builder report or
+  deliverable exists, the worktree is empty of committed, uncommitted, untracked,
+  and ignored changes, the task is still on its approved commit, and no restart was
+  already authorized. The failed run, its iteration, and the audit chain are kept
+  as they were; the authorization is recorded beside them, and the reused
+  implementation loop runs the same validation, QA, Reviewer, and human acceptance
+  gates.
 
 Not delivered, and not implied by this release:
 

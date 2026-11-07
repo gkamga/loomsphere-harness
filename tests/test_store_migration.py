@@ -270,6 +270,78 @@ class Migration(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_a_v3_database_gains_only_the_restart_table(self) -> None:
+        self._v1_database()
+        SqliteStore(self.path).check()
+        # Roll the version back to what a 2C.3 database recorded, with its rows intact.
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TABLE builder_restarts")
+            connection.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = SqliteStore(self.path)
+        store.check()
+
+        self.assertEqual(
+            self._scalar("SELECT value FROM meta WHERE key='schema_version'"),
+            str(SCHEMA_VERSION),
+        )
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM tasks"), 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM runs"), 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM proposals"), 1)
+        self.assertEqual(self._scalar("SELECT COUNT(*) FROM approvals"), 1)
+        self.assertEqual(
+            self._scalar("SELECT COUNT(*) FROM sqlite_master WHERE name='builder_restarts'"), 1
+        )
+        self.assertEqual(store.verify_audit_chain(), 0)
+        self.assertEqual(store.builder_restarts(TASK_ID), [])
+
+    def test_a_restart_record_cannot_be_rewritten_or_deleted(self) -> None:
+        self._v1_database()
+        SqliteStore(self.path).check()
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "INSERT INTO iterations (id, task_id, number, status, base_commit,"
+                " created_at, updated_at) VALUES"
+                " ('I-1', ?, 1, 'failed', ?, 'now', 'now')",
+                (TASK_ID, "a" * 40),
+            )
+            connection.execute(
+                "INSERT INTO runs (id, task_id, role, status, failure_reason, started_at)"
+                " VALUES ('R-2', ?, 'builder', 'failed', 'timed-out', 'now')",
+                (TASK_ID,),
+            )
+            connection.execute(
+                "INSERT INTO builder_restarts VALUES"
+                " ('BR-1', ?, 'I-1', 'R-2', 1, 'timed-out', ?, 'P-1', 'digest', 'A-1',"
+                " 'contract', 'snapshot', 'tester', NULL, 'now')",
+                (TASK_ID, "a" * 40),
+            )
+            connection.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE builder_restarts SET actor='other' WHERE id='BR-1'"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("DELETE FROM builder_restarts WHERE id='BR-1'")
+            # A second authorization for the same failed iteration is impossible, so
+            # the one-time guarantee does not depend on application logic.
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO builder_restarts VALUES"
+                    " ('BR-2', ?, 'I-1', 'R-2', 2, 'timed-out', ?, 'P-1', 'digest', 'A-1',"
+                    " 'contract', 'snapshot', 'tester', NULL, 'now')",
+                    (TASK_ID, "a" * 40),
+                )
+        finally:
+            connection.close()
+
     def test_an_unknown_version_fails_closed_without_touching_the_database(self) -> None:
         self._v1_database(version="9")
         store = SqliteStore(self.path)

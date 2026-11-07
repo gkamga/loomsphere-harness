@@ -30,8 +30,8 @@ from loomsphere_harness.workspace import WorkspaceError
 
 COMMANDS = (
     "init", "submit", "run", "show", "approve", "reject", "implement", "retry-review",
-    "inspect-recovery", "recover-builder", "changes", "evidence", "accept", "reject-delivery",
-    "status", "audit",
+    "inspect-recovery", "recover-builder", "restart-builder", "changes", "evidence",
+    "accept", "reject-delivery", "status", "audit",
 )
 EXPECTED_ERRORS = (
     ConfigError, AssetIntegrityError, EngineError, StoreError, RepositoryError, ApprovalError,
@@ -88,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
     recover_builder.add_argument(
         "--snapshot-digest", "--digest", dest="snapshot_digest", required=True,
         help="snapshot SHA-256 shown by `inspect-recovery`")
+    restart_builder = sub.add_parser(
+        "restart-builder",
+        help="authorize one restart of an interrupted Builder that wrote nothing, then "
+             "take it through validation, QA, and review")
+    restart_builder.add_argument("task")
+    restart_builder.add_argument(
+        "--failed-run", dest="failed_run_id", required=True,
+        help="failed Builder run id shown by `inspect-recovery`")
     changes = sub.add_parser("changes", help="show the recorded change set of the deliverable")
     changes.add_argument("task")
     evidence = sub.add_parser("evidence", help="show the validation and review evidence")
@@ -535,6 +543,28 @@ def render_recovery(view: dict[str, Any]) -> str:
     elif inspection.get("next"):
         lines.append("Recovery available. Authorize exactly this work with:")
         lines.append(f"  {inspection['next']}")
+
+    # An interrupted Builder that wrote nothing has no work to recover, so the
+    # restart is the only remaining path and is reported separately from recovery.
+    restart = inspection.get("restart")
+    if restart:
+        authorized = restart.get("authorized") or []
+        lines += [
+            "",
+            f"authorized restarts {restart.get('used', len(authorized))} of {restart['limit']}",
+        ]
+        for item in authorized:
+            lines.append(
+                f"  {item['id']}  run {item['failed_run_id']}  "
+                f"{item['failure_reason']}  {item['created_at']}"
+            )
+        if restart.get("obstacles"):
+            lines.append("")
+            lines.append("Not restartable:")
+            lines.extend(f"  - {obstacle}" for obstacle in restart["obstacles"])
+        elif restart.get("next"):
+            lines.append("Restart available. Authorize one Builder attempt with:")
+            lines.append(f"  {restart['next']}")
     return "\n".join(lines)
 
 
@@ -579,6 +609,10 @@ def run_command(args: argparse.Namespace) -> int:
         return 0 if view["recovery"]["eligible"] else 3
     elif command == "recover-builder":
         view = engine.recover_builder(args.task, snapshot_digest=args.snapshot_digest)
+        _emit(args, view, render_iterations(view))
+        return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
+    elif command == "restart-builder":
+        view = engine.restart_builder(args.task, failed_run_id=args.failed_run_id)
         _emit(args, view, render_iterations(view))
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command in ("changes", "evidence"):

@@ -88,6 +88,7 @@ from loomsphere_harness.workspace import (
     screen_change_set,
     workspace_path_for,
 )
+from loomsphere_harness.store import MAX_BUILDER_RESTARTS, RESTARTABLE_FAILURES
 
 DELIVERABLE_SCHEMA_VERSION = "1.0.0"
 
@@ -153,6 +154,9 @@ RECOVERABLE_FAILURES = (
 )
 #: Run statuses that mean the Builder did not finish its turn.
 RECOVERABLE_RUN_STATUSES = ("failed", "interrupted")
+
+REASON_RESTART_REFUSED = "restart-refused"
+REASON_RESTART_EXHAUSTED = "restart-exhausted"
 _SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
 COMMIT_MESSAGE = "loomsphere-harness: {task} iteration {number}"
@@ -450,12 +454,15 @@ class ImplementationStage:
             "change_set": None,
             "snapshot": None,
             "next": None,
+            "restart": None,
         }
 
         snapshot: dict[str, Any] | None = None
         changeset: ChangeSet | None = None
         snapshot_error: str | None = None
         preserved = False
+        worktree_ready = False
+        changed_names: list[str] | None = None
         has_commit = iteration is not None and bool(iteration.get("commit_sha"))
         # A failed Builder either committed its work when the failure was recorded,
         # or the process died before it could. The second case is still inspectable:
@@ -484,20 +491,26 @@ class ImplementationStage:
                             reviewed_commit=str(iteration.get("commit_sha")),
                         )
                     digest, entries = recoverable_inventory(path, iteration["base_commit"])
+                    worktree_ready = True
                     if not has_commit:
-                        screen_change_set(
-                            path, [entry["path"] for entry in entries]
-                        )
-                        preserved = True
+                        changed_names = [entry["path"] for entry in entries]
+                        # Work exists only if the inventory found it. An empty
+                        # change set means the Builder left nothing behind, and
+                        # advertising a recovery for it would send a human to
+                        # authorise the freezing of no work at all.
+                        preserved = bool(entries)
+                        if entries:
+                            screen_change_set(path, changed_names)
                 except WorkspaceError as error:
                     snapshot_error = f"{error.code}: {error.message}"
                     preserved = False
                 else:
-                    snapshot = {
-                        "digest": digest,
-                        "files": entries,
-                        "committed": has_commit,
-                    }
+                    if has_commit or entries:
+                        snapshot = {
+                            "digest": digest,
+                            "files": entries,
+                            "committed": has_commit,
+                        }
                     if changeset is not None:
                         view["change_set"] = {
                             "base_commit": changeset.base_commit,
@@ -522,18 +535,57 @@ class ImplementationStage:
                     "The task worktree holding the failed Builder's work is not available."
                 )
             view["obstacles"] = obstacles
-            return view
-
-        view["snapshot"] = snapshot
-        view["obstacles"] = self._recovery_obstacles(
-            task, iteration, builder_run, changeset, preserved=preserved
-        )
-        view["eligible"] = not view["obstacles"]
-        if view["eligible"]:
-            view["next"] = (
-                f"loomsphere-harness recover-builder {task_id} "
-                f"--snapshot-digest {snapshot['digest']}"
+        else:
+            view["snapshot"] = snapshot
+            view["obstacles"] = self._recovery_obstacles(
+                task, iteration, builder_run, changeset, preserved=preserved
             )
+            view["eligible"] = not view["obstacles"]
+            if view["eligible"]:
+                view["next"] = (
+                    f"loomsphere-harness recover-builder {task_id} "
+                    f"--snapshot-digest {snapshot['digest']}"
+                )
+        if not view["eligible"]:
+            view["next"] = None
+
+        # Recovery is not the only exit from a failed Builder. When the failure was
+        # an interruption and nothing at all was written, a human can authorise one
+        # restart instead. Both paths are reported from their own oracle, and the
+        # restart is never offered while preserved work exists.
+        used = len(store.builder_restarts(task_id))
+        restart_obstacles = self._restart_obstacles(
+            task,
+            iteration,
+            builder_run,
+            changed_names=changed_names,
+            worktree_ready=worktree_ready,
+        )
+        view["restart"] = {
+            "eligible": not restart_obstacles,
+            "obstacles": restart_obstacles,
+            "authorized": [
+                {
+                    "id": item["id"],
+                    "failed_iteration_id": item["failed_iteration_id"],
+                    "failed_run_id": item["failed_run_id"],
+                    "failure_reason": item["failure_reason"],
+                    "restart_number": item["restart_number"],
+                    "created_at": item["created_at"],
+                }
+                for item in store.builder_restarts(task_id)
+            ],
+            "limit": MAX_BUILDER_RESTARTS,
+            "used": used,
+            "next": (
+                None
+                if restart_obstacles or builder_run is None
+                else (
+                    f"loomsphere-harness restart-builder {task_id} "
+                    f"--failed-run {builder_run['id']}"
+                )
+            ),
+        }
         return view
 
     def recover_builder(self, task_id: str, *, snapshot_digest: str) -> dict[str, Any]:
@@ -957,8 +1009,10 @@ class ImplementationStage:
                 )
             if not iteration.get("commit_sha") and not preserved:
                 obstacles.append(
-                    "The failed run never committed a change set, so there is nothing "
-                    "to authorize."
+                    "The failed run never committed a change set and none of the work "
+                    "left behind could be preserved, so there is nothing to authorize "
+                    "here; a worktree that holds no change at all can be restarted with "
+                    "`restart-builder`."
                 )
             if iteration.get("build_report") or iteration.get("build_digest"):
                 obstacles.append(
@@ -1083,6 +1137,247 @@ class ImplementationStage:
     @staticmethod
     def _refuse_recovery(message: str) -> NoReturn:
         raise EngineError(REASON_RECOVERY_REFUSED, message)
+
+    # -- human-authorised restart of an interrupted Builder ------------------
+    def _restart_obstacles(
+        self,
+        task: dict[str, Any],
+        iteration: dict[str, Any] | None,
+        builder_run: dict[str, Any] | None,
+        *,
+        changed_names: Sequence[str] | None,
+        worktree_ready: bool,
+    ) -> list[str]:
+        """Every reason an interrupted Builder cannot be restarted, in one place.
+
+        `inspect-recovery` reports these and `restart-builder` refuses on the same
+        list, so what a human is shown and what the gate enforces cannot drift.
+
+        ``changed_names`` is the change set read from the task worktree, including
+        untracked and ignored paths, or ``None`` when it could not be read. A
+        restart is only ever available for a run that left nothing behind: as soon
+        as any preserved work exists, ``recover-builder`` is the correct path and
+        discarding it in favour of a fresh attempt would be a silent reset.
+        """
+
+        store = self.store
+        task_id = task["id"]
+        obstacles: list[str] = []
+        if task["status"] != "implementation_failed":
+            obstacles.append(
+                f"Task {task_id} is {task['status']}; only implementation_failed can be "
+                "restarted."
+            )
+        if iteration is None:
+            obstacles.append("The task has no iteration to restart.")
+        else:
+            if iteration["status"] != ITERATION_FAILED:
+                obstacles.append(
+                    f"Iteration {iteration['number']} is {iteration['status']}; "
+                    "only a failed iteration can be restarted."
+                )
+            if iteration.get("commit_sha"):
+                obstacles.append(
+                    "The failed iteration recorded a committed change set, so preserved "
+                    "work exists; use `inspect-recovery` and `recover-builder` instead."
+                )
+            if iteration.get("build_report") or iteration.get("build_digest"):
+                obstacles.append(
+                    "This iteration already has a Builder report, so the Builder finished "
+                    "its turn; a restart applies only to an interrupted run."
+                )
+            if iteration["base_commit"] != task.get("repo_commit"):
+                obstacles.append(
+                    "The iteration base commit is not the approved repository commit, so a "
+                    "restart would not start from the authorized commit."
+                )
+        if builder_run is None:
+            obstacles.append("No failed Builder run is recorded for this task.")
+        else:
+            if builder_run["status"] not in RECOVERABLE_RUN_STATUSES:
+                obstacles.append(
+                    f"The Builder run is {builder_run['status']}, not a failed run."
+                )
+            reason = builder_run.get("failure_reason")
+            if reason not in RESTARTABLE_FAILURES:
+                obstacles.append(
+                    f"The Builder stopped with {reason!r}; a restart applies only to an "
+                    "interruption that cut the run short "
+                    f"({', '.join(RESTARTABLE_FAILURES)})."
+                )
+        if store.deliverable(task_id) is not None or store.acceptance(task_id) is not None:
+            obstacles.append("A deliverable or delivery decision already exists.")
+        # Only a failure that committed nothing can leave an empty worktree; when a
+        # commit exists the refusal above already names the preserved work.
+        if iteration is not None and not iteration.get("commit_sha"):
+            if not worktree_ready:
+                obstacles.append(
+                    "The task worktree is missing, so the absence of changes cannot be "
+                    "confirmed."
+                )
+            elif changed_names is None:
+                obstacles.append(
+                    "The task worktree cannot be inspected, so the absence of changes "
+                    "cannot be confirmed."
+                )
+            elif changed_names:
+                shown = ", ".join(changed_names[:5])
+                extra = (
+                    "" if len(changed_names) <= 5 else f" and {len(changed_names) - 5} more"
+                )
+                obstacles.append(
+                    f"The worktree still holds {len(changed_names)} changed path(s): "
+                    f"{shown}{extra}. Preserved work must be recovered, not discarded."
+                )
+        used = len(store.builder_restarts(task_id))
+        if used >= MAX_BUILDER_RESTARTS:
+            if task["status"] == "approved":
+                obstacles.append(
+                    "An authorized Builder restart is already recorded and the task is "
+                    "approved; run `implement` to spend that authorization."
+                )
+            else:
+                obstacles.append(
+                    f"The task already used its {MAX_BUILDER_RESTARTS} authorized Builder "
+                    "restart; a further attempt requires a new task."
+                )
+        obstacles.extend(self._approval_obstacles(task, iteration))
+        return obstacles
+
+    @staticmethod
+    def _refuse_restart(message: str) -> NoReturn:
+        raise EngineError(REASON_RESTART_REFUSED, message)
+
+    def restart_builder(self, task_id: str, *, failed_run_id: str) -> dict[str, Any]:
+        """Authorize one restart of an interrupted Builder that wrote nothing.
+
+        The failed run, its failure reason, its iteration, and the audit trail that
+        recorded them are never rewritten. What is added is a separately recorded
+        authorization naming the failed run and iteration, the approved proposal
+        and approval, the contract digests, and the digest of the empty change set
+        it verified. The task returns to ``approved`` and the ordinary stage runs
+        again, so validation, QA, the Reviewer, and the human delivery decision are
+        unchanged.
+
+        The authorization is written in the same transaction that re-checks every
+        precondition, and it is unique per failed iteration, so a second process
+        cannot authorize a second restart. The whole operation holds the task's
+        recovery lease, so a concurrent repair pass cannot mistake the live restart
+        for an interrupted stage.
+        """
+
+        engine = self.engine
+        store = self.store
+        task = engine._task(task_id)
+        with store.recovery_lease(task_id):
+            return self._restart_builder_under_lease(task, failed_run_id=failed_run_id)
+
+    def _restart_builder_under_lease(
+        self, task: dict[str, Any], *, failed_run_id: str
+    ) -> dict[str, Any]:
+        task_id = task["id"]
+        engine = self.engine
+        store = self.store
+        # Fail closed before authorizing anything: `run` refuses without a sandbox,
+        # and an authorization spent on a run that cannot start would burn the one
+        # restart the task is allowed.
+        if engine.config.sandbox is None:
+            self._refuse_restart(
+                "No sandbox is configured, so the Builder cannot be started safely."
+            )
+        iteration = store.iteration(task_id)
+        runs = store.runs(task_id)
+        builder_run = self._failed_builder_run(runs)
+        if builder_run is not None and builder_run["id"] != failed_run_id:
+            self._refuse_restart(
+                f"The recorded failed Builder run is {builder_run['id']!r}, not "
+                f"{failed_run_id!r}; restart exactly the run that was inspected."
+            )
+
+        # Read the worktree without touching it. `changed_paths` unions the tracked
+        # diff with every untracked path, ignored ones included, so a single stray
+        # file is enough to refuse.
+        path = workspace_path_for(engine.workspace_root, task_id)
+        worktree_ready = is_worktree(path)
+        changed_names: list[str] | None = None
+        if worktree_ready and iteration is not None and not iteration.get("commit_sha"):
+            try:
+                changed_names = changed_paths(path, iteration["base_commit"])
+            except WorkspaceError:
+                changed_names = None
+        obstacles = self._restart_obstacles(
+            task,
+            iteration,
+            builder_run,
+            changed_names=changed_names,
+            worktree_ready=worktree_ready,
+        )
+        if obstacles:
+            self._refuse_restart(" ".join(obstacles))
+        if iteration is None or builder_run is None:  # pragma: no cover - guarded above
+            self._refuse_restart("The task has no failed Builder run and no iteration.")
+
+        # The worktree must still be the trusted one: the recorded branch, the exact
+        # approved commit, and that commit in the current history.
+        try:
+            resumed = resume_task_workspace(engine.workspace_root, task_id)
+            if resumed.commit != iteration["base_commit"] or resumed.commit != task["repo_commit"]:
+                self._refuse_restart(
+                    f"The worktree is at {resumed.commit}, not the approved commit "
+                    f"{task['repo_commit']}."
+                )
+            if not is_ancestor(path, task["repo_commit"], resumed.commit):
+                self._refuse_restart(
+                    "The approved commit is not in the worktree history, so the "
+                    "worktree is not the trusted one."
+                )
+            digest, entries = recoverable_inventory(path, iteration["base_commit"])
+            residual = changed_paths(path, iteration["base_commit"])
+        except WorkspaceError as error:
+            self._refuse_restart(
+                f"The task worktree cannot be verified ({error.code}): {error.message}"
+            )
+        if entries or residual:
+            self._refuse_restart(
+                f"The worktree holds {len(residual)} changed path(s), so preserved work "
+                "exists; use `inspect-recovery` and `recover-builder` instead."
+            )
+
+        contract, _criteria = self._contract(task_id)
+        proposal = store.proposal(task_id)
+        approval = store.approval(task_id)
+        if proposal is None or approval is None:
+            self._refuse_restart("The approved proposal or approval is missing.")
+        record = store.authorize_builder_restart(
+            task_id=task_id,
+            failed_iteration_id=iteration["id"],
+            failed_run_id=failed_run_id,
+            actor=engine.identity.current().id,
+            reason=None,
+            base_commit=iteration["base_commit"],
+            proposal_id=proposal["id"],
+            proposal_digest=proposal["digest"],
+            approval_id=approval["id"],
+            contract_digest=contract_digest(contract),
+            empty_snapshot_digest=digest,
+            limit=MAX_BUILDER_RESTARTS,
+        )
+
+        # The authorization is recorded and the task is back at `approved`; the
+        # unchanged stage opens a fresh iteration and appends a new Builder run. A
+        # failure inside it is recorded by the stage itself, exactly as it would be
+        # for any other iteration, and nothing here retries.
+        outcome = self.run(task_id)
+        return {
+            "restart_id": record["id"],
+            "restart_number": record["restart_number"],
+            "failed_iteration_id": iteration["id"],
+            "failed_run_id": failed_run_id,
+            "failure_reason": record["failure_reason"],
+            "base_commit": record["base_commit"],
+            "empty_snapshot_digest": record["empty_snapshot_digest"],
+            **outcome,
+        }
 
     def _format_failed_review_run(
         self, task_id: str, iteration: dict[str, Any], runs: dict[str, dict[str, Any]]
@@ -2141,14 +2436,18 @@ __all__ = [
     "ImplementationStage",
     "ADVERSE_QA_VERDICTS",
     "MAX_BUILDER_RECOVERIES",
+    "MAX_BUILDER_RESTARTS",
     "MAX_QA_FORMAT_ATTEMPTS",
     "MAX_REVIEW_RETRIES",
     "QA_FORMAT_RETRY_EVENT",
     "RECOVERABLE_FAILURES",
+    "RESTARTABLE_FAILURES",
     "REASON_BUILDER_INTERRUPTED",
     "REASON_RECOVERY_ELIGIBLE",
     "REASON_RECOVERY_INCOMPLETE",
     "REASON_RECOVERY_REFUSED",
+    "REASON_RESTART_EXHAUSTED",
+    "REASON_RESTART_REFUSED",
     "REASON_REVIEW_RETRY_REFUSED",
     "REASON_CONTRACT_UNAVAILABLE",
     "REASON_INVALID_BUILD_REPORT",
