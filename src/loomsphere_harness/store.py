@@ -22,11 +22,11 @@ try:  # pragma: no cover - the fallback exists only for platforms without POSIX 
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-SCHEMA_VERSION = 3
-#: Versions this build can open. A v1 or v2 database is migrated forward by
+SCHEMA_VERSION = 4
+#: Versions this build can open. A v1, v2, or v3 database is migrated forward by
 #: ``initialize``; ``check`` refuses anything else so no stage runs on data it
 #: cannot read.
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, SCHEMA_VERSION)
 GENESIS = "0" * 64
 
 #: Every role that can own a run row in schema v2.
@@ -43,6 +43,16 @@ RECOVERY_EVENT = "recovery.authorized"
 #: Iteration statuses a Builder recovery may claim: ``failed`` is the normal
 #: shape, ``building`` is what an interrupted process leaves behind.
 RECOVERABLE_ITERATION_STATUSES = ("failed", "building")
+
+#: Audit event that records one human authorisation to restart a Builder that
+#: stopped without writing anything. The immutable row it accompanies is the
+#: durable limit: counting it is what makes the restart one-time across process
+#: restarts and concurrent invocations.
+BUILDER_RESTART_EVENT = "builder.restart-authorized"
+
+#: Run statuses that mean a Builder run did not finish its turn. A restart is
+#: only ever authorized against one of these.
+INTERRUPTED_RUN_STATUSES = ("failed", "interrupted")
 
 
 class StoreError(RuntimeError):
@@ -142,6 +152,19 @@ CREATE TABLE acceptances (
   decision TEXT NOT NULL CHECK (decision IN ('accepted','rejected')),
   actor TEXT NOT NULL, reason TEXT, decided_at TEXT NOT NULL
 );
+CREATE TABLE builder_restarts (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  failed_iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  failed_run_id TEXT NOT NULL REFERENCES runs(id),
+  restart_number INTEGER NOT NULL CHECK (restart_number >= 1),
+  failure_reason TEXT NOT NULL, base_commit TEXT NOT NULL,
+  proposal_id TEXT NOT NULL REFERENCES proposals(id),
+  proposal_digest TEXT NOT NULL,
+  approval_id TEXT NOT NULL REFERENCES approvals(id),
+  contract_digest TEXT NOT NULL,
+  empty_snapshot_digest TEXT NOT NULL,
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
 CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_events
   BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
 CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
@@ -168,6 +191,10 @@ CREATE TRIGGER recoveries_no_update BEFORE UPDATE ON recoveries
   BEGIN SELECT RAISE(ABORT, 'a recovery record is immutable'); END;
 CREATE TRIGGER recoveries_no_delete BEFORE DELETE ON recoveries
   BEGIN SELECT RAISE(ABORT, 'a recovery record cannot be deleted'); END;
+CREATE TRIGGER builder_restarts_no_update BEFORE UPDATE ON builder_restarts
+  BEGIN SELECT RAISE(ABORT, 'a Builder restart record is immutable'); END;
+CREATE TRIGGER builder_restarts_no_delete BEFORE DELETE ON builder_restarts
+  BEGIN SELECT RAISE(ABORT, 'a Builder restart record cannot be deleted'); END;
 """
 
 #: Tables added by schema v2. Kept separate so the v1→v2 migration applies exactly
@@ -229,6 +256,29 @@ CREATE TRIGGER IF NOT EXISTS recoveries_no_update BEFORE UPDATE ON recoveries
   BEGIN SELECT RAISE(ABORT, 'a recovery record is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS recoveries_no_delete BEFORE DELETE ON recoveries
   BEGIN SELECT RAISE(ABORT, 'a recovery record cannot be deleted'); END;
+"""
+
+#: Objects added by schema v4: the human-authorised, one-time restart of a Builder
+#: that stopped before writing a change set. The row is immutable and unique per
+#: failed iteration, so the authorization cannot be replayed or duplicated.
+V4_TABLES = """
+CREATE TABLE IF NOT EXISTS builder_restarts (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  failed_iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  failed_run_id TEXT NOT NULL REFERENCES runs(id),
+  restart_number INTEGER NOT NULL CHECK (restart_number >= 1),
+  failure_reason TEXT NOT NULL, base_commit TEXT NOT NULL,
+  proposal_id TEXT NOT NULL REFERENCES proposals(id),
+  proposal_digest TEXT NOT NULL,
+  approval_id TEXT NOT NULL REFERENCES approvals(id),
+  contract_digest TEXT NOT NULL,
+  empty_snapshot_digest TEXT NOT NULL,
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS builder_restarts_no_update BEFORE UPDATE ON builder_restarts
+  BEGIN SELECT RAISE(ABORT, 'a Builder restart record is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS builder_restarts_no_delete BEFORE DELETE ON builder_restarts
+  BEGIN SELECT RAISE(ABORT, 'a Builder restart record cannot be deleted'); END;
 """
 
 
@@ -366,8 +416,38 @@ class SqliteStore:
         if version == 2:
             self._migrate_v2_to_v3(connection)
             version = 3
+        if version == 3:
+            self._migrate_v3_to_v4(connection)
+            version = 4
         if version != SCHEMA_VERSION:  # pragma: no cover - unreachable by construction
             raise StoreError("state-version", "The state database version is unsupported.")
+
+    def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
+        """Add the Builder-restart authorization table without touching a row.
+
+        v4 only creates objects, so the existing evidence is read back unchanged
+        and compared by row count, exactly as v2→v3 does.
+        """
+
+        previous = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("tasks", "runs", "iterations", "recoveries")
+        }
+        connection.executescript(V4_TABLES)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        for table, count in previous.items():
+            now_count = connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            if now_count != count:
+                raise StoreError(
+                    "state-corrupt", "The schema migration did not preserve every recorded row."
+                )
 
     def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
         """Add the builder-recovery table without touching a recorded row.
@@ -1160,6 +1240,185 @@ class SqliteStore:
                 },
             )
         return self.recovery_for_iteration(iteration_id)  # type: ignore[return-value]
+
+    def builder_restarts(self, task_id: str) -> list[dict[str, Any]]:
+        """Every recorded authorization to restart this task's Builder."""
+
+        db = self._connect()
+        try:
+            rows = db.execute(
+                "SELECT * FROM builder_restarts WHERE task_id = ? ORDER BY created_at",
+                (task_id,),
+            ).fetchall()
+        finally:
+            db.close()
+        return [dict(row) for row in rows]
+
+    def builder_restart_for_iteration(self, iteration_id: str) -> dict[str, Any] | None:
+        db = self._connect()
+        try:
+            return _row(db.execute(
+                "SELECT * FROM builder_restarts WHERE failed_iteration_id = ?", (iteration_id,)
+            ).fetchone())
+        finally:
+            db.close()
+
+    def authorize_builder_restart(
+        self, *, task_id: str, failed_iteration_id: str, failed_run_id: str, actor: str,
+        reason: str | None, base_commit: str, proposal_id: str,
+        proposal_digest: str, approval_id: str, contract_digest: str,
+        empty_snapshot_digest: str, limit: int,
+    ) -> dict[str, Any]:
+        """Claim the one authorized restart of a Builder that wrote nothing, atomically.
+
+        Every condition a restart depends on is re-checked here, inside the write
+        transaction, rather than trusted from the caller: the task status, the
+        single-authorization limit, the failed iteration and run, the absence of a
+        Builder report, deliverable, or acceptance, and the approval that binds the
+        proposal and contract. Two concurrent invocations therefore cannot both
+        authorize, and a row that already exists cannot be replayed.
+
+        The task moves back to ``approved`` so the normal implementation loop opens
+        the next iteration; the authorization itself is the only thing that permits
+        it. The failed run, the failed iteration, and every audit event already
+        recorded are never modified.
+        """
+
+        restart_id = str(uuid.uuid4())
+        with self._tx() as db:
+            task = db.execute(
+                "SELECT status, repo_commit FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise StoreError("task-not-found", f"No task {task_id}.")
+            # The authorization count is checked before the status so that a second
+            # concurrent attempt reports exhaustion, which is what happened, rather
+            # than the transition this attempt never reached.
+            used = db.execute(
+                "SELECT COUNT(*) AS n FROM builder_restarts WHERE task_id = ?", (task_id,)
+            ).fetchone()["n"]
+            if used >= limit:
+                raise StoreError(
+                    "restart-exhausted",
+                    f"Task {task_id} already used its {limit} authorized Builder restart.",
+                )
+            if task["status"] != "implementation_failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Task {task_id} is {task['status']}; expected implementation_failed.",
+                )
+            iteration = db.execute(
+                "SELECT number, status, base_commit, commit_sha, build_report, build_digest"
+                " FROM iterations WHERE id = ? AND task_id = ?",
+                (failed_iteration_id, task_id),
+            ).fetchone()
+            if iteration is None:
+                raise StoreError(
+                    "iteration-not-found", f"No iteration {failed_iteration_id} for {task_id}."
+                )
+            if iteration["status"] != "failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Iteration {failed_iteration_id} is {iteration['status']}; expected failed.",
+                )
+            if iteration["commit_sha"] is not None:
+                raise StoreError(
+                    "restart-refused",
+                    "The failed iteration recorded a commit, so preserved work exists.",
+                )
+            if iteration["build_report"] is not None or iteration["build_digest"] is not None:
+                raise StoreError(
+                    "restart-refused", "The failed iteration recorded a Builder report."
+                )
+            if iteration["base_commit"] != task["repo_commit"] or base_commit != task["repo_commit"]:
+                raise StoreError(
+                    "restart-refused",
+                    "The iteration base commit is not the approved repository commit.",
+                )
+            placeholders = ",".join("?" for _ in INTERRUPTED_RUN_STATUSES)
+            run = db.execute(
+                "SELECT role, status, failure_reason FROM runs"
+                f" WHERE id = ? AND task_id = ? AND status IN ({placeholders})",
+                (failed_run_id, task_id, *INTERRUPTED_RUN_STATUSES),
+            ).fetchone()
+            if run is None or run["role"] != "builder":
+                raise StoreError(
+                    "restart-refused", "The supplied id is not a failed Builder run."
+                )
+            if db.execute(
+                "SELECT 1 FROM deliverables WHERE task_id = ? LIMIT 1", (task_id,)
+            ).fetchone() is not None or db.execute(
+                "SELECT 1 FROM acceptances WHERE task_id = ? LIMIT 1", (task_id,)
+            ).fetchone() is not None:
+                raise StoreError(
+                    "restart-refused", "A deliverable or delivery decision already exists."
+                )
+            proposal = db.execute(
+                "SELECT id, digest, status, document FROM proposals"
+                " WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            approval = db.execute(
+                "SELECT id, proposal_id, proposal_digest, decision, repo_commit FROM approvals"
+                " WHERE task_id = ? ORDER BY decided_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                proposal is None
+                or approval is None
+                or proposal["id"] != proposal_id
+                or proposal["digest"] != proposal_digest
+                or proposal["status"] != "approved"
+                or hashlib.sha256(proposal["document"].encode("utf-8")).hexdigest()
+                != proposal["digest"]
+                or approval["id"] != approval_id
+                or approval["decision"] != "approved"
+                or approval["proposal_id"] != proposal["id"]
+                or approval["proposal_digest"] != proposal["digest"]
+            ):
+                raise StoreError(
+                    "restart-refused", "The original approval no longer matches the proposal."
+                )
+            if approval["repo_commit"] not in (None, task["repo_commit"]):
+                raise StoreError(
+                    "restart-refused",
+                    "The approved repository commit is not the one the task recorded.",
+                )
+            db.execute(
+                "INSERT INTO builder_restarts VALUES"
+                " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    restart_id, task_id, failed_iteration_id, failed_run_id,
+                    used + 1, str(run["failure_reason"] or "unknown"), base_commit,
+                    proposal["id"], proposal["digest"], approval["id"], contract_digest,
+                    empty_snapshot_digest, actor, reason, now(),
+                ),
+            )
+            # The status transition is audited with the authorization, so the one
+            # event that permits a second Builder run carries the exact record it
+            # authorized. `approved` is the only status the loop opens an
+            # iteration from other than `changes_required`, which this is not.
+            self._set_status(
+                db, task_id, "approved", actor, ("implementation_failed",),
+                BUILDER_RESTART_EVENT,
+                {
+                    "restart_id": restart_id,
+                    "failed_iteration_id": failed_iteration_id,
+                    "failed_run_id": failed_run_id,
+                    "failure_reason": str(run["failure_reason"] or "unknown"),
+                    "restart_number": used + 1,
+                    "base_commit": base_commit,
+                    "proposal_id": proposal["id"],
+                    "proposal_digest": proposal["digest"],
+                    "approval_id": approval["id"],
+                    "contract_digest": contract_digest,
+                    "empty_snapshot_digest": empty_snapshot_digest,
+                    "reason_note": reason,
+                    "limit": limit,
+                    "attempt": used + 1,
+                },
+            )
+        return self.builder_restart_for_iteration(failed_iteration_id)  # type: ignore[return-value]
 
     def iteration(self, task_id: str) -> dict[str, Any] | None:
         db = self._connect()

@@ -356,6 +356,28 @@ human acceptance gates as any other delivery, and the deliverable records
 `builder.status = "not-recorded"` because no Builder report or Builder test run
 ever existed.
 
+### Restarting a Builder that wrote nothing
+
+A Builder that times out or is interrupted before writing anything leaves an empty
+worktree, so there is nothing to recover and `implement` will not reopen a failed
+task. `inspect-recovery` reports that case as *not recoverable* and offers the one
+narrow alternative instead:
+
+```sh
+loomsphere-harness --repo . restart-builder T-0001 --failed-run <run id>
+```
+
+You are authorizing exactly one fresh Builder attempt, and only for a task that
+failed without producing anything: the original approval and acceptance contract
+must be unchanged, the run must have been cut short by an interruption, no Builder
+report or deliverable may exist, the worktree must hold no committed, uncommitted,
+untracked, or ignored change, and the task must still be on its approved commit.
+Preserved work is refused rather than discarded — that is what `recover-builder` is
+for. The authorization is recorded in an append-only table, the failed run and its
+iteration keep everything they recorded, and the restart is allowed once. The task
+returns to `approved` and the ordinary `implement` path runs the same validation,
+QA, Reviewer, and human acceptance gates; nothing is retried automatically.
+
 ## 10. Reviewing evidence
 
 ```sh

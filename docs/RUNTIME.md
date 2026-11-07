@@ -13,8 +13,10 @@ and the only model call boundary is the `AgentRunner` seam. The loop stops at a
 human acceptance decision: it never mirrors a push, opens a pull request, or merges.
 
 Phase 2C.1 shipped Intake → Architect → approval. Phase 2C.2 adds the
-build/verify/review loop and delivery acceptance on top of the same runtime; the
-store is now schema v2 and migrates an existing v1 state file in place.
+build/verify/review loop and delivery acceptance on top of the same runtime.
+Phase 2C.3 adds recovery of a failed Builder's preserved work and this phase adds
+the one-time restart of a Builder that wrote nothing; the store is now schema v4
+and migrates an existing v1, v2, or v3 state file in place.
 
 ## Install
 
@@ -122,6 +124,7 @@ loomsphere-harness --repo . implement T-0001   # Builder, validation, QA, Review
 loomsphere-harness --repo . retry-review T-0001 # one Reviewer-only retry
 loomsphere-harness --repo . inspect-recovery T-0001 # work a failed Builder left behind
 loomsphere-harness --repo . recover-builder T-0001 --snapshot-digest <sha256>
+loomsphere-harness --repo . restart-builder T-0001 --failed-run <run id>
 loomsphere-harness --repo . changes T-0001     # recorded change set of the deliverable
 loomsphere-harness --repo . evidence T-0001    # validation run and review evidence
 loomsphere-harness --repo . accept  T-0001 --digest <deliverable sha256> [--reason "..."]
@@ -137,7 +140,8 @@ repository to it. The runtime never reads assets from inside the target repo.
 stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
 `implement` → `awaiting_acceptance`, `changes`/`evidence` → no deliverable,
 `inspect-recovery` → the preserved work is not recoverable, `recover-builder` → the
-recovered work did not reach `awaiting_acceptance`).
+recovered work did not reach `awaiting_acceptance`, `restart-builder` → the
+restarted work did not reach `awaiting_acceptance`).
 
 ## Recovering work a failed Builder left behind
 
@@ -189,7 +193,44 @@ human makes:
   `status: "not-recorded"` with `tests_run: null`, the QA and Reviewer prompts carry a
   recovery provenance block telling them no Builder report exists, and the top-level
   `recovery` document ends at `acceptance: "pending-human-acceptance".
+## Restarting a Builder that wrote nothing
 
+A Builder can also stop before it writes a single file — a timeout or a killed
+process leaves an empty worktree. There is no work to recover, and `implement`
+refuses a task that already failed, so nothing but rewriting state could continue it.
+`restart-builder` is the narrow alternative:
+
+- `inspect-recovery <task>` still leads. It reports the failed Builder run, the empty
+  change set, and a separate `restart` section: whether a restart is available, every
+  obstacle that would block one, the authorizations already recorded, and the exact
+  command to run next. It stays read-only, writes no audit event, and does not call
+  the Builder. An empty change set is reported as *not recoverable*, because
+  `recover-builder` needs a change set to authorize.
+- `restart-builder <task> --failed-run <run id>` refuses (`restart-refused`) unless
+  every one of these holds: the task is `implementation_failed`; the original
+  proposal approval and the acceptance contract are unchanged and still match; the
+  failed Builder run's reason is an interruption that cut it short (`timed-out`,
+  `builder-interrupted`, `interrupted` — a run that exhausted its budget or hit a
+  model error is refused); no Builder report, deliverable, or delivery decision is
+  recorded; the worktree holds no committed, uncommitted, untracked, or ignored
+  change; the task worktree is on the same commit the task approved; and no restart
+  was already authorized. Preserved work is refused, not discarded — that is the
+  `recover-builder` path.
+- One restart per task is a database constraint, not a flag: the authorization is
+  unique per failed iteration and counted inside the same write transaction that
+  moves the task back to `approved`, so a second invocation, a second process, or a
+  restarted CLI cannot authorize twice. The authorization carries the failed run,
+  the approval and contract digests, and the digest of the empty change set it
+  verified.
+- Nothing existing is rewritten. The failed run keeps its `failed` status and reason,
+  the failed iteration keeps its failure reason and detail, and the authorization is
+  recorded beside them in an append-only `builder_restarts` table with the
+  authorizing OS user.
+- Only the authorization is granted by the command; the Builder itself still runs
+  under `implement`'s conditions. The task returns to `approved` and the normal loop
+  opens the next iteration, so validation, QA, the Reviewer, and the human acceptance
+  gate are exactly the ones a first attempt faces. Nothing is retried automatically,
+  and no budget, limit, or gate is relaxed.
 ## What is enforced
 
 - **Approval** is by the local OS user (not a model) and must quote the SHA-256 of
@@ -209,10 +250,11 @@ human makes:
 - **Blocking Intake questions** stop the task at `needs_clarification` (no Architect
   run). Clarification answers are not part of this milestone: resubmit a clarified
   requirement.
-- **Restart**: all state is SQLite. A run left `running` by a crash is marked
+- **Crash repair**: all state is SQLite. A run left `running` by a crash is marked
   `interrupted` on the next command and the stage can be re-run with `run`; a Builder
   stage is additionally left recoverable, with its uncommitted work preserved for
-  `recover-builder`.
+  `recover-builder`, and a Builder that wrote nothing is eligible for one
+  human-authorized `restart-builder`.
 - **Isolated worktree**: the Builder never runs in the developer's checkout. Each
   task gets `task-<key>` at `workspace_root/task-<key>` on branch
   `loomsphere/task-<key>`, created from the approved `HEAD`. The workspace root must

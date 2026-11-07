@@ -45,7 +45,11 @@ from loomsphere_harness.pydantic_harness import PydanticHarnessRunner  # noqa: E
 from loomsphere_harness.repository import GitRepository, OsUserIdentity  # noqa: E402
 from loomsphere_harness.sandbox import SandboxExecutor, SandboxPolicy  # noqa: E402
 from loomsphere_harness.store import SqliteStore, StoreError  # noqa: E402
-from loomsphere_harness.workspace import changed_paths, ensure_task_workspace  # noqa: E402
+from loomsphere_harness.workspace import (  # noqa: E402
+    changed_paths,
+    ensure_task_workspace,
+    recoverable_inventory,
+)
 
 IMAGE_ID = "sha256:" + "b" * 64
 CRITERION_ID = "AC-1"
@@ -1835,6 +1839,497 @@ class BuilderRecovery(LoopCase):
         self.assertIsNone(engine.store.iteration(task_id)["commit_sha"])
         self.assertTrue((worktree / "tests" / "test_hello.py").exists())
         self.assertTrue((worktree / "tests" / "linked.py").is_symlink())
+
+
+class BuilderRestart(LoopCase):
+    """An interrupted Builder that wrote nothing can be restarted once, by a human.
+
+    The pilot left exactly this state: the Builder timed out after 180 seconds with
+    an empty worktree, so there was no preserved work to recover and no way to run
+    the task again. A restart is authorized once, in its own immutable record, and
+    the ordinary stage then runs again — the failed run, its failure reason, and the
+    audit chain that recorded them are never rewritten.
+    """
+
+    def worktree(self, engine, task_id):
+        return engine.workspace_root / f"task-{task_id.lower()}"
+
+    def timed_out(self, **options):
+        """The pilot's state: the Builder stops before writing a single file."""
+
+        options.setdefault("builder_failures", {1: TimeoutError("the run timed out")})
+        options.setdefault("attempt_files", {1: {}})
+        engine, task_id, calls = self.approved_task(**options)
+        view = engine.implement(task_id)
+        self.assertEqual(view["implementation"]["reason"], "timed-out")
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertIsNone(view["deliverable"])
+        return engine, task_id, calls
+
+    def inspection(self, engine, task_id):
+        return engine.inspect_recovery(task_id)["recovery"]
+
+    def failed_run(self, engine, task_id):
+        return [run for run in engine.store.runs(task_id) if run["role"] == "builder"][-1]
+
+    def assertRefused(self, engine, task_id, *, run_id=None, code="restart-refused"):
+        """A refusal changes nothing at all: no run, no audit event, no restart."""
+
+        worktree = self.worktree(engine, task_id)
+        task_before = engine._task(task_id)
+        iteration_before = engine.store.iteration(task_id)
+        runs_before = engine.store.runs(task_id)
+        audit_before = engine.store.audit_events(task_id)
+        restarts_before = engine.store.builder_restarts(task_id)
+        head_before = self.head_of(worktree)
+        porcelain_before = self.porcelain(worktree)
+
+        with self.assertRaises(EngineError) as raised:
+            engine.restart_builder(
+                task_id, failed_run_id=run_id or self.failed_run(engine, task_id)["id"]
+            )
+
+        self.assertEqual(raised.exception.code, code)
+        self.assertEqual(engine._task(task_id), task_before)
+        self.assertEqual(engine.store.iteration(task_id), iteration_before)
+        self.assertEqual(engine.store.runs(task_id), runs_before)
+        self.assertEqual(engine.store.audit_events(task_id), audit_before)
+        self.assertEqual(engine.store.builder_restarts(task_id), restarts_before)
+        self.assertEqual(self.head_of(worktree), head_before)
+        self.assertEqual(self.porcelain(worktree), porcelain_before)
+        return raised.exception
+
+    def authorization(self, engine, task_id):
+        """The exact values a restart authorization is bound to."""
+
+        task = engine._task(task_id)
+        iteration = engine.store.iteration(task_id)
+        proposal = engine.store.proposal(task_id)
+        approval = engine.store.approval(task_id)
+        contract, _criteria = ImplementationStage(engine)._contract(task_id)
+        return {
+            "task_id": task_id,
+            "failed_iteration_id": iteration["id"],
+            "failed_run_id": self.failed_run(engine, task_id)["id"],
+            "actor": "bob",
+            "reason": None,
+            "base_commit": task["repo_commit"],
+            "proposal_id": proposal["id"],
+            "proposal_digest": proposal["digest"],
+            "approval_id": approval["id"],
+            "contract_digest": implementation_module.contract_digest(contract),
+            "empty_snapshot_digest": "e" * 64,
+            "limit": 1,
+        }
+
+    # -- the pilot's state ----------------------------------------------------
+    def test_a_timeout_that_wrote_nothing_is_not_reported_as_recoverable(self) -> None:
+        """The correction that matters most: no work means no recovery to authorise."""
+
+        engine, task_id, _ = self.timed_out()
+        worktree = self.worktree(engine, task_id)
+        iteration = engine.store.iteration(task_id)
+
+        self.assertEqual(iteration["status"], "failed")
+        self.assertEqual(iteration["failure_reason"], "timed-out")
+        self.assertIsNone(iteration["commit_sha"])
+        self.assertIsNone(iteration["build_report"])
+        self.assertEqual(self.porcelain(worktree), "")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertIsNone(inspection["snapshot"])
+        self.assertIsNone(inspection["next"])
+        self.assertTrue(
+            any("never committed a change set" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        rendered = render_recovery({"recovery": inspection})
+        self.assertIn("Not recoverable:", rendered)
+        self.assertNotIn("Recovery available", rendered)
+
+    def test_the_inspection_offers_the_restart_for_an_empty_worktree(self) -> None:
+        engine, task_id, _ = self.timed_out()
+
+        inspection = self.inspection(engine, task_id)
+
+        restart = inspection["restart"]
+        self.assertTrue(restart["eligible"], restart["obstacles"])
+        self.assertEqual(restart["obstacles"], [])
+        self.assertEqual(restart["authorized"], [])
+        self.assertEqual(restart["limit"], 1)
+        self.assertEqual(restart["used"], 0)
+        self.assertIn("restart-builder", restart["next"])
+        self.assertIn(self.failed_run(engine, task_id)["id"], restart["next"])
+        rendered = render_recovery({"recovery": inspection})
+        self.assertIn("Restart available", rendered)
+        self.assertIn("authorized restarts 0 of 1", rendered)
+
+    # -- the authorised restart ----------------------------------------------
+    def test_a_restart_after_a_timeout_delivers_through_the_existing_pipeline(self) -> None:
+        engine, task_id, calls = self.timed_out(
+            attempt_files={
+                1: {},
+                2: BUILT_FILES,
+            }
+        )
+        failed_run_id = self.failed_run(engine, task_id)["id"]
+
+        view = engine.restart_builder(task_id, failed_run_id=failed_run_id)
+
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["implementation"]["restart_number"], 1)
+        self.assertEqual(view["implementation"]["failed_run_id"], failed_run_id)
+        self.assertEqual(len(view["implementation"]["empty_snapshot_digest"]), 64)
+        # The restart runs the unchanged loop: a fresh iteration, then QA and the
+        # Reviewer, with validation executed in the sandbox.
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder", "builder", "qa", "reviewer"],
+        )
+        self.assertTrue(any("--network" in call for call in calls))
+        iterations = engine.store.iterations(task_id)
+        self.assertEqual([item["number"] for item in iterations], [1, 2])
+        self.assertEqual(iterations[0]["status"], "failed")
+        self.assertEqual(iterations[0]["failure_reason"], "timed-out")
+        self.assertEqual(iterations[1]["status"], "ready")
+        self.assertNotEqual(iterations[1]["commit_sha"], iterations[1]["base_commit"])
+        # The human gate is untouched by the restart.
+        self.assertIsNone(view["acceptance"])
+        document = view["deliverable"]["document"]
+        self.assertEqual(document["iteration"]["commit"], iterations[1]["commit_sha"])
+        engine.accept_delivery(
+            task_id, deliverable_digest=view["deliverable"]["digest"], reason="looks right"
+        )
+        self.assertEqual(engine.describe(task_id)["task"]["status"], "delivered")
+
+    def test_the_failed_run_and_its_audit_chain_are_preserved(self) -> None:
+        engine, task_id, _ = self.timed_out(attempt_files={1: {}, 2: BUILT_FILES})
+        iteration_before = engine.store.iteration(task_id)
+        runs_before = engine.store.runs(task_id)
+        events_before = engine.store.audit_events(task_id)
+        failed_run_id = self.failed_run(engine, task_id)["id"]
+        # The digest the authorization must record: this worktree, this base commit,
+        # and nothing changed.
+        empty_digest, empty_entries = recoverable_inventory(
+            self.worktree(engine, task_id), iteration_before["base_commit"]
+        )
+        self.assertEqual(empty_entries, [])
+
+        view = engine.restart_builder(task_id, failed_run_id=failed_run_id)
+
+        # The failed iteration is exactly what the failure recorded.
+        iterations = engine.store.iterations(task_id)
+        self.assertEqual(
+            {key: iterations[0][key] for key in ("id", "number", "status", "failure_reason",
+                                                 "failure_detail", "commit_sha")},
+            {key: iteration_before[key] for key in ("id", "number", "status", "failure_reason",
+                                                    "failure_detail", "commit_sha")},
+        )
+        self.assertEqual(iterations[0]["failure_reason"], "timed-out")
+        self.assertIsNone(iterations[0]["commit_sha"])
+        # Every run the failure recorded is unchanged, including the failed Builder.
+        after = {run["id"]: run for run in engine.store.runs(task_id)}
+        for run in runs_before:
+            self.assertEqual(after[run["id"]], run)
+        self.assertEqual(
+            after[failed_run_id]["status"], "failed"
+        )
+        self.assertEqual(after[failed_run_id]["failure_reason"], "timed-out")
+        # The original audit events are all still there, in the same order, and the
+        # chain still verifies end to end.
+        events = engine.store.audit_events(task_id)
+        self.assertEqual(events[: len(events_before)], events_before)
+        self.assertGreater(len(events), len(events_before))
+        self.assertEqual(engine.store.verify_audit_chain(), len(engine.store.audit_events()))
+        # The authorization names exactly what it was bound to, and records the
+        # digest of the empty change set it verified.
+        restart = engine.store.builder_restarts(task_id)[0]
+        self.assertEqual(restart["failed_iteration_id"], iteration_before["id"])
+        self.assertEqual(restart["failed_run_id"], failed_run_id)
+        self.assertEqual(restart["failure_reason"], "timed-out")
+        self.assertEqual(restart["base_commit"], engine._task(task_id)["repo_commit"])
+        self.assertEqual(restart["restart_number"], 1)
+        self.assertEqual(restart["empty_snapshot_digest"], view["implementation"]["empty_snapshot_digest"])
+        self.assertEqual(len(restart["empty_snapshot_digest"]), 64)
+        self.assertEqual(restart["empty_snapshot_digest"], empty_digest)
+        self.assertTrue(
+            any(
+                event["event"] == "builder.restart-authorized"
+                and event["detail"]["restart_id"] == restart["id"]
+                for event in events
+            ),
+            [event["event"] for event in events],
+        )
+
+    def test_the_restart_is_never_run_automatically(self) -> None:
+        """The Builder is only ever invoked again by an explicit human command."""
+
+        engine, task_id, _ = self.timed_out(attempt_files={1: {}, 2: BUILT_FILES})
+        failed_run_id = self.failed_run(engine, task_id)["id"]
+
+        # Reading the state, repairing interrupted stages, and inspecting recovery
+        # never start a Builder run and never spend the authorization.
+        engine.recover()
+        self.inspection(engine, task_id)
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+        self.assertEqual(
+            [run["role"] for run in engine.store.runs(task_id)],
+            ["intake", "architect", "builder"],
+        )
+        self.assertEqual(
+            len([event for event in engine.store.audit_events(task_id)
+                 if event["event"] == "builder.started"]),
+            1,
+        )
+
+        engine.restart_builder(task_id, failed_run_id=failed_run_id)
+
+        self.assertEqual(
+            len([event for event in engine.store.audit_events(task_id)
+                 if event["event"] == "builder.started"]),
+            2,
+        )
+        self.assertEqual(
+            len([run for run in engine.store.runs(task_id) if run["role"] == "builder"]), 2
+        )
+
+    # -- every refusal --------------------------------------------------------
+    def test_untracked_work_blocks_a_restart(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        worktree = self.worktree(engine, task_id)
+        (worktree / "scratch.py").write_text("# loose work\n", encoding="utf-8")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("scratch.py" in item for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id)
+
+        self.assertIn("scratch.py", str(error))
+        # The refusal left the work exactly where the human found it.
+        self.assertTrue((worktree / "scratch.py").exists())
+
+    def test_ignored_work_blocks_a_restart(self) -> None:
+        """An ignored file is still work: `changed_paths` includes it deliberately."""
+
+        engine, task_id, _ = self.timed_out()
+        worktree = self.worktree(engine, task_id)
+        (worktree / ".gitignore").write_text("*.local\n", encoding="utf-8")
+        (worktree / "deploy.local").write_text("KEEP=1\n", encoding="utf-8")
+
+        self.assertFalse(self.inspection(engine, task_id)["restart"]["eligible"])
+        error = self.assertRefused(engine, task_id)
+
+        self.assertIn("deploy.local", str(error))
+        self.assertTrue((worktree / "deploy.local").exists())
+
+    def test_a_changed_base_commit_blocks_a_restart(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        task = engine._task(task_id)
+        # A commit the approval never named, recorded as the task's commit.
+        with closing(sqlite3.connect(self.state)) as connection:
+            connection.execute(
+                "UPDATE tasks SET repo_commit = ? WHERE id = ?", ("f" * 40, task_id)
+            )
+            connection.commit()
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("approved repository commit" in item
+                for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+        self.assertEqual(self.failed_run(engine, task_id)["role"], "builder")
+        self.assertRefused(engine, task_id)
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+        self.assertNotEqual(engine._task(task_id)["repo_commit"], task["repo_commit"])
+
+    def test_an_invalidated_approval_blocks_a_restart(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        # Simulate tampering: the approval row is append-only, so the trigger has to
+        # be dropped to write the corrupt state the check exists to catch.
+        with closing(sqlite3.connect(self.state)) as connection:
+            for name in ("approvals_no_update", "approvals_no_delete"):
+                connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+            connection.execute(
+                "UPDATE approvals SET decision = 'rejected' WHERE task_id = ?", (task_id,)
+            )
+            connection.commit()
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("original approval no longer matches" in item
+                for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id)
+
+        self.assertIn("original approval no longer matches", str(error))
+
+    def test_a_spent_run_is_not_restartable(self) -> None:
+        """The allowlist is the reason: a run that reached its limit is not repeated."""
+
+        engine, task_id, _ = self.approved_task(
+            builder_failures={1: out_of_budget()}, attempt_files={1: {}}
+        )
+        view = engine.implement(task_id)
+        self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
+        # Nothing was written, so recovery has nothing to offer either.
+        self.assertEqual(self.porcelain(self.worktree(engine, task_id)), "")
+
+        inspection = self.inspection(engine, task_id)
+
+        # The run is recoverable in principle but its reason is deliberately not on
+        # the restart allowlist: only an interruption that cut the run short is.
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("interruption that cut the run short" in item
+                for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+
+    def test_a_restart_of_another_run_is_refused(self) -> None:
+        engine, task_id, _ = self.timed_out()
+
+        error = self.assertRefused(engine, task_id, run_id="run-not-the-failed-one")
+
+        self.assertIn("restart exactly the run that was inspected", str(error))
+
+    def test_a_healthy_task_cannot_be_restarted(self) -> None:
+        engine, task_id, _ = self.approved_task()
+        self.assertEqual(engine.implement(task_id)["task"]["status"], "awaiting_acceptance")
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("only implementation_failed" in item
+                for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+
+    # -- exactly one authorization -------------------------------------------
+    def test_a_second_restart_is_refused(self) -> None:
+        timeout = TimeoutError("the run timed out")
+        engine, task_id, _ = self.timed_out(
+            attempt_files={1: {}, 2: {}}, builder_failures={1: timeout, 2: timeout}
+        )
+        failed_run_id = self.failed_run(engine, task_id)["id"]
+
+        # The restarted Builder also stops without writing anything.
+        view = engine.restart_builder(task_id, failed_run_id=failed_run_id)
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(view["implementation"]["reason"], "timed-out")
+        self.assertEqual(len(engine.store.builder_restarts(task_id)), 1)
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["restart"]["eligible"])
+        self.assertTrue(
+            any("already used its 1 authorized Builder restart" in item
+                for item in inspection["restart"]["obstacles"]),
+            inspection["restart"]["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id)
+
+        self.assertIn("already used its 1 authorized Builder restart", str(error))
+
+    def test_two_processes_cannot_both_authorize_a_restart(self) -> None:
+        """The single authorization is a database guarantee, not a process flag."""
+
+        engine, task_id, _ = self.timed_out()
+        values = self.authorization(engine, task_id)
+
+        first = subprocess.Popen(
+            [sys.executable, "-c", _AUTHORIZE_SCRIPT, str(self.state), json.dumps(values)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(HARNESS_ROOT),
+        )
+        second = subprocess.Popen(
+            [sys.executable, "-c", _AUTHORIZE_SCRIPT, str(self.state), json.dumps(values)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(HARNESS_ROOT),
+        )
+        outcomes = []
+        for process in (first, second):
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            outcomes.append(json.loads(stdout))
+
+        self.assertEqual(len([item for item in outcomes if "id" in item]), 1, outcomes)
+        self.assertEqual(
+            [item["error"] for item in outcomes if "error" in item], ["restart-exhausted"]
+        )
+        restarts = engine.store.builder_restarts(task_id)
+        self.assertEqual(len(restarts), 1)
+        self.assertEqual(engine._task(task_id)["status"], "approved")
+
+    def test_a_live_restart_cannot_be_spent_twice(self) -> None:
+        engine, task_id, _ = self.timed_out()
+        failed_run_id = self.failed_run(engine, task_id)["id"]
+
+        with engine.store.recovery_lease(task_id):
+            with self.assertRaises(StoreError) as raised:
+                engine.restart_builder(task_id, failed_run_id=failed_run_id)
+
+        self.assertEqual(raised.exception.code, "recovery-active")
+        self.assertEqual(engine.store.builder_restarts(task_id), [])
+
+    # -- the gates the restart does not bypass --------------------------------
+    def test_the_restarted_work_still_stops_at_validation(self) -> None:
+        engine, task_id, _ = self.timed_out(
+            attempt_files={1: {}, 2: BUILT_FILES}, validation_exit_code=1
+        )
+
+        view = engine.restart_builder(
+            task_id, failed_run_id=self.failed_run(engine, task_id)["id"]
+        )
+
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(view["implementation"]["reason"], "validation-failed")
+        self.assertIsNone(view["deliverable"])
+        self.assertEqual(engine.store.builder_restarts(task_id)[0]["restart_number"], 1)
+        # QA and the Reviewer never saw the change set.
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder", "builder"],
+        )
+
+    def test_the_restarted_work_still_stops_at_a_rejecting_reviewer(self) -> None:
+        engine, task_id, _ = self.timed_out(
+            attempt_files={1: {}, 2: BUILT_FILES}, review_verdicts=[REVIEW_REJECTED]
+        )
+
+        view = engine.restart_builder(
+            task_id, failed_run_id=self.failed_run(engine, task_id)["id"]
+        )
+
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertEqual(view["implementation"]["reason"], "review-rejected")
+        self.assertIsNone(view["acceptance"])
+        self.assertIsNone(view["deliverable"])
+
+
+_AUTHORIZE_SCRIPT = (
+    "import json, sys\n"
+    "from loomsphere_harness.store import SqliteStore, StoreError\n"
+    "values = json.loads(sys.argv[2])\n"
+    "try:\n"
+    "    row = SqliteStore(sys.argv[1]).authorize_builder_restart(**values)\n"
+    "except StoreError as error:\n"
+    "    print(json.dumps({'error': error.code}))\n"
+    "else:\n"
+    "    print(json.dumps({'id': row['id']}))\n"
+)
 
 
 if __name__ == "__main__":  # pragma: no cover

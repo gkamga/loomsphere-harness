@@ -641,6 +641,22 @@ class Engine:
         )
         return {"implementation": outcome, **self.describe(task_id)}
 
+    def restart_builder(self, task_id: str, *, failed_run_id: str) -> dict[str, Any]:
+        """Authorize one restart of an interrupted Builder that left no changes.
+
+        The counterpart of `recover_builder` for a run that stopped before writing
+        anything: there is no preserved work to carry forward, so a human authorizes
+        exactly one fresh attempt. The failed run and its audit history are kept.
+        """
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        self.recover()
+        outcome = ImplementationStage(self).restart_builder(
+            task_id, failed_run_id=failed_run_id
+        )
+        return {"implementation": outcome, **self.describe(task_id)}
+
     def accept_delivery(
         self, task_id: str, *, deliverable_digest: str, reason: str | None = None
     ) -> dict[str, Any]:
