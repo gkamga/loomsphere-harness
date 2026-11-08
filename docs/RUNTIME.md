@@ -398,6 +398,39 @@ characters per file read, 200 directory-listing entries, 100 search matches, and
 These bounds apply equally to read-only Intake and Architect runs and to the
 Builder.
 
+Those bounds cap a single result, not the history it accumulates. Every provider
+request re-sends the whole message history, so an unbounded history charges each
+early result once per later request: seven capped reads in one QA run were re-sent
+enough times to cost roughly 183,600 input tokens and exhaust a 150,000-token QA
+budget before a verdict could be produced. The runtime therefore bounds the
+retained tool-result text of a single run:
+
+- A result whose content is byte-identical to a newer result of the same read tool
+  is replaced in later requests by a stub naming the tool, the target, the original
+  size, a SHA-256 digest, and the instruction to call the tool again if the content
+  is still needed.
+- Once the retained text exceeds the bound (48,000 characters by default), older
+  results are elided newest-first, keeping the two most recent verbatim so the
+  answer under construction still holds the evidence it was reasoning about.
+- Only results a tool can reproduce are elided: a command result is evidence and is
+  never replaced. Non-text content (an image or PDF return) is never elided.
+
+Elision is never silent, and it never changes what a tool did: the run's
+`tool_activity` keeps the true `result_chars` and adds `elided`, `elided_chars`, and
+`elision_reason`. The counts are recorded in `events.context`, which holds the
+active policy, per-request prompt sizes, the peak and total prompt characters, and
+the number and size of elided results — counts and digests only, never prompt text,
+file content, or tool arguments.
+
+Because the token limits are checked after a response, they cannot stop a request
+that is already too large to fit. The runtime therefore also projects the next
+request's prompt before sending it: if the projection cannot fit the remaining
+budget, the request is not sent and the run fails with
+`resource-limit-exceeded` and `events.context_limit.kind =
+"projected-request-cannot-fit"`, recording that no tokens were spent on it. The
+projection assumes eight characters per token, which understates real token counts,
+so it refuses only requests that provably could not fit.
+
 ## Structured output
 
 Every stage answer is a contract, not prose, and the runtime never guesses what an

@@ -164,7 +164,18 @@ QA_RULES = """\
    the configured sandbox. Your analysis environment is separate. Do not rerun the
    command there or infer that the recorded sandbox run did not occur because a
    tool is unavailable locally. If independent execution is unavailable, state
-   that separately and assess the recorded result and diff."""
+   that separately and assess the recorded result and diff.
+6. Start from the evidence already in this prompt: the diff, the recorded
+   validation run, and the criteria. Read a file to confirm something the diff
+   cannot tell you, not to reconstruct the change set you were given.
+7. Read each file once. Content you have already received is still yours to cite;
+   rereading the same path yields no new evidence and spends the budget you need
+   to reach a verdict.
+8. Search for the identifier or line you need, and page a large file with `offset`
+   and `limit`, rather than reading whole directories or files for background.
+9. Never answer late or not at all in order to keep reading. If the budget
+   tightens, narrow what you read, not what you judge: a verdict that states its
+   remaining gaps is acceptable, an absent verdict is not."""
 
 REVIEWER_RULES = """\
 1. Do not modify any file and do not run code; you are reviewing recorded evidence.
