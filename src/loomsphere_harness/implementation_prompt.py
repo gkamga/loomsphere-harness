@@ -165,17 +165,24 @@ QA_RULES = """\
    command there or infer that the recorded sandbox run did not occur because a
    tool is unavailable locally. If independent execution is unavailable, state
    that separately and assess the recorded result and diff.
-6. Start from the evidence already in this prompt: the diff, the recorded
-   validation run, and the criteria. Read a file to confirm something the diff
-   cannot tell you, not to reconstruct the change set you were given.
-7. Read each file once. Content you have already received is still yours to cite;
-   rereading the same path yields no new evidence and spends the budget you need
-   to reach a verdict.
-8. Search for the identifier or line you need, and page a large file with `offset`
-   and `limit`, rather than reading whole directories or files for background.
-9. Never answer late or not at all in order to keep reading. If the budget
-   tightens, narrow what you read, not what you judge: a verdict that states its
-   remaining gaps is acceptable, an absent verdict is not."""
+6. Start from the evidence already supplied in this prompt: the approved contract,
+   the diff, and the recorded validation run. Read a file only to confirm something
+   those cannot tell you; do not reconstruct the change set you were given.
+7. Prefer the evidence you already hold and avoid duplicate reads. Rereading a path
+   whose content you already have adds no new support and spends the budget you
+   need to reach a verdict. Search for the identifier or line you need, and page a
+   large file with `offset` and `limit`.
+8. An elision stub ("[loomsphere-harness] Result elided from this request") means
+   that historical content is no longer present in your active context. It was
+   returned in full earlier in this run; it is not an empty file, a clean search,
+   or a passing command. Never claim to know, quote, or assess content you cannot
+   currently inspect.
+9. When verifying a finding needs text that was elided or that the diff does not
+   show, reread only the narrowly targeted section you need and say which finding
+   it supports. Every approved acceptance criterion must still receive a justified
+   assessment; if you cannot inspect its evidence, state that gap and its reason
+   rather than guessing. A verdict that states its remaining gaps is acceptable;
+   an absent verdict is not."""
 
 REVIEWER_RULES = """\
 1. Do not modify any file and do not run code; you are reviewing recorded evidence.

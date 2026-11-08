@@ -1,16 +1,19 @@
-"""Bounded model context: retained tool-result text, stub fidelity, refusal.
+"""Bounded model context: QA-only retention, stub fidelity, honest projection.
 
 A PydanticAI run re-sends the whole message history on every request, so a tool
-result is paid for once per remaining request. The M00-02 pilot showed the cost:
-seven capped reads exhausted a 150,000-token QA budget with no verdict. These
-tests pin the correction down without a network, a provider, or wall-clock
-dependence: they assert a bound exists, that it names what it removed, that it
-never touches evidence the harness must keep verbatim, and that it stops before a
-request that provably cannot fit rather than overshooting.
+result is paid for once per remaining request. A reference QA run recorded 69,624
+tokens against a 60,000-token limit in four requests without answering, and an
+offline replay of seven representative capped reads estimates 183,573 input
+tokens at a 150,000-token ceiling by characters/4. These tests pin the correction
+down without a network, a provider, or wall-clock dependence: they assert a bound
+exists for read-only QA, that it names what it removed, that it never touches
+evidence the harness must keep verbatim, that no other role is affected, and that
+the token projection is recorded rather than enforced.
 
 They also assert the bound cannot be used to weaken QA: elision keeps the tool, the
-target, the true size, and a digest, the newest evidence stays verbatim, and the
-recorded audit trail still reports what each tool actually returned.
+target, the true size, and a digest, the newest evidence stays verbatim, an elided
+section can be reread narrowly, and the recorded audit trail still reports what
+each tool actually returned.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from loomsphere_harness.pydantic_harness import (  # noqa: E402
     ContextPolicy,
     PydanticHarnessRunner,
 )
+from loomsphere_harness.reports import parse_qa_report  # noqa: E402
 
 #: A marker that appears only in file content, so its absence from a request or
 #: from recorded evidence proves the content itself was not copied somewhere.
@@ -106,11 +110,22 @@ class ContextCase(RuntimeCase):
 
         return FunctionModel(respond), requests
 
-    def run_reads(self, sequence: list[str], policy: ContextPolicy):
+    def run_reads(
+        self,
+        sequence: list[str],
+        policy: ContextPolicy,
+        *,
+        role: str = "qa",
+        read_only: bool = True,
+        config=None,
+    ):
         model, requests = self.reads(sequence)
-        runner = PydanticHarnessRunner(model_config(), model=model, context_policy=policy)
+        runner = PydanticHarnessRunner(
+            config or model_config(), model=model, context_policy=policy
+        )
         invocation = AgentInvocation(
-            uuid4(), self.repo, "read the implementation", 30, role="qa", read_only=True
+            uuid4(), self.repo, "read the implementation", 30,
+            role=role, read_only=read_only,
         )
         return runner.run(invocation), requests
 
@@ -223,6 +238,7 @@ class EvidenceBoundary(ContextCase):
                 [
                     "request", "prompt_chars", "messages", "tool_results",
                     "retained_tool_chars", "elided_tool_results", "projected_tokens",
+                    "remaining_tokens", "projection_exceeds_remaining",
                 ]
             ),
         )
@@ -250,11 +266,88 @@ class EvidenceBoundary(ContextCase):
         self.assertEqual(result.events["context"]["elided_tool_results"], 0)
 
 
-class PreRequestRefusal(ContextCase):
-    def test_a_request_that_cannot_fit_is_refused_before_it_is_sent(self) -> None:
+class BudgetProjectionIsDiagnostic(ContextCase):
+    """The next-request projection is recorded, never enforced.
+
+    A character heuristic cannot prove that a request will not fit any provider's
+    tokenizer, so refusing on it could spend a QA task's one-time authorization on a
+    false positive. ``UsageLimits`` remains the only enforcement, and it is checked
+    after a response, so an overshoot inside one response is still possible.
+    """
+
+    def test_a_conservative_projection_does_not_refuse_a_request(self) -> None:
         model, requests = self.reads(["big.py", "big.py", "small.txt"])
         runner = PydanticHarnessRunner(
             model_config(total_token_limit=4_000), model=model, context_policy=UNBOUNDED
+        )
+        invocation = AgentInvocation(
+            uuid4(), self.repo, "read", 30, role="qa", read_only=True
+        )
+
+        result = runner.run(invocation)
+
+        # Every request was sent, including the ones the estimate flags.
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(requests), 4)
+        context = result.events["context"]
+        measurements = context["measurements"]
+        self.assertTrue(
+            any(entry["projection_exceeds_remaining"] for entry in measurements),
+            "the fixture did not exercise a projection above the remaining budget",
+        )
+        self.assertFalse(any("refused" in entry for entry in measurements))
+        self.assertEqual(context["policy"]["projection_enforcement"], "diagnostic-only")
+
+    def test_highly_compressible_input_is_not_refused_by_a_character_estimate(
+        self,
+    ) -> None:
+        # 20,000 spaces: 20,000 characters, but a real tokenizer compresses long
+        # runs to a few hundred tokens. A character-based refusal would trip here
+        # while the run had spent almost nothing.
+        (self.repo / "spaces.txt").write_text(" " * 20_000, encoding="utf-8")
+        model, requests = self.reads(["spaces.txt", "spaces.txt"])
+        runner = PydanticHarnessRunner(
+            model_config(total_token_limit=500), model=model, context_policy=UNBOUNDED
+        )
+        invocation = AgentInvocation(
+            uuid4(), self.repo, "read", 30, role="qa", read_only=True
+        )
+
+        result = runner.run(invocation)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(requests), 3)
+        flagged = [
+            entry
+            for entry in result.events["context"]["measurements"]
+            if entry["projection_exceeds_remaining"]
+        ]
+        self.assertTrue(flagged, "the estimate did not record the projected overrun")
+        # The projection is far above what the run actually recorded. That gap is
+        # exactly why it may be reported but may not refuse a request.
+        self.assertGreater(
+            flagged[-1]["projected_tokens"], result.events["usage"]["total_tokens"]
+        )
+
+    def test_the_official_usage_limit_remains_the_only_enforcement(self) -> None:
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in getattr(message, "parts", ())
+                if isinstance(part, ToolReturnPart)
+            ]
+            usage = RequestUsage(input_tokens=500, output_tokens=1)
+            if returns:
+                return ModelResponse(parts=[TextPart("answered")], usage=usage)
+            return ModelResponse(
+                parts=[ToolCallPart("read_file", {"path": "small.txt"})], usage=usage
+            )
+
+        runner = PydanticHarnessRunner(
+            model_config(total_token_limit=100),
+            model=FunctionModel(respond),
+            context_policy=ContextPolicy(),
         )
         invocation = AgentInvocation(
             uuid4(), self.repo, "read", 30, role="qa", read_only=True
@@ -265,22 +358,10 @@ class PreRequestRefusal(ContextCase):
 
         error = raised.exception
         self.assertEqual(error.reason, "resource-limit-exceeded")
-        evidence = error.events["context_limit"]
-        self.assertEqual(evidence["kind"], "projected-request-cannot-fit")
-        self.assertGreaterEqual(evidence["projected_tokens"], evidence["remaining_tokens"])
-        self.assertEqual(evidence["total_token_limit"], 4_000)
-        self.assertTrue(error.events["context"]["measurements"][-1]["refused"])
-
-        # Refused, not overshot: the provider was never asked for that request.
-        self.assertLess(len(requests), 3)
-        self.assertIn("was never sent", error.detail)
-        self.assertNotIn(CONTENT_MARKER, json.dumps(error.events, default=str))
-
-    def test_a_run_that_fits_is_never_refused(self) -> None:
-        bounded, requests = self.run_reads(["big.py", "small.txt"], ContextPolicy())
-        self.assertEqual(bounded.exit_code, 0)
-        self.assertFalse(any(r.get("refused") for r in bounded.events["context"]["measurements"]))
-        self.assertEqual(len(requests), 3)
+        self.assertIn("A run limit was reached", error.detail)
+        # The ceiling is checked after the response, so the run can be stopped only
+        # once it has already spent past it. Nothing here claims overspend is gone.
+        self.assertGreater(error.events["usage"]["total_tokens"], 100)
 
 
 class QAGateIsUnweakened(ContextCase):
@@ -319,10 +400,194 @@ class QAGateIsUnweakened(ContextCase):
         lowered = QA_RULES.lower()
         for forbidden in ("skip the criteria", "omit findings", "assume it passed"):
             self.assertNotIn(forbidden, lowered)
-        self.assertIn("read each file once", lowered)
-        self.assertIn("still yours to cite", lowered)
-        # The bound is a budget for reading, never a licence to suppress a finding.
-        self.assertIn("narrow what you read, not what you judge", lowered)
+        # The economy rules are about which evidence to fetch, never about what may
+        # be judged: supplied evidence comes first, duplicate reads add nothing, and
+        # a stub means the text is no longer in context.
+        self.assertIn("evidence already supplied in this prompt", lowered)
+        self.assertIn("avoid duplicate reads", lowered)
+        self.assertIn("no longer present in your active context", lowered)
+        self.assertIn("never claim to know, quote, or assess content", lowered)
+        # A targeted reread is allowed when a finding needs it.
+        self.assertIn("reread only the narrowly targeted section", lowered)
+        # Every criterion still needs a justified assessment, and a verdict is
+        # mandatory: stating a gap is acceptable, dropping the judgement is not.
+        self.assertIn("every approved acceptance criterion must still receive", lowered)
+        self.assertIn("if you cannot inspect its evidence, state that gap", lowered)
+        self.assertIn("an absent verdict is not", lowered)
+
+
+class RoleScoping(ContextCase):
+    """The bound is a read-only QA measure and changes no other role's history.
+
+    A Builder, Reviewer, Architect, or Intake run must never have its evidence
+    elided, its prompt shrunk, or its request judged by the QA context policy.
+    """
+
+    NON_QA_ROLES = ("builder", "reviewer", "architect", "intake")
+
+    def test_non_qa_roles_send_exactly_what_they_sent_before(self) -> None:
+        sequence = ["big.py", "big.py", "small.txt", "big.py"]
+        reference, reference_requests = self.run_reads(sequence, UNBOUNDED, role="builder")
+        aggressive = ContextPolicy(max_retained_chars=1_000, keep_recent=1)
+
+        for role in self.NON_QA_ROLES:
+            with self.subTest(role=role):
+                result, requests = self.run_reads(sequence, aggressive, role=role)
+                self.assertEqual(result.exit_code, 0)
+                # Byte-for-byte the same requests as the policy-free baseline.
+                self.assertEqual(requests, reference_requests)
+                self.assertIsNone(result.events.get("context"))
+                # The recorded limits are identical apart from the role name.
+                self.assertEqual(
+                    {key: value for key, value in result.events["limits"].items()
+                     if key != "role"},
+                    {key: value for key, value in reference.events["limits"].items()
+                     if key != "role"},
+                )
+
+    def test_a_writable_invocation_is_never_bounded(self) -> None:
+        sequence = ["big.py", "big.py", "small.txt"]
+        result, requests = self.run_reads(
+            sequence, ContextPolicy(max_retained_chars=1_000), role="qa", read_only=False
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(result.events.get("context"))
+        for request in requests:
+            for entry in request["returns"]:
+                self.assertNotIn("Result elided from this request", entry)
+
+    def test_the_same_sequence_is_bounded_for_qa_only(self) -> None:
+        sequence = ["big.py", "big.py", "small.txt", "big.py"]
+        aggressive = ContextPolicy(max_retained_chars=1_000, keep_recent=1)
+
+        bounded, bounded_requests = self.run_reads(sequence, aggressive, role="qa")
+        unbounded, unbounded_requests = self.run_reads(
+            sequence, aggressive, role="reviewer"
+        )
+
+        self.assertGreaterEqual(bounded.events["context"]["elided_tool_results"], 1)
+        self.assertIsNone(unbounded.events.get("context"))
+        self.assertLess(
+            bounded_requests[-1]["prompt_chars"],
+            unbounded_requests[-1]["prompt_chars"],
+        )
+
+
+class ElisionRecovery(ContextCase):
+    """A QA model that meets a stub, rereads narrowly, and only then judges."""
+
+    def test_qa_rereads_elided_evidence_before_reaching_a_verdict(self) -> None:
+        criteria = [f"AC-{index}" for index in range(1, 6)]
+        calls: list[dict[str, object]] = []
+        requests: list[list[str]] = []
+        state = {"step": 0}
+
+        def read(path: str, **extra) -> ModelResponse:
+            calls.append({"path": path, **extra})
+            args: dict[str, object] = {"path": path}
+            args.update(extra)
+            return ModelResponse(
+                parts=[ToolCallPart("read_file", args)],
+                usage=RequestUsage(input_tokens=10, output_tokens=1),
+            )
+
+        def respond(messages, info):
+            returns = [
+                part
+                for message in messages
+                for part in getattr(message, "parts", ())
+                if isinstance(part, ToolReturnPart)
+            ]
+            requests.append([str(part.content) for part in returns])
+            step = state["step"]
+            state["step"] += 1
+            if step == 0:
+                return read("big.py")
+            if step == 1:
+                return read("other.py")
+            if step == 2:
+                return read("small.txt")
+            if step == 3:
+                # The stub for the first read is in the history now. The model does
+                # what the rules require: a narrow reread, not a memory claim.
+                return read("big.py", offset=0, limit=5)
+            report = {
+                "verdict": "failed",
+                "summary": "The first criterion is unmet.",
+                "findings": [
+                    {
+                        "severity": "blocking",
+                        "description": "The required branch is missing.",
+                        "evidence": "big.py lines 1-5",
+                    }
+                ],
+                "acceptance_criteria": [
+                    {
+                        "criterion_id": criterion,
+                        "criterion": f"criterion {criterion}",
+                        "status": "unmet" if criterion == "AC-1" else "unknown",
+                        "evidence": "big.py lines 1-5",
+                    }
+                    for criterion in criteria
+                ],
+                "residual_risks": [],
+            }
+            return ModelResponse(
+                parts=[TextPart(f"```json\n{json.dumps(report)}\n```")],
+                usage=RequestUsage(input_tokens=10, output_tokens=1),
+            )
+
+        runner = PydanticHarnessRunner(
+            model_config(),
+            model=FunctionModel(respond),
+            context_policy=ContextPolicy(max_retained_chars=1_000, keep_recent=1),
+        )
+        invocation = AgentInvocation(
+            uuid4(), self.repo, "Assess " + ", ".join(criteria), 30,
+            role="qa", read_only=True,
+        )
+
+        result = runner.run(invocation)
+
+        stubbed = [
+            index
+            for index, returns in enumerate(requests)
+            if any("Result elided from this request" in entry for entry in returns)
+        ]
+        self.assertTrue(stubbed, "the model never encountered an elision stub")
+        self.assertGreaterEqual(len(requests), 5, "the run ended before the reread")
+        # The stub was visible before the reread was requested, so the recovery was
+        # a response to it and not a coincidence of ordering.
+        self.assertLessEqual(stubbed[0], len(requests) - 2)
+
+        # The reread happened last, and it was narrow, not a full re-read.
+        self.assertEqual(calls[-1]["path"], "big.py")
+        self.assertEqual(calls[-1]["limit"], 5)
+        # The verdict request carries both the stub and the restored section, so
+        # the model judged with the content in view and the history honest.
+        final = requests[-1]
+        self.assertTrue(
+            any(CONTENT_MARKER in entry for entry in final),
+            "the targeted reread did not restore the elided content",
+        )
+        self.assertTrue(
+            any("Result elided from this request" in entry for entry in final),
+            "the stub was hidden rather than kept as the historical marker",
+        )
+
+        # The verdict arrived, and every criterion still carries an assessment.
+        report_parsed = parse_qa_report(result.response_text)
+        self.assertEqual(report_parsed.verdict, "failed")
+        self.assertEqual(
+            [claim.criterion_id for claim in report_parsed.acceptance_criteria],
+            criteria,
+        )
+        for claim in report_parsed.acceptance_criteria:
+            self.assertTrue(
+                claim.evidence, f"{claim.criterion_id} was assessed without justification"
+            )
+        self.assertGreaterEqual(result.events["context"]["elided_tool_results"], 1)
 
 
 if __name__ == "__main__":

@@ -400,10 +400,10 @@ Builder.
 
 Those bounds cap a single result, not the history it accumulates. Every provider
 request re-sends the whole message history, so an unbounded history charges each
-early result once per later request: seven capped reads in one QA run were re-sent
-enough times to cost roughly 183,600 input tokens and exhaust a 150,000-token QA
-budget before a verdict could be produced. The runtime therefore bounds the
-retained tool-result text of a single run:
+early result once per later request. One recorded QA run re-sent four requests and
+reported 69,624 input tokens against a 60,000-token limit before producing a
+verdict (see [qa-recovery](workflows/qa-recovery.md)). The runtime therefore bounds
+the retained tool-result text of a read-only QA run:
 
 - A result whose content is byte-identical to a newer result of the same read tool
   is replaced in later requests by a stub naming the tool, the target, the original
@@ -415,21 +415,33 @@ retained tool-result text of a single run:
 - Only results a tool can reproduce are elided: a command result is evidence and is
   never replaced. Non-text content (an image or PDF return) is never elided.
 
+The policy applies to read-only QA invocations and to nothing else. Intake,
+Architect, Builder, and Reviewer runs keep exactly the behaviour they had: nothing
+in their history is elided, their budgets are unchanged, and no request of theirs is
+measured against the projection below. A stub means the historical content is no
+longer present in the active context; QA is instructed to reread a narrowly targeted
+section when verification needs it, and never to claim knowledge of content it
+cannot currently inspect.
+
 Elision is never silent, and it never changes what a tool did: the run's
 `tool_activity` keeps the true `result_chars` and adds `elided`, `elided_chars`, and
-`elision_reason`. The counts are recorded in `events.context`, which holds the
-active policy, per-request prompt sizes, the peak and total prompt characters, and
-the number and size of elided results — counts and digests only, never prompt text,
-file content, or tool arguments.
+`elision_reason`. The counts are recorded in `events.context`, which is present only
+when the policy applied and holds the active policy, per-request prompt sizes, the
+peak and total prompt characters, and the number and size of elided results — counts
+and digests only, never prompt text, file content, or tool arguments.
 
-Because the token limits are checked after a response, they cannot stop a request
-that is already too large to fit. The runtime therefore also projects the next
-request's prompt before sending it: if the projection cannot fit the remaining
-budget, the request is not sent and the run fails with
-`resource-limit-exceeded` and `events.context_limit.kind =
-"projected-request-cannot-fit"`, recording that no tokens were spent on it. The
-projection assumes eight characters per token, which understates real token counts,
-so it refuses only requests that provably could not fit.
+The token limits are checked after each response, so no check the runtime can make
+before a request guarantees that the request fits or that a budget is never
+overshot. `events.context.measurements` therefore records a projection of each
+request (`prompt_chars // 8`) together with `remaining_tokens` and a
+`projection_exceeds_remaining` flag, and the policy is marked
+`projection_enforcement: "diagnostic-only"`. The projection is a diagnostic
+estimate, not a proven lower bound on provider tokens: highly compressible input can
+tokenize to far fewer tokens per character, so the flag can be true for a request
+that would have fitted. It is recorded and reported; it never refuses a request.
+Refusing on an unproven estimate would spend a QA task's one-time authorization on a
+false positive. The authoritative limit remains the official provider-usage check,
+which can only fire after a response has been paid for.
 
 ## Structured output
 

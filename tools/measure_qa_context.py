@@ -1,19 +1,29 @@
 """Measure QA context growth with a deterministic, offline replay.
 
 This is a measurement tool, not a test: it drives the real
-``PydanticHarnessRunner`` with a scripted ``FunctionModel`` that behaves like the
-QA invocation that exhausted its budget in the M00-02 pilot. It reports, per model
-request, how many characters of context the runtime actually handed the model, how
-much of that was retained tool-result content, and what the run finally cost. It
-never records prompt text, file content, or tool arguments.
+``PydanticHarnessRunner`` with a scripted ``FunctionModel`` over a fixture
+workspace. The script is a *representative* sequence of capped reads modelled on
+the QA work that exhausted a shared budget; it is not a recording of the Demandro
+M00-02 run, and its paths and order are not claimed to be the ones that run used.
+It reports, per model request, how many characters of context the runtime actually
+handed the model, how much of that was retained tool-result content, and what the
+run finally cost. It never records prompt text, file content, or tool arguments.
+
+Three kinds of figure must stay distinct when these numbers are quoted:
+
+* **Synthetic character-based estimates** — the ``characters // 4`` and
+  ``characters // 6`` conversions printed here. They are arithmetic on measured
+  character counts, not tokenizer output.
+* **Actual recorded provider usage** — the ``recorded usage`` block, which comes
+  only from what the model reported back through the runtime's own accumulator. In
+  this offline replay the scripted model reports its own numbers, so the block
+  shows the accounting path works; it is not DeepSeek usage.
+* **Hypotheses about future savings** — any claim that a real provider bill will
+  fall by a particular amount. Nothing here measures that.
 
 Usage::
 
     .venv/bin/python tools/measure_qa_context.py [--json]
-
-The token figures below are a local ``characters // 4`` estimate, plus the
-``characters // 6`` floor. They are not provider token counts and must not be
-reported as measured DeepSeek usage.
 """
 
 from __future__ import annotations
@@ -49,8 +59,10 @@ CRITERIA_TEXT = "\n".join(
     for index, name in enumerate(CRITERIA, start=1)
 )
 
-#: The read sequence the pilot's QA run performed: two implementation files, one
-#: large source file, and repeated reads of the same paths.
+#: A representative QA read sequence: two implementation files, one large source
+#: file, and repeated reads of the same paths. It is scripted for deterministic
+#: comparison, not recorded; the reference run's exact paths and order are not
+#: claimed here.
 READ_SEQUENCE = [
     "app/main.py",
     "app/helpers.py",
@@ -80,7 +92,7 @@ def write_fixture(repo: Path) -> None:
     (repo / "app").mkdir(parents=True, exist_ok=True)
     (repo / "tests").mkdir(parents=True, exist_ok=True)
     # Long enough that one 400-line read reaches the 24,000-character cap, which
-    # is what made the pilot's read results expensive.
+    # is what makes a single read cost a large share of the request in this replay.
     large = "".join(
         f"def helper_{index:04d}(value: int) -> int:  # padding padding padding\n"
         f"    return value + {index}  # extra padding padding padding padding\n"
@@ -296,8 +308,8 @@ def main() -> int:
         "--once",
         action="store_true",
         help=(
-            "read each fixture file once instead of repeating the pilot's reads; "
-            "a counterfactual for read discipline, not a measured provider saving"
+            "read each fixture file once instead of repeating reads; a "
+            "counterfactual for read discipline, not a measured provider saving"
         ),
     )
     arguments = parser.parse_args()

@@ -101,19 +101,27 @@ TRUNCATION_EXCERPT_CHARS = 400
 #: the same arguments. Only these are ever elided from a later request: a command
 #: result cannot be reproduced, so it is evidence and stays verbatim.
 ELIDABLE_TOOLS: tuple[str, ...] = READ_TOOLS
-#: How much prior tool-result text one run may keep in its model context. Every
+#: The bounded-context policy is a QA read-only measure. Every other role keeps the
+#: history behaviour it had before this policy existed: a role whose findings are
+#: not the budget-limited QA stage must not have its evidence silently reduced.
+CONTEXT_POLICY_ROLE = "qa"
+#: How much prior tool-result text one QA run may keep in its model context. Every
 #: provider request re-sends the whole history, so an unbounded history is charged
-#: again on each request: seven capped reads became 164,000 input tokens in the
-#: M00-02 QA run and exhausted a 150,000-token budget before QA could answer. The
-#: bound keeps the most recent evidence verbatim and names every elided result.
+#: again on each request. The reference Demandro M0-02 QA run recorded 69,624 tokens
+#: against a 60,000-token limit in four requests without answering
+#: (docs/workflows/qa-recovery.md). An offline replay of seven representative capped
+#: reads estimates 183,573 input tokens at a 150,000-token ceiling by characters/4.
+#: It is a synthetic estimate, not a provider measurement. The bound keeps the most
+#: recent evidence verbatim and names every elided result.
 MAX_RETAINED_TOOL_CHARS = 48_000
 #: The most recent results always stay verbatim, so the answer under construction
 #: keeps the evidence it was just reasoning about.
 KEEP_RECENT_TOOL_RESULTS = 2
-#: Characters per token assumed when deciding whether the *next* request cannot
-#: fit. Deliberately pessimistic (real tokenizers emit more than one token per
-#: eight characters), so the guard never refuses a request that would have fitted.
-CONTEXT_CHARS_PER_TOKEN_FLOOR = 8
+#: Characters per token used only to *estimate* the size of the next request for
+#: diagnostics. It is not a proven lower bound for any provider tokenizer: an input
+#: that compresses well (long runs of spaces, repetitive markup) can emit far fewer
+#: tokens than this estimate. It is therefore recorded, never enforced.
+CONTEXT_CHARS_PER_TOKEN_ESTIMATE = 8
 #: Per-message and per-part framing that the provider charges for but that carries
 #: no content: role markers, tool names, and tool call identifiers.
 MESSAGE_OVERHEAD_CHARS = 40
@@ -296,6 +304,19 @@ def tools_for(invocation: AgentInvocation) -> tuple[str, ...]:
     return READ_TOOLS + WRITE_TOOLS
 
 
+def context_policy_applies(invocation: AgentInvocation) -> bool:
+    """Whether the bounded-context policy governs this invocation.
+
+    Only a read-only QA run is bounded. QA is the stage whose context growth
+    exhausted a shared budget, and it reviews recorded evidence it cannot rewrite.
+    Every other role keeps the history behaviour it had before this policy existed:
+    an Intake, Architect, Builder, or Reviewer run must never have its evidence
+    elided or its request judged against a character-based token estimate.
+    """
+
+    return invocation.role == CONTEXT_POLICY_ROLE and invocation.read_only
+
+
 def _is_local_host(host: str) -> bool:
     if host == "localhost":
         return True
@@ -320,8 +341,11 @@ class ContextPolicy:
     keep_recent: int = KEEP_RECENT_TOOL_RESULTS
     #: The tools whose results may be elided.
     elidable_tools: tuple[str, ...] = ELIDABLE_TOOLS
-    #: Characters per token assumed for the next-request projection.
-    chars_per_token: int = CONTEXT_CHARS_PER_TOKEN_FLOOR
+    #: Characters per token used for the diagnostic next-request projection. The
+    #: projection is recorded, not enforced: there is no provider tokenizer here
+    #: that could prove a request cannot fit, and the official ``UsageLimits``
+    #: check remains the only enforcement.
+    chars_per_token: int = CONTEXT_CHARS_PER_TOKEN_ESTIMATE
 
     def evidence(self) -> dict[str, object]:
         return {
@@ -329,22 +353,8 @@ class ContextPolicy:
             "keep_recent_tool_results": self.keep_recent,
             "elidable_tools": list(self.elidable_tools),
             "projection_chars_per_token": self.chars_per_token,
+            "projection_enforcement": "diagnostic-only",
         }
-
-
-class _ContextLimitReached(Exception):
-    """The next request cannot fit in what is left of the run's token budget.
-
-    Raised before the request is sent, so the run stops instead of paying for a
-    request that must push the total past the configured ceiling.
-    """
-
-    def __init__(self, evidence: dict[str, object]) -> None:
-        self.evidence = evidence
-        super().__init__(
-            "the next model request cannot fit the remaining token budget "
-            f"({evidence['projected_tokens']} >= {evidence['remaining_tokens']})"
-        )
 
 
 def _context_chars(messages: list[object]) -> int:
@@ -396,29 +406,18 @@ class ContextBudget:
     elided_calls: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def __call__(self, messages: list[object]) -> list[object]:
-        """Register as a PydanticAI history processor and measure the request."""
+        """Register as a PydanticAI history processor and measure the request.
+
+        The next-request projection is recorded for diagnosis only. A character
+        heuristic cannot prove that a request will not fit, and refusing a QA task
+        on an unproven estimate would spend its one-time authorization on a false
+        positive. ``UsageLimits`` remains the enforcement; it is checked after a
+        response, so an overshoot inside one response is still possible.
+        """
 
         self._bound(messages)
         record = self._measure(messages)
         self.measurements.append(record)
-        limit = self.total_token_limit
-        used = _usage_total(self.usage)
-        if limit > 0 and used > 0:
-            projected = record["projected_tokens"]
-            remaining = limit - used
-            if projected >= remaining:
-                record["refused"] = True
-                raise _ContextLimitReached(
-                    {
-                        "request": record["request"],
-                        "prompt_chars": record["prompt_chars"],
-                        "projected_tokens": projected,
-                        "remaining_tokens": remaining,
-                        "total_token_limit": limit,
-                        "chars_per_token": self.policy.chars_per_token,
-                        "kind": "projected-request-cannot-fit",
-                    }
-                )
         return messages
 
     def evidence(self) -> dict[str, object]:
@@ -457,6 +456,14 @@ class ContextBudget:
             if isinstance(part.content, str)
             and part.tool_call_id not in self.elided_calls
         )
+        limit = self.total_token_limit
+        used = _usage_total(self.usage)
+        remaining = limit - used if limit > 0 else None
+        # A diagnostic estimate of provider tokens, not a lower bound. An input
+        # that compresses well can emit far fewer tokens than this, so the flag
+        # below can be true for a request that would have fitted and is never
+        # used to refuse one.
+        projected = prompt_chars // max(1, self.policy.chars_per_token)
         return {
             "request": len(self.measurements) + 1,
             "prompt_chars": prompt_chars,
@@ -464,9 +471,11 @@ class ContextBudget:
             "tool_results": len(returns),
             "retained_tool_chars": retained,
             "elided_tool_results": len(self.elided_calls),
-            # A floor, not an estimate of provider tokens: it exists only so a
-            # request that provably cannot fit is refused before it is sent.
-            "projected_tokens": prompt_chars // max(1, self.policy.chars_per_token),
+            "projected_tokens": projected,
+            "remaining_tokens": remaining,
+            "projection_exceeds_remaining": (
+                remaining is not None and projected >= remaining
+            ),
         }
 
     def _bound(self, messages: list[object]) -> None:
@@ -732,35 +741,44 @@ class PydanticHarnessRunner:
             ),
         )
         writable = "write_file" in tools
+        # Only a read-only QA run is bounded. Other roles keep their previous
+        # history behaviour, including no elision and no context measurement.
+        bounded = context_policy_applies(invocation)
         # The accumulator is owned here rather than read back from the result: it
         # is the only figure that survives an exception, a timeout, or cancellation.
         usage = RunUsage()
-        budget = ContextBudget(
-            policy=self.context_policy,
-            total_token_limit=effective.total_token_limit,
-            usage=usage,
+        budget = (
+            ContextBudget(
+                policy=self.context_policy,
+                total_token_limit=effective.total_token_limit,
+                usage=usage,
+            )
+            if bounded
+            else None
         )
+        capabilities = [
+            LocalWorkspace(invocation.workspace_path, read_only=not writable),
+            FileSystem(
+                tools=tools,
+                denied_patterns=DENIED_PATTERNS,
+                content_hashes=False,
+                read_only=not writable,
+                max_read_lines=MAX_READ_LINES,
+                max_read_chars=MAX_READ_CHARS,
+                max_list_results=MAX_LIST_RESULTS,
+                max_search_results=MAX_SEARCH_RESULTS,
+                max_find_results=MAX_FIND_RESULTS,
+            ),
+        ]
+        if budget is not None:
+            # Runs before every QA model request, so the retained history is
+            # bounded and measured before it is paid for again.
+            capabilities.append(ProcessHistory(budget))
         agent = Agent(
             model,
             instructions=INSTRUCTIONS,
             retries=TOOL_RETRIES,
-            capabilities=[
-                LocalWorkspace(invocation.workspace_path, read_only=not writable),
-                FileSystem(
-                    tools=tools,
-                    denied_patterns=DENIED_PATTERNS,
-                    content_hashes=False,
-                    read_only=not writable,
-                    max_read_lines=MAX_READ_LINES,
-                    max_read_chars=MAX_READ_CHARS,
-                    max_list_results=MAX_LIST_RESULTS,
-                    max_search_results=MAX_SEARCH_RESULTS,
-                    max_find_results=MAX_FIND_RESULTS,
-                ),
-                # Runs before every model request, so the retained history is
-                # bounded and measured before it is paid for again.
-                ProcessHistory(budget),
-            ],
+            capabilities=capabilities,
         )
         started = time.monotonic()
         limits = UsageLimits(
@@ -791,17 +809,19 @@ class PydanticHarnessRunner:
             """
 
             snapshot = usage_snapshot(usage)
-            return {
+            events: dict[str, object] = {
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "usage": snapshot,
                 "diagnostics": budget_report(snapshot, effective.values()),
                 "tool_summary": tool_summary(captured[0] if captured else []),
-                # One row per request: how much prompt was sent and how much of it
-                # was retained tool result. This is the measurement the M00-02
-                # exclusion showed was missing, and it explains a budget failure
-                # without recording any of the content that caused it.
-                "context": budget.evidence(),
             }
+            if budget is not None:
+                # One row per request: how much prompt was sent and how much of it
+                # was retained tool result. This is the measurement the reference
+                # QA exclusion showed was missing, and it explains a budget failure
+                # without recording any of the content that caused it.
+                events["context"] = budget.evidence()
+            return events
 
         try:
             result = await asyncio.wait_for(invoke(), timeout=invocation.timeout_seconds)
@@ -811,24 +831,10 @@ class PydanticHarnessRunner:
                 f"The agent run exceeded {invocation.timeout_seconds} seconds.",
                 events=observed(),
             ) from error
-        except _ContextLimitReached as error:
-            # Stopped before the request was sent: the ceiling is reached without
-            # paying for a request that could only breach it. Reported as the same
-            # reason the runtime uses, so one reason covers one class of outcome.
-            raise _RunFailure(
-                "resource-limit-exceeded",
-                _context_limit_detail(error.evidence),
-                events={
-                    **observed(),
-                    "context_limit": error.evidence,
-                    "tool_activity": _tool_activity(
-                        captured[0] if captured else [],
-                        original_chars=budget.original_chars,
-                        elided=budget.elided_calls,
-                    ),
-                },
-            ) from error
         except UsageLimitExceeded as error:
+            # The official check runs after a response, so it can stop a run that
+            # has just pushed the total past the ceiling; it cannot prevent the
+            # request that did so. Nothing here claims overspend is eliminated.
             raise _RunFailure(
                 "resource-limit-exceeded", f"A run limit was reached: {error}"[:300],
                 events=observed(),
@@ -860,8 +866,8 @@ class PydanticHarnessRunner:
             **observed(),
             "tool_activity": _tool_activity(
                 result.all_messages(),
-                original_chars=budget.original_chars,
-                elided=budget.elided_calls,
+                original_chars=budget.original_chars if budget is not None else None,
+                elided=budget.elided_calls if budget is not None else None,
             ),
         }
         response = str(result.output or "").strip()
@@ -981,20 +987,6 @@ def truncation_detail(evidence: dict[str, object], *, response: str) -> str:
         f"{evidence.get('output_tokens')} of {evidence.get('max_output_tokens')}). "
         "The incomplete text was not parsed as a contract. Raise "
         "model.max_output_tokens or shorten the required response."
-    )
-
-
-def _context_limit_detail(evidence: dict[str, object]) -> str:
-    """The failure detail for a run stopped before a request that cannot fit."""
-
-    return (
-        f"The run stopped before request {evidence.get('request')} was sent, because "
-        "its prompt would not fit the remaining token budget: the prompt is at least "
-        f"{evidence.get('projected_tokens')} tokens and "
-        f"{evidence.get('remaining_tokens')} of {evidence.get('total_token_limit')} "
-        "remain. The request was never sent, so no tokens were spent on it and no "
-        "verdict was produced. Fewer or smaller reads, a larger budget, or a "
-        "narrower scope would each avoid it."
     )
 
 
