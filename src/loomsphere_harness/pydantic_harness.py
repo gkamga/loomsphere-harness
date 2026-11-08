@@ -26,7 +26,7 @@ import ipaddress
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -84,6 +84,9 @@ MAX_SEARCH_RESULTS = 100
 MAX_FIND_RESULTS = 200
 #: Distinct tool names kept in the bounded failure diagnostic.
 TOOL_SUMMARY_LIMIT = 25
+#: Per-request context measurements kept in the run evidence. A run longer than
+#: this keeps its newest measurements and flags the truncation.
+MEASUREMENT_LIMIT = 60
 #: Smaller models call tools that do not exist (for example a shell). Each such
 #: call is refused; a few retries let the model recover without widening any grant.
 TOOL_RETRIES = 5
@@ -94,6 +97,35 @@ TRUNCATING_FINISH_REASONS = frozenset({"length"})
 #: contract. Reporting it as ``invalid-intake`` hid the real cause.
 REASON_RESPONSE_TRUNCATED = "response-truncated"
 TRUNCATION_EXCERPT_CHARS = 400
+#: Tool results whose content can be fetched again by calling the same tool with
+#: the same arguments. Only these are ever elided from a later request: a command
+#: result cannot be reproduced, so it is evidence and stays verbatim.
+ELIDABLE_TOOLS: tuple[str, ...] = READ_TOOLS
+#: The bounded-context policy is a QA read-only measure. Every other role keeps the
+#: history behaviour it had before this policy existed: a role whose findings are
+#: not the budget-limited QA stage must not have its evidence silently reduced.
+CONTEXT_POLICY_ROLE = "qa"
+#: How much prior tool-result text one QA run may keep in its model context. Every
+#: provider request re-sends the whole history, so an unbounded history is charged
+#: again on each request. The reference Demandro M0-02 QA run recorded 69,624 tokens
+#: against a 60,000-token limit in four requests without answering
+#: (docs/workflows/qa-recovery.md). An offline replay of seven representative capped
+#: reads estimates 183,573 input tokens at a 150,000-token ceiling by characters/4.
+#: It is a synthetic estimate, not a provider measurement. The bound keeps the most
+#: recent evidence verbatim and names every elided result.
+MAX_RETAINED_TOOL_CHARS = 48_000
+#: The most recent results always stay verbatim, so the answer under construction
+#: keeps the evidence it was just reasoning about.
+KEEP_RECENT_TOOL_RESULTS = 2
+#: Characters per token used only to *estimate* the size of the next request for
+#: diagnostics. It is not a proven lower bound for any provider tokenizer: an input
+#: that compresses well (long runs of spaces, repetitive markup) can emit far fewer
+#: tokens than this estimate. It is therefore recorded, never enforced.
+CONTEXT_CHARS_PER_TOKEN_ESTIMATE = 8
+#: Per-message and per-part framing that the provider charges for but that carries
+#: no content: role markers, tool names, and tool call identifiers.
+MESSAGE_OVERHEAD_CHARS = 40
+PART_OVERHEAD_CHARS = 80
 
 INSTRUCTIONS = (
     "You are a LoomSphere agent. Work only through the provided file tools, which "
@@ -272,6 +304,19 @@ def tools_for(invocation: AgentInvocation) -> tuple[str, ...]:
     return READ_TOOLS + WRITE_TOOLS
 
 
+def context_policy_applies(invocation: AgentInvocation) -> bool:
+    """Whether the bounded-context policy governs this invocation.
+
+    Only a read-only QA run is bounded. QA is the stage whose context growth
+    exhausted a shared budget, and it reviews recorded evidence it cannot rewrite.
+    Every other role keeps the history behaviour it had before this policy existed:
+    an Intake, Architect, Builder, or Reviewer run must never have its evidence
+    elided or its request judged against a character-based token estimate.
+    """
+
+    return invocation.role == CONTEXT_POLICY_ROLE and invocation.read_only
+
+
 def _is_local_host(host: str) -> bool:
     if host == "localhost":
         return True
@@ -281,16 +326,283 @@ def _is_local_host(host: str) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class ContextPolicy:
+    """How much prior tool-result text one run may keep in the model context.
+
+    The policy bounds *history that is sent again on every request*. It never
+    bounds what a tool may return, never edits the workspace, and never drops a
+    result silently: an elided result is replaced by a stub naming the tool, the
+    target, the original size, and a SHA-256 digest, so the model knows the exact
+    bytes it is missing and can fetch them again.
+    """
+
+    max_retained_chars: int = MAX_RETAINED_TOOL_CHARS
+    keep_recent: int = KEEP_RECENT_TOOL_RESULTS
+    #: The tools whose results may be elided.
+    elidable_tools: tuple[str, ...] = ELIDABLE_TOOLS
+    #: Characters per token used for the diagnostic next-request projection. The
+    #: projection is recorded, not enforced: there is no provider tokenizer here
+    #: that could prove a request cannot fit, and the official ``UsageLimits``
+    #: check remains the only enforcement.
+    chars_per_token: int = CONTEXT_CHARS_PER_TOKEN_ESTIMATE
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "max_retained_tool_chars": self.max_retained_chars,
+            "keep_recent_tool_results": self.keep_recent,
+            "elidable_tools": list(self.elidable_tools),
+            "projection_chars_per_token": self.chars_per_token,
+            "projection_enforcement": "diagnostic-only",
+        }
+
+
+def _context_chars(messages: list[object]) -> int:
+    """The characters of prompt the runtime is about to send for one request.
+
+    Summed per part rather than over ``str(parts)``: rendering the part list would
+    include the content a second time and double every figure, which would both
+    misreport the evidence and make the pre-request guard refuse runs that fit.
+    """
+
+    total = 0
+    for message in messages:
+        total += MESSAGE_OVERHEAD_CHARS
+        for part in getattr(message, "parts", ()):
+            total += PART_OVERHEAD_CHARS
+            content = getattr(part, "content", None)
+            if content is not None:
+                total += len(content) if isinstance(content, str) else len(str(content))
+            args = getattr(part, "args", None)
+            if args is not None:
+                total += len(str(args))
+    return total
+
+
+@dataclass
+class ContextBudget:
+    """Bound one run's retained tool-result text and measure each request.
+
+    PydanticAI re-sends the full message history on every request, so the cost of
+    a tool result is charged once per remaining request rather than once. Two rules
+    keep that geometric growth finite without losing evidence:
+
+    1. **Duplicate elision.** A result whose content is byte-identical to a newer
+       result of the same tool is replaced by a stub: the model already has the
+       newer copy, so the older one adds cost and no information.
+    2. **Retention bound.** Once the retained results exceed
+       ``max_retained_chars``, older results are elided newest-first, keeping the
+       most recent ``keep_recent`` verbatim.
+
+    Every elision records the original character count keyed by tool call id, so
+    the audit trail keeps the true result size and never a stub's size.
+    """
+
+    policy: ContextPolicy
+    total_token_limit: int
+    usage: object
+    measurements: list[dict[str, object]] = field(default_factory=list)
+    original_chars: dict[str, int] = field(default_factory=dict)
+    elided_calls: dict[str, dict[str, object]] = field(default_factory=dict)
+
+    def __call__(self, messages: list[object]) -> list[object]:
+        """Register as a PydanticAI history processor and measure the request.
+
+        The next-request projection is recorded for diagnosis only. A character
+        heuristic cannot prove that a request will not fit, and refusing a QA task
+        on an unproven estimate would spend its one-time authorization on a false
+        positive. ``UsageLimits`` remains the enforcement; it is checked after a
+        response, so an overshoot inside one response is still possible.
+        """
+
+        self._bound(messages)
+        record = self._measure(messages)
+        self.measurements.append(record)
+        return messages
+
+    def evidence(self) -> dict[str, object]:
+        """The bounded context observations recorded on the run.
+
+        Counts and digests only: no prompt text, no file content, no arguments.
+        """
+
+        prompts = [int(record["prompt_chars"]) for record in self.measurements]
+        return {
+            "policy": self.policy.evidence(),
+            "requests": len(self.measurements),
+            "measurements": self.measurements[-MEASUREMENT_LIMIT:],
+            "measurements_truncated": len(self.measurements) > MEASUREMENT_LIMIT,
+            "peak_prompt_chars": max(prompts) if prompts else 0,
+            "total_prompt_chars": sum(prompts),
+            "elided_tool_results": len(self.elided_calls),
+            "elided_chars": sum(
+                int(entry["chars"]) for entry in self.elided_calls.values()
+            ),
+        }
+
+    def _measure(self, messages: list[object]) -> dict[str, object]:
+        from pydantic_ai.messages import ToolReturnPart
+
+        prompt_chars = _context_chars(messages)
+        returns = [
+            part
+            for message in messages
+            for part in getattr(message, "parts", ())
+            if isinstance(part, ToolReturnPart)
+        ]
+        retained = sum(
+            len(part.content)
+            for part in returns
+            if isinstance(part.content, str)
+            and part.tool_call_id not in self.elided_calls
+        )
+        limit = self.total_token_limit
+        used = _usage_total(self.usage)
+        remaining = limit - used if limit > 0 else None
+        # A diagnostic estimate of provider tokens, not a lower bound. An input
+        # that compresses well can emit far fewer tokens than this, so the flag
+        # below can be true for a request that would have fitted and is never
+        # used to refuse one.
+        projected = prompt_chars // max(1, self.policy.chars_per_token)
+        return {
+            "request": len(self.measurements) + 1,
+            "prompt_chars": prompt_chars,
+            "messages": len(messages),
+            "tool_results": len(returns),
+            "retained_tool_chars": retained,
+            "elided_tool_results": len(self.elided_calls),
+            "projected_tokens": projected,
+            "remaining_tokens": remaining,
+            "projection_exceeds_remaining": (
+                remaining is not None and projected >= remaining
+            ),
+        }
+
+    def _bound(self, messages: list[object]) -> None:
+        from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+
+        targets: dict[str, tuple[str, dict[str, object] | None]] = {}
+        for message in messages:
+            for part in getattr(message, "parts", ()):
+                if isinstance(part, ToolCallPart):
+                    targets[part.tool_call_id] = (
+                        part.tool_name,
+                        _argument_target(part.args),
+                    )
+
+        candidates: list[tuple[object, str]] = []
+        for message in messages:
+            for part in getattr(message, "parts", ()):
+                if not isinstance(part, ToolReturnPart):
+                    continue
+                if not isinstance(part.content, str):
+                    # Image or PDF content: not elided, so no stub can misdescribe it.
+                    continue
+                self.original_chars.setdefault(part.tool_call_id, len(part.content))
+                if part.tool_call_id in self.elided_calls:
+                    continue
+                tool = targets.get(part.tool_call_id, (part.tool_name, None))[0]
+                if tool not in self.policy.elidable_tools:
+                    continue
+                candidates.append((part, tool))
+
+        budget = self.policy.max_retained_chars
+        digest_of_kept: dict[tuple[str, str], None] = {}
+        for position, (part, tool) in enumerate(reversed(candidates)):
+            content = part.content
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            key = (tool, digest)
+            if key in digest_of_kept:
+                self._elide(part, tool, targets, content, digest, reason="duplicate")
+                continue
+            if position < self.policy.keep_recent or len(content) <= budget:
+                digest_of_kept[key] = None
+                budget -= len(content)
+                continue
+            self._elide(part, tool, targets, content, digest, reason="retention-bound")
+
+    def _elide(
+        self,
+        part: object,
+        tool: str,
+        targets: dict[str, tuple[str, dict[str, object] | None]],
+        content: str,
+        digest: str,
+        *,
+        reason: str,
+    ) -> None:
+        target = targets.get(part.tool_call_id, (tool, None))[1] or {}
+        self.elided_calls[part.tool_call_id] = {
+            "tool": tool,
+            "target": target.get("target"),
+            "chars": len(content),
+            "sha256": f"sha256:{digest}",
+            "reason": reason,
+        }
+        part.content = _elision_stub(
+            tool=tool,
+            target=target.get("target"),
+            chars=len(content),
+            digest=digest,
+            reason=reason,
+        )
+
+
+def _elision_stub(
+    *,
+    tool: str,
+    target: object,
+    chars: int,
+    digest: str,
+    reason: str,
+) -> str:
+    """The text that replaces an elided result.
+
+    It is deliberately explicit: the model must not mistake an elided result for an
+    empty file, a clean search, or a passing command, and it must be able to ask for
+    the same bytes again.
+    """
+
+    why = (
+        "an identical, newer result for the same tool is retained above"
+        if reason == "duplicate"
+        else "this run's retained tool-result budget is full"
+    )
+    return (
+        f"[loomsphere-harness] Result elided from this request: {why}. "
+        f"Nothing was hidden from you selectively; the content was returned in full "
+        f"earlier in this run.\n"
+        f"tool: {tool}\n"
+        f"target: {target if target is not None else 'unknown'}\n"
+        f"elided_chars: {chars}\n"
+        f"sha256: {digest}\n"
+        f"If you still need the content, call {tool} again with the same arguments "
+        f"(use offset/limit to page a large file). Do not assume what it said."
+    )
+
+
+def _usage_total(usage: object) -> int:
+    total = getattr(usage, "total_tokens", 0)
+    return int(total) if isinstance(total, int) else 0
+
+
 class PydanticHarnessRunner:
     """Run one invocation as a PydanticAI agent with confined file tools."""
 
     def __init__(
-        self, config: PydanticHarnessConfig, *, model: object | None = None
+        self,
+        config: PydanticHarnessConfig,
+        *,
+        model: object | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         self.config = config
         # Test seam only: lets a unit test exercise the tool boundary without a
         # network endpoint. The real factory path always builds the configured model.
         self._model = model
+        # Test seam and configuration point: tightening the bound never changes a
+        # verdict, so it is adjustable without an approval step.
+        self.context_policy = context_policy or ContextPolicy()
 
     def _validated(self, invocation: AgentInvocation) -> str | None:
         """Refuse an unconfigured or unapproved backend; return the API key."""
@@ -407,7 +719,7 @@ class PydanticHarnessRunner:
         import time
 
         from pydantic_ai import Agent, capture_run_messages
-        from pydantic_ai.capabilities import LocalWorkspace
+        from pydantic_ai.capabilities import LocalWorkspace, ProcessHistory
         from pydantic_ai.exceptions import (
             ModelAPIError,
             ModelHTTPError,
@@ -429,24 +741,44 @@ class PydanticHarnessRunner:
             ),
         )
         writable = "write_file" in tools
+        # Only a read-only QA run is bounded. Other roles keep their previous
+        # history behaviour, including no elision and no context measurement.
+        bounded = context_policy_applies(invocation)
+        # The accumulator is owned here rather than read back from the result: it
+        # is the only figure that survives an exception, a timeout, or cancellation.
+        usage = RunUsage()
+        budget = (
+            ContextBudget(
+                policy=self.context_policy,
+                total_token_limit=effective.total_token_limit,
+                usage=usage,
+            )
+            if bounded
+            else None
+        )
+        capabilities = [
+            LocalWorkspace(invocation.workspace_path, read_only=not writable),
+            FileSystem(
+                tools=tools,
+                denied_patterns=DENIED_PATTERNS,
+                content_hashes=False,
+                read_only=not writable,
+                max_read_lines=MAX_READ_LINES,
+                max_read_chars=MAX_READ_CHARS,
+                max_list_results=MAX_LIST_RESULTS,
+                max_search_results=MAX_SEARCH_RESULTS,
+                max_find_results=MAX_FIND_RESULTS,
+            ),
+        ]
+        if budget is not None:
+            # Runs before every QA model request, so the retained history is
+            # bounded and measured before it is paid for again.
+            capabilities.append(ProcessHistory(budget))
         agent = Agent(
             model,
             instructions=INSTRUCTIONS,
             retries=TOOL_RETRIES,
-            capabilities=[
-                LocalWorkspace(invocation.workspace_path, read_only=not writable),
-                FileSystem(
-                    tools=tools,
-                    denied_patterns=DENIED_PATTERNS,
-                    content_hashes=False,
-                    read_only=not writable,
-                    max_read_lines=MAX_READ_LINES,
-                    max_read_chars=MAX_READ_CHARS,
-                    max_list_results=MAX_LIST_RESULTS,
-                    max_search_results=MAX_SEARCH_RESULTS,
-                    max_find_results=MAX_FIND_RESULTS,
-                ),
-            ],
+            capabilities=capabilities,
         )
         started = time.monotonic()
         limits = UsageLimits(
@@ -454,9 +786,6 @@ class PydanticHarnessRunner:
             tool_calls_limit=effective.tool_call_limit,
             total_tokens_limit=effective.total_token_limit,
         )
-        # The accumulator is owned here rather than read back from the result: it
-        # is the only figure that survives an exception, a timeout, or cancellation.
-        usage = RunUsage()
         captured: list[list[object]] = []
 
         async def invoke():
@@ -480,12 +809,19 @@ class PydanticHarnessRunner:
             """
 
             snapshot = usage_snapshot(usage)
-            return {
+            events: dict[str, object] = {
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "usage": snapshot,
                 "diagnostics": budget_report(snapshot, effective.values()),
                 "tool_summary": tool_summary(captured[0] if captured else []),
             }
+            if budget is not None:
+                # One row per request: how much prompt was sent and how much of it
+                # was retained tool result. This is the measurement the reference
+                # QA exclusion showed was missing, and it explains a budget failure
+                # without recording any of the content that caused it.
+                events["context"] = budget.evidence()
+            return events
 
         try:
             result = await asyncio.wait_for(invoke(), timeout=invocation.timeout_seconds)
@@ -496,6 +832,9 @@ class PydanticHarnessRunner:
                 events=observed(),
             ) from error
         except UsageLimitExceeded as error:
+            # The official check runs after a response, so it can stop a run that
+            # has just pushed the total past the ceiling; it cannot prevent the
+            # request that did so. Nothing here claims overspend is eliminated.
             raise _RunFailure(
                 "resource-limit-exceeded", f"A run limit was reached: {error}"[:300],
                 events=observed(),
@@ -525,7 +864,11 @@ class PydanticHarnessRunner:
 
         events = {
             **observed(),
-            "tool_activity": _tool_activity(result.all_messages()),
+            "tool_activity": _tool_activity(
+                result.all_messages(),
+                original_chars=budget.original_chars if budget is not None else None,
+                elided=budget.elided_calls if budget is not None else None,
+            ),
         }
         response = str(result.output or "").strip()
         truncation = truncation_evidence(
@@ -706,7 +1049,12 @@ def _argument_target(args: object) -> dict[str, object] | None:
     return None
 
 
-def _tool_activity(messages: list[object]) -> list[dict[str, object]]:
+def _tool_activity(
+    messages: list[object],
+    *,
+    original_chars: dict[str, int] | None = None,
+    elided: dict[str, dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """Ordered tool calls with their outcome; no arguments and no results.
 
     Earlier revisions copied up to 300 characters of the arguments and 320 of the
@@ -714,10 +1062,17 @@ def _tool_activity(messages: list[object]) -> list[dict[str, object]]:
     contents, and for a read the result is, so the record became a partial copy of
     the workspace. Only the tool name, its target, its outcome, and how much it
     returned are kept.
+
+    ``result_chars`` is the size the tool actually returned, not the size of what
+    was later elided from a subsequent request: the two differ when the context
+    bound replaced a retained result with a stub, and the audit record must keep
+    describing what the tool did.
     """
 
     from pydantic_ai.messages import ToolCallPart, ToolReturnPart, RetryPromptPart
 
+    originals = original_chars or {}
+    elided = elided or {}
     calls: dict[str, dict[str, object]] = {}
     for message in messages:
         for part in getattr(message, "parts", ()):
@@ -736,9 +1091,18 @@ def _tool_activity(messages: list[object]) -> list[dict[str, object]]:
                 # The file tools report a refused path as an ordinary result, so the
                 # outcome is "returned" and only the size is kept.
                 calls[part.tool_call_id]["outcome"] = "returned"
-                calls[part.tool_call_id]["result_chars"] = len(str(part.content))
+                calls[part.tool_call_id]["result_chars"] = originals.get(
+                    part.tool_call_id, len(str(part.content))
+                )
             elif isinstance(part, RetryPromptPart) and part.tool_call_id in calls:
                 calls[part.tool_call_id]["outcome"] = "rejected"
+    for tool_call_id, entry in elided.items():
+        if tool_call_id in calls:
+            # Recorded so a reviewer can tell a small result from a large one that
+            # was later removed from the requests, without seeing either.
+            calls[tool_call_id]["elided"] = True
+            calls[tool_call_id]["elided_chars"] = entry.get("chars")
+            calls[tool_call_id]["elision_reason"] = entry.get("reason")
     return list(calls.values())[:TOOL_ACTIVITY_LIMIT]
 
 
