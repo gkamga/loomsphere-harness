@@ -1,11 +1,12 @@
 # QA recovery: one authorised re-run of a stopped QA invocation
 
 A QA invocation can stop before it answers. When it does, the task lands in
-`qa_failed` even though the Builder finished, the change set was frozen, and the
-immutable sandbox validation already proved that change set against every
-acceptance selector. QA never formed an opinion, so there is nothing to
-contradict and nothing to overrule — but until this workflow existed there was no
-supported command out of that state.
+`qa_failed` after the change set was frozen and immutable sandbox validation
+proved that change set against every acceptance selector. The Builder may have
+finished with a verified report, or a human may have authorized recovery of a
+failed Builder's preserved change set. QA never formed an opinion, so there is
+nothing to contradict and nothing to overrule — but until this workflow existed
+there was no supported command out of that state.
 
 QA recovery re-runs **only the QA invocation**, once, on the exact state that was
 already proven, and then lets the normal Reviewer, delivery, and human-acceptance
@@ -55,14 +56,18 @@ All of the following must hold; the first failure is reported as a refusal.
 | QA recorded no verdict for this iteration | no `qa_report`, `qa_digest`, or `qa_run_id` on the iteration |
 | No deliverable or acceptance exists | `deliverables`, `tasks.status` |
 | The proposal and approval are the frozen ones | contract digest and workspace digest match the iteration |
+| Builder provenance is verified | successful Builder run/report/digest, or matching authorized Builder-recovery row and audit evidence |
 | The source is exactly what was validated | `change_set.workspace_digest == validation.workspace_digest` |
-| Validation succeeded against that source | `status = succeeded`, `exit_code = 0`, selector coverage complete |
+| Validation succeeded against that source and approved contract | stored output digest, sandbox image identity, `status = succeeded`, `exit_code = 0`, selector coverage complete |
 | No earlier QA recovery for this iteration | `qa_recoveries` row count for the iteration is below `MAX_QA_RECOVERIES` |
 
 ## What it refuses
 
 - a recorded adverse QA verdict (`failed`) — that is an opinion, and the ordinary
   rework path already handles it;
+- an absent Builder report without a matching, audited Builder-recovery
+  authorization for the same failed run, approved contract, frozen commit, and
+  workspace digest;
 - a failed or missing validation record, or validation against a different source
   digest than the worktree now holds;
 - a worktree that no longer matches the recorded change set (uncommitted changes,
@@ -88,10 +93,13 @@ recoveries, and the worktree byte-identical.
 
 Intake, Architect, Builder, and the sandbox validation are **not** re-run: they
 were already proved against the identical source and image, and repeating them
-would cost the same budget while proving nothing new. No Builder report and no QA
-evidence is ever manufactured for the re-run; the new QA run carries a provenance
-block naming the run it replaces, that run's failure reason, and the fact that
-nothing was rebuilt or re-validated.
+would cost the same budget while proving nothing new. An authorized Builder
+recovery remains explicitly distinct from a successful Builder report; neither a
+report nor a digest is manufactured for it. The QA-recovery authorization and
+deliverable bind the recorded Builder provenance, validation output, sandbox
+image, approved contract, and frozen change set. The new QA run carries a
+provenance block naming the run it replaces, that run's failure reason, and the
+fact that nothing was rebuilt or re-validated.
 
 ## Reading the token consumption
 

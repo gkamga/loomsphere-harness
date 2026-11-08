@@ -93,6 +93,7 @@ from loomsphere_harness.store import (
     MAX_QA_RECOVERIES,
     QA_RECOVERABLE_FAILURES,
     RESTARTABLE_FAILURES,
+    StoreError,
 )
 
 DELIVERABLE_SCHEMA_VERSION = "1.0.0"
@@ -1458,10 +1459,14 @@ class ImplementationStage:
                     "This iteration recorded a QA verdict, so there is nothing to re-run; "
                     "a verdict is never re-asked in the hope of a different answer."
                 )
-            if iteration.get("build_report") is None or not iteration.get("build_digest"):
+            try:
+                self.store.verify_qa_builder_provenance(
+                    task_id=task_id, iteration_id=iteration["id"]
+                )
+            except (StoreError, EngineError, AcceptanceContractError) as error:
                 obstacles.append(
-                    "This iteration recorded no Builder report. Use `inspect-recovery` and "
-                    "`recover-builder` to take the preserved work through QA instead."
+                    "The iteration has no verifiable Builder provenance "
+                    f"({getattr(error, 'message', str(error))})."
                 )
             if not iteration.get("commit_sha"):
                 obstacles.append("The iteration recorded no commit to re-examine.")
@@ -1594,8 +1599,19 @@ class ImplementationStage:
             [item for item in store.qa_recoveries(task_id)
              if iteration is None or item["iteration_id"] == iteration["id"]]
         )
+        try:
+            builder_provenance = (
+                None
+                if iteration is None
+                else store.verify_qa_builder_provenance(
+                    task_id=task_id, iteration_id=iteration["id"]
+                )
+            )
+        except StoreError as error:
+            builder_provenance = {"status": "unverified", "reason": error.message}
         view: dict[str, Any] = {
             "task": {"id": task_id, "title": task["title"], "status": task["status"]},
+            "builder_provenance": builder_provenance,
             "iteration": (
                 None
                 if iteration is None
@@ -1851,8 +1867,11 @@ class ImplementationStage:
             base_commit=changeset.base_commit,
             head_commit=changeset.head_commit,
             workspace_digest=changeset.workspace_digest,
-            builder_run_id=iteration.get("builder_run_id"),
-            build_digest=str(iteration["build_digest"]),
+            builder_run_id=(
+                iteration.get("builder_run_id")
+                or (recovery or {}).get("builder_run_id")
+            ),
+            build_digest=iteration.get("build_digest"),
             proposal_id=proposal["id"],
             proposal_digest=proposal["digest"],
             approval_id=approval["id"],
@@ -2734,6 +2753,11 @@ class ImplementationStage:
         iteration = self.store.iteration(task_id) or iteration
         recovery = self.store.recovery_for_iteration(iteration["id"])
         qa_recovery = self.store.qa_recovery_for_iteration(iteration["id"])
+        if report is None and recovery is None:
+            raise EngineError(
+                REASON_QA_RECOVERY_REFUSED,
+                "A deliverable without a Builder report requires recorded Builder recovery.",
+            )
 
         document: dict[str, Any] = {
             "schema_version": DELIVERABLE_SCHEMA_VERSION,
@@ -2767,6 +2791,7 @@ class ImplementationStage:
                     "digest": report.digest,
                     "run_id": iteration.get("builder_run_id"),
                     "status": "reported",
+                    "provenance": "builder-report",
                 }
                 if report is not None
                 else {
@@ -2776,6 +2801,8 @@ class ImplementationStage:
                     "digest": None,
                     "run_id": recovery["builder_run_id"] if recovery else None,
                     "status": "not-recorded",
+                    "provenance": "builder-recovery",
+                    "recovery_id": recovery["id"],
                     "reason": recovery["failure_reason"] if recovery else None,
                     "detail": recovery["failure_detail"] if recovery else None,
                     "tests_run": None,
@@ -2828,10 +2855,16 @@ class ImplementationStage:
                     "failure_reason": qa_recovery["failure_reason"],
                     "failure_detail": qa_recovery["failure_detail"],
                     "recovery_number": qa_recovery["recovery_number"],
+                    "builder_provenance": qa_recovery["builder_provenance"],
+                    "builder_recovery_id": qa_recovery["builder_recovery_id"],
+                    "builder_run_id": qa_recovery["builder_run_id"],
+                    "build_digest": qa_recovery["build_digest"],
+                    "contract_digest": qa_recovery["contract_digest"],
                     "base_commit": qa_recovery["base_commit"],
                     "head_commit": qa_recovery["head_commit"],
                     "workspace_digest": qa_recovery["workspace_digest"],
                     "validation_output_digest": qa_recovery["validation_output_digest"],
+                    "sandbox_image_id": qa_recovery["sandbox_image_id"],
                     "previous_qa_verdict": "not-recorded",
                     "rebuilt": False,
                     "revalidated": False,

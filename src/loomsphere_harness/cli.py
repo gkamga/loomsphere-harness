@@ -588,6 +588,19 @@ def render_qa_recovery(view: dict[str, Any]) -> str:
     inspection = view["qa_recovery"]
     task = inspection["task"]
     lines = [f"{task['id']}  {task['status']}  {task['title']}"]
+    builder_provenance = inspection.get("builder_provenance")
+    if isinstance(builder_provenance, dict):
+        provenance = builder_provenance.get("builder_provenance")
+        lines.append(
+            f"Builder provenance {provenance or builder_provenance.get('status')}"
+        )
+        if builder_provenance.get("builder_recovery_id"):
+            lines.append(
+                f"  recovery {builder_provenance['builder_recovery_id']}  "
+                f"Builder run {builder_provenance.get('builder_run_id')}"
+            )
+        if builder_provenance.get("reason"):
+            lines.append(f"  provenance obstacle {builder_provenance['reason']}")
     iteration = inspection.get("iteration")
     if iteration is None:
         lines.append("no iteration is recorded for this task")

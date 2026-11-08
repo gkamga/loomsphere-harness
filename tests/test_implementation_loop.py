@@ -2476,11 +2476,9 @@ class BuilderRestart(LoopCase):
 class QaRecovery(LoopCase):
     """Human-authorised re-run of a QA invocation that stopped without answering.
 
-    This is the Demandro M0-02 shape. The Builder finished and its work was frozen
-    on the task branch, the frozen change set passed the immutable sandbox
-    validation with every acceptance selector verified, and then QA's invocation hit
-    the run's token budget after four requests. Nothing was wrong with the
-    implementation, yet no supported path existed out of ``qa_failed``.
+    This covers both successful Builder reports and the Demandro M0-02 shape,
+    where a failed Builder's preserved change set was authorized and validated
+    before QA hit its run budget.
 
     Every test here pins the two halves of the fix at once: the re-run reuses what
     was already proven (contract, change set, validation evidence, approval) and
@@ -2508,6 +2506,68 @@ class QaRecovery(LoopCase):
         self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
         self.assertEqual(view["task"]["status"], "qa_failed")
         self.assertIsNone(view["deliverable"])
+        return engine, task_id, calls
+
+    def failed_recovered_qa(self, *, criteria_count: int = 1):
+        """Recover a Builder failure, validate its files, then stop the first QA."""
+
+        criteria = [
+            {
+                "criterion": f"Pilot obligation {index}.",
+                "approach": "Run the exact approved selector.",
+                "verification": {
+                    "kind": "pytest",
+                    "selector": f"tests/test_hello.py::test_selector_{index}",
+                },
+            }
+            for index in range(1, criteria_count + 1)
+        ]
+        proposal = {
+            **PROPOSAL,
+            "acceptance_criteria_mapping": criteria,
+        }
+        claims = [
+            {
+                "criterion_id": f"AC-{index}",
+                "criterion": criterion["criterion"],
+                "status": "met",
+                "evidence": criterion["verification"]["selector"],
+            }
+            for index, criterion in enumerate(criteria, start=1)
+        ]
+        qa_report = {**QA_REPORT, "acceptance_criteria": claims}
+        review_verdict = {**REVIEW_VERDICT, "acceptance_criteria": claims}
+        files = {
+            "tests/test_hello.py": "".join(
+                f"def test_selector_{index}() -> None:\n    assert True\n\n"
+                for index in range(1, criteria_count + 1)
+            )
+        }
+        engine, task_id, calls = self.approved_task(
+            proposal=proposal,
+            builder_failures={1: out_of_budget()},
+            attempt_files={1: files},
+            qa_failures={1: out_of_budget()},
+            qa_reports=[qa_report],
+            review_verdicts=[review_verdict],
+        )
+        failed_builder_view = engine.implement(task_id)
+        self.assertEqual(
+            failed_builder_view["implementation"]["reason"], "resource-limit-exceeded"
+        )
+        self.assertEqual(engine._task(task_id)["status"], "implementation_failed")
+        iteration = engine.store.iteration(task_id)
+        self.assertIsNone(iteration["build_report"])
+        self.assertIsNone(iteration["build_digest"])
+        self.assertTrue((self.worktree(engine, task_id) / "tests/test_hello.py").stat().st_size)
+
+        recovery_view = engine.inspect_recovery(task_id)["recovery"]
+        self.assertTrue(recovery_view["eligible"], recovery_view["obstacles"])
+        builder_recovery = engine.recover_builder(
+            task_id, snapshot_digest=recovery_view["snapshot"]["digest"]
+        )
+        self.assertEqual(engine._task(task_id)["status"], "qa_failed")
+        self.assertEqual(builder_recovery["implementation"]["reason"], "resource-limit-exceeded")
         return engine, task_id, calls
 
     def qa_runs(self, engine, task_id):
@@ -2637,6 +2697,14 @@ class QaRecovery(LoopCase):
         self.assertEqual(recovery["previous_qa_verdict"], "not-recorded")
         self.assertFalse(recovery["rebuilt"])
         self.assertFalse(recovery["revalidated"])
+        self.assertEqual(
+            recovery["builder_provenance"], "builder-report"
+        )
+        self.assertIsNone(recovery["builder_recovery_id"])
+        self.assertEqual(
+            self.inspection(engine, task_id)["builder_provenance"]["builder_provenance"],
+            "builder-report",
+        )
 
         events = [event["event"] for event in view["audit"]]
         self.assertEqual(events.count("qa.recovery-authorized"), 1)
@@ -2644,6 +2712,195 @@ class QaRecovery(LoopCase):
         self.assertGreaterEqual(
             engine.store.verify_audit_chain(), len(engine.store.audit_events(task_id))
         )
+
+    def test_recovered_builder_provenance_can_recover_qa_without_rebuilding(self) -> None:
+        engine, task_id, calls = self.failed_recovered_qa(criteria_count=5)
+        iteration = engine.store.iteration(task_id)
+        builder_run_before = next(
+            run for run in engine.store.runs(task_id) if run["role"] == "builder"
+        )
+        iteration_failure_before = (
+            iteration["failure_reason"],
+            iteration["failure_detail"],
+        )
+        failed_qa_before = self.failed_run(engine, task_id)
+        builder_recovery_before = engine.store.recovery_for_iteration(iteration["id"])
+        self.assertIsNotNone(builder_recovery_before)
+        validation_evidence = iteration["validation"]["verification_coverage"]["criteria"]
+        self.assertEqual(len(validation_evidence), 5)
+        self.assertEqual(
+            [item["execution"]["command"][-1] for item in validation_evidence],
+            [f"tests/test_hello.py::test_selector_{index}" for index in range(1, 6)],
+        )
+        self.assertTrue(all(item["status"] == "succeeded" for item in validation_evidence))
+        inspect = self.inspection(engine, task_id)
+        self.assertTrue(inspect["eligible"], inspect["obstacles"])
+        self.assertEqual(inspect["iteration"]["builder_report"], "not-recorded")
+        self.assertEqual(
+            inspect["builder_provenance"]["builder_provenance"], "builder-recovery"
+        )
+        self.assertEqual(inspect["validation"]["criteria"], 5)
+        docker_runs_before_retry = [
+            call for call in calls if call[1:2] == ["run"]
+        ]
+
+        view = engine.retry_qa(task_id, failed_run_id=failed_qa_before["id"])
+
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(
+            [run["role"] for run in view["runs"]],
+            ["intake", "architect", "builder", "qa", "qa", "reviewer"],
+        )
+        self.assertEqual(
+            [run for run in engine.store.runs(task_id) if run["role"] == "builder"],
+            [builder_run_before],
+        )
+        iteration_after = engine.store.iteration(task_id)
+        self.assertEqual(
+            (iteration_after["failure_reason"], iteration_after["failure_detail"]),
+            iteration_failure_before,
+        )
+        qa_runs = self.qa_runs(engine, task_id)
+        self.assertEqual(qa_runs[0], failed_qa_before)
+        self.assertEqual(qa_runs[0]["status"], "failed")
+        self.assertEqual(qa_runs[0]["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(qa_runs[1]["status"], "succeeded")
+        self.assertEqual(
+            [run for run in view["runs"] if run["role"] == "reviewer"][0]["status"],
+            "succeeded",
+        )
+        self.assertEqual(
+            view["deliverable"]["document"]["review"]["report"]["verdict"], "accepted"
+        )
+        self.assertEqual(
+            engine.store.recovery_for_iteration(iteration["id"]),
+            builder_recovery_before,
+        )
+        self.assertEqual(len(engine.store.qa_recoveries(task_id)), 1)
+        self.assertEqual(
+            [call for call in calls if call[1:2] == ["run"]],
+            docker_runs_before_retry,
+        )
+        self.assertIsNone(engine.store.iteration(task_id)["build_report"])
+        self.assertIsNone(engine.store.iteration(task_id)["build_digest"])
+
+        document = view["deliverable"]["document"]
+        self.assertEqual(document["builder"]["status"], "not-recorded")
+        self.assertIsNone(document["builder"]["report"])
+        self.assertIsNone(document["builder"]["digest"])
+        self.assertEqual(document["builder"]["provenance"], "builder-recovery")
+        self.assertEqual(document["builder"]["recovery_id"], builder_recovery_before["id"])
+        self.assertEqual(document["recovery"]["id"], builder_recovery_before["id"])
+        self.assertEqual(
+            document["qa_recovery"]["builder_provenance"], "builder-recovery"
+        )
+        self.assertEqual(
+            document["qa_recovery"]["builder_recovery_id"], builder_recovery_before["id"]
+        )
+        self.assertEqual(document["qa_recovery"]["builder_run_id"], builder_run_before["id"])
+        self.assertEqual(
+            document["qa_recovery"]["contract_digest"],
+            builder_recovery_before["contract_digest"],
+        )
+        self.assertEqual(
+            document["qa_recovery"]["validation_output_digest"],
+            iteration["validation"]["output_digest"],
+        )
+        self.assertEqual(
+            document["qa_recovery"]["sandbox_image_id"],
+            iteration["validation"]["sandbox_image_id"],
+        )
+        self.assertIsNone(view["acceptance"])
+        self.assertEqual(document["recovery"]["acceptance"], "pending-human-acceptance")
+
+    def test_a_missing_builder_recovery_record_blocks_qa_recovery(self) -> None:
+        engine, task_id, _ = self.failed_recovered_qa()
+        self.corrupt("DROP TRIGGER recoveries_no_delete")
+        self.corrupt("DELETE FROM recoveries WHERE task_id = ?", task_id)
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("no verifiable Builder provenance" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+
+    def test_a_mismatched_builder_recovery_record_blocks_qa_recovery(self) -> None:
+        engine, task_id, _ = self.failed_recovered_qa()
+        self.corrupt("DROP TRIGGER recoveries_no_update")
+        self.corrupt(
+            "UPDATE recoveries SET head_commit = ? WHERE task_id = ?",
+            "f" * 40,
+            task_id,
+        )
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("no verifiable Builder provenance" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+
+    def test_a_forged_builder_recovery_record_without_audit_evidence_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_recovered_qa()
+        original = engine.store.recovery(task_id)
+        self.assertIsNotNone(original)
+        self.corrupt("DROP TRIGGER recoveries_no_update")
+        self.corrupt("DROP TRIGGER recoveries_no_delete")
+        self.corrupt("DELETE FROM recoveries WHERE task_id = ?", task_id)
+        with closing(sqlite3.connect(self.state)) as db:
+            db.execute(
+                "INSERT INTO recoveries (id, task_id, iteration_id, builder_run_id,"
+                " failure_reason, failure_detail, base_commit, head_commit, snapshot_digest,"
+                " recovery_digest, changed_files, contract_digest, actor, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "forged-recovery",
+                    original["task_id"],
+                    original["iteration_id"],
+                    original["builder_run_id"],
+                    original["failure_reason"],
+                    original["failure_detail"],
+                    original["base_commit"],
+                    original["head_commit"],
+                    original["snapshot_digest"],
+                    original["recovery_digest"],
+                    json.dumps(original["changed_files"]),
+                    original["contract_digest"],
+                    original["actor"],
+                    original["created_at"],
+                ),
+            )
+            db.commit()
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("matching authorization audit event" in item for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id)
+
+    def test_store_rejects_mismatched_qa_authorization_evidence(self) -> None:
+        engine, task_id, _ = self.failed_recovered_qa()
+        correct = self.authorization(engine, task_id)
+        mismatches = {
+            "contract_digest": "0" * 64,
+            "validation_output_digest": "1" * 64,
+            "sandbox_image_id": "sha256:" + "0" * 64,
+        }
+
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                supplied = {**correct, field: value}
+                with self.assertRaises(StoreError) as raised:
+                    engine.store.authorize_qa_recovery(**supplied)
+                self.assertEqual(raised.exception.code, "qa-recovery-refused")
+                self.assertEqual(engine._task(task_id)["status"], "qa_failed")
+                self.assertEqual(engine.store.qa_recoveries(task_id), [])
 
     def test_inspecting_a_stopped_qa_run_changes_nothing(self) -> None:
         engine, task_id, _ = self.failed_qa()

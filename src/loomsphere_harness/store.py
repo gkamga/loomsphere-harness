@@ -13,9 +13,18 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .reports import ReportError, parse_build_report
+from .schemas.acceptance_contract import (
+    AcceptanceContract,
+    AcceptanceContractError,
+    build_contract,
+    contract_digest as calculate_contract_digest,
+)
 
 try:  # pragma: no cover - the fallback exists only for platforms without POSIX locks
     import fcntl
@@ -193,15 +202,26 @@ CREATE TABLE qa_recoveries (
   failure_reason TEXT NOT NULL, failure_detail TEXT,
   base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
   workspace_digest TEXT NOT NULL,
-  builder_run_id TEXT REFERENCES runs(id),
-  build_digest TEXT NOT NULL,
+  builder_provenance TEXT NOT NULL CHECK (
+    builder_provenance IN ('builder-report','builder-recovery')
+  ),
+  builder_recovery_id TEXT REFERENCES recoveries(id),
+  builder_run_id TEXT NOT NULL REFERENCES runs(id),
+  build_digest TEXT,
   proposal_id TEXT NOT NULL REFERENCES proposals(id),
   proposal_digest TEXT NOT NULL,
   approval_id TEXT NOT NULL REFERENCES approvals(id),
   contract_digest TEXT NOT NULL,
   validation_output_digest TEXT NOT NULL,
   sandbox_image_id TEXT NOT NULL,
-  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
+  CHECK (
+    (builder_provenance = 'builder-report'
+      AND builder_recovery_id IS NULL AND build_digest IS NOT NULL)
+    OR
+    (builder_provenance = 'builder-recovery'
+      AND builder_recovery_id IS NOT NULL AND build_digest IS NULL)
+  )
 );
 CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_events
   BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
@@ -325,8 +345,9 @@ CREATE TRIGGER IF NOT EXISTS builder_restarts_no_delete BEFORE DELETE ON builder
 
 #: Objects added by schema v5: the human-authorised re-run of a QA stage whose
 #: invocation failed before it produced a report. The row is immutable, unique per
-#: iteration, and binds the exact change set, validation run, and approval that the
-#: retry is allowed to run against, so a retry cannot drift onto other evidence.
+#: iteration, and binds the exact Builder provenance, change set, validation run,
+#: and approval that the retry is allowed to run against, so a retry cannot drift
+#: onto other evidence.
 V5_TABLES = """
 CREATE TABLE IF NOT EXISTS qa_recoveries (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -336,15 +357,26 @@ CREATE TABLE IF NOT EXISTS qa_recoveries (
   failure_reason TEXT NOT NULL, failure_detail TEXT,
   base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
   workspace_digest TEXT NOT NULL,
-  builder_run_id TEXT REFERENCES runs(id),
-  build_digest TEXT NOT NULL,
+  builder_provenance TEXT NOT NULL CHECK (
+    builder_provenance IN ('builder-report','builder-recovery')
+  ),
+  builder_recovery_id TEXT REFERENCES recoveries(id),
+  builder_run_id TEXT NOT NULL REFERENCES runs(id),
+  build_digest TEXT,
   proposal_id TEXT NOT NULL REFERENCES proposals(id),
   proposal_digest TEXT NOT NULL,
   approval_id TEXT NOT NULL REFERENCES approvals(id),
   contract_digest TEXT NOT NULL,
   validation_output_digest TEXT NOT NULL,
   sandbox_image_id TEXT NOT NULL,
-  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
+  CHECK (
+    (builder_provenance = 'builder-report'
+      AND builder_recovery_id IS NULL AND build_digest IS NOT NULL)
+    OR
+    (builder_provenance = 'builder-recovery'
+      AND builder_recovery_id IS NOT NULL AND build_digest IS NULL)
+  )
 );
 CREATE TRIGGER IF NOT EXISTS qa_recoveries_no_update BEFORE UPDATE ON qa_recoveries
   BEGIN SELECT RAISE(ABORT, 'a QA recovery record is immutable'); END;
@@ -692,9 +724,13 @@ class SqliteStore:
 
         db = self._connect()
         try:
-            rows = db.execute("SELECT * FROM audit_events ORDER BY seq").fetchall()
+            return self._verify_audit_chain(db)
         finally:
             db.close()
+
+    @staticmethod
+    def _verify_audit_chain(db: sqlite3.Connection) -> int:
+        rows = db.execute("SELECT * FROM audit_events ORDER BY seq").fetchall()
         previous = GENESIS
         for row in rows:
             body = _dump(
@@ -1418,10 +1454,344 @@ class SqliteStore:
         finally:
             db.close()
 
+    @staticmethod
+    def _approved_contract(document: str) -> AcceptanceContract:
+        try:
+            proposal = json.loads(document)
+            criteria = proposal.get("acceptance_criteria_mapping")
+            if not isinstance(criteria, list):
+                raise ValueError("the proposal has no acceptance criteria mapping")
+            return build_contract(criteria)
+        except (json.JSONDecodeError, AttributeError, ValueError, AcceptanceContractError) as error:
+            raise StoreError(
+                "qa-recovery-refused",
+                f"The approved acceptance contract cannot be verified ({error}).",
+            ) from error
+
+    @staticmethod
+    def _verify_qa_validation(
+        *,
+        validation: Any,
+        contract: AcceptanceContract,
+        iteration_validation_exit_code: int | None,
+        workspace_digest: str,
+        validation_output_digest: str,
+        sandbox_image_id: str,
+    ) -> None:
+        def refuse() -> None:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The supplied validation digest or sandbox image does not match the "
+                "successful acceptance evidence recorded on the iteration.",
+            )
+
+        if (
+            not isinstance(validation, dict)
+            or validation.get("status") != "succeeded"
+            or validation.get("exit_code") != 0
+            or iteration_validation_exit_code != 0
+            or validation.get("workspace_digest") != workspace_digest
+            or validation.get("output_digest") != validation_output_digest
+            or validation.get("sandbox_image_id") != sandbox_image_id
+            or not isinstance(sandbox_image_id, str)
+            or not sandbox_image_id.startswith("sha256:")
+            or not isinstance(validation_output_digest, str)
+            or not validation_output_digest
+        ):
+            refuse()
+
+        coverage = validation.get("verification_coverage")
+        evidence = coverage.get("criteria") if isinstance(coverage, dict) else None
+        if not isinstance(evidence, list) or len(evidence) != len(contract.criteria):
+            refuse()
+        by_id = {item.get("id"): item for item in evidence if isinstance(item, dict)}
+        if len(by_id) != len(contract.criteria):
+            refuse()
+        expected_source = workspace_digest
+        expected_image = sandbox_image_id
+        expected_image_name = validation.get("sandbox_image")
+        pytest_criteria = [
+            criterion for criterion in contract.criteria
+            if criterion.verification.kind == "pytest"
+        ]
+        if pytest_criteria:
+            environment = coverage.get("environment_check")
+            if (
+                not isinstance(environment, dict)
+                or environment.get("command") != ["python", "-m", "pytest", "--version"]
+                or environment.get("status") != "succeeded"
+                or environment.get("source_digest") != expected_source
+                or environment.get("source_digest_after") != expected_source
+                or environment.get("sandbox_image_id") != expected_image
+                or environment.get("sandbox_image") != expected_image_name
+            ):
+                refuse()
+        for criterion in contract.criteria:
+            result = by_id.get(criterion.id)
+            if (
+                result is None
+                or result.get("declared") != criterion.verification.model_dump(mode="json")
+                or result.get("mandatory") != criterion.mandatory
+            ):
+                refuse()
+            if not criterion.mandatory:
+                continue
+            if criterion.verification.kind != "pytest":
+                refuse()
+            selector = criterion.verification.selector
+            expected_commands = (
+                ["python", "-m", "pytest", "--collect-only", "-q", selector],
+                ["python", "-m", "pytest", "-q", selector],
+            )
+            collection = result.get("collection")
+            execution = result.get("execution")
+            if (
+                result.get("status") != "succeeded"
+                or result.get("selector_exists") is not True
+                or result.get("selector_executed") is not True
+                or not isinstance(collection, dict)
+                or collection.get("command") != expected_commands[0]
+                or collection.get("status") != "succeeded"
+                or collection.get("exit_code") != 0
+                or collection.get("source_digest") != expected_source
+                or collection.get("source_digest_after") != expected_source
+                or collection.get("sandbox_image_id") != expected_image
+                or collection.get("sandbox_image") != expected_image_name
+                or not collection.get("output_digest")
+                or not isinstance(execution, dict)
+                or execution.get("command") != expected_commands[1]
+                or execution.get("status") != "succeeded"
+                or execution.get("exit_code") != 0
+                or execution.get("source_digest") != expected_source
+                or execution.get("source_digest_after") != expected_source
+                or execution.get("sandbox_image_id") != expected_image
+                or execution.get("sandbox_image") != expected_image_name
+                or not execution.get("output_digest")
+            ):
+                refuse()
+
+    def _qa_builder_provenance(
+        self,
+        db: sqlite3.Connection,
+        *,
+        task_id: str,
+        iteration: sqlite3.Row,
+        builder_run_id: str | None,
+        build_digest: str | None,
+        expected_contract_digest: str,
+    ) -> dict[str, str | None]:
+        """Verify exactly one report or authorized-recovery provenance path."""
+
+        report_recorded = iteration["build_report"] is not None
+        digest_recorded = iteration["build_digest"] is not None
+        if report_recorded != digest_recorded:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The iteration has incomplete Builder report provenance.",
+            )
+
+        if report_recorded:
+            if (
+                builder_run_id != iteration["builder_run_id"]
+                or build_digest != iteration["build_digest"]
+                or not iteration["builder_run_id"]
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied Builder report provenance does not match the iteration.",
+                )
+            if db.execute(
+                "SELECT 1 FROM recoveries WHERE task_id = ? AND iteration_id = ?",
+                (task_id, iteration["id"]),
+            ).fetchone() is not None:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The iteration has conflicting Builder recovery provenance.",
+                )
+            run = db.execute(
+                "SELECT role, status, response_text FROM runs WHERE id = ? AND task_id = ?",
+                (iteration["builder_run_id"], task_id),
+            ).fetchone()
+            if run is None or run["role"] != "builder" or run["status"] != "succeeded":
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report has no successful Builder run.",
+                )
+            try:
+                report = parse_build_report(run["response_text"] or "")
+                stored_report = json.loads(iteration["build_report"])
+            except (ReportError, json.JSONDecodeError, TypeError) as error:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report cannot be verified.",
+                ) from error
+            if (
+                report.digest != iteration["build_digest"]
+                or stored_report != asdict(report)
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report does not match its stored digest.",
+                )
+            return {
+                "builder_provenance": "builder-report",
+                "builder_recovery_id": None,
+                "builder_run_id": iteration["builder_run_id"],
+                "build_digest": iteration["build_digest"],
+            }
+
+        if build_digest is not None:
+            raise StoreError(
+                "qa-recovery-refused",
+                "A missing Builder report is not backed by valid recovery provenance.",
+            )
+        recovery = db.execute(
+            "SELECT * FROM recoveries WHERE task_id = ? AND iteration_id = ?",
+            (task_id, iteration["id"]),
+        ).fetchone()
+        if (
+            recovery is None
+            or builder_run_id != recovery["builder_run_id"]
+            or (
+                iteration["builder_run_id"] is not None
+                and recovery["builder_run_id"] != iteration["builder_run_id"]
+            )
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The missing Builder report has no recovery record for this iteration.",
+            )
+        run = db.execute(
+            "SELECT role, status, failure_reason FROM runs WHERE id = ? AND task_id = ?",
+            (recovery["builder_run_id"], task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["role"] != "builder"
+            or run["status"] != "failed"
+            or run["failure_reason"] != recovery["failure_reason"]
+            or recovery["builder_run_id"] is None
+            or recovery["base_commit"] != iteration["base_commit"]
+            or recovery["head_commit"] != iteration["commit_sha"]
+            or recovery["recovery_digest"] != iteration["workspace_digest"]
+            or recovery["contract_digest"] != expected_contract_digest
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery does not match the failed run, approved "
+                "contract, or frozen change set.",
+            )
+        try:
+            changed_files = json.loads(recovery["changed_files"])
+        except (json.JSONDecodeError, TypeError) as error:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery has invalid changed-file evidence.",
+            ) from error
+        if (
+            not isinstance(changed_files, list)
+            or not changed_files
+            or any(not isinstance(item, dict) or not item.get("path") for item in changed_files)
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery has no valid changed-file evidence.",
+            )
+
+        self._verify_audit_chain(db)
+        expected_event = {
+            "recovery_id": recovery["id"],
+            "iteration_id": recovery["iteration_id"],
+            "builder_run_id": recovery["builder_run_id"],
+            "failure_reason": recovery["failure_reason"],
+            "recovery_digest": recovery["recovery_digest"],
+            "snapshot_digest": recovery["snapshot_digest"],
+            "contract_digest": recovery["contract_digest"],
+            "base_commit": recovery["base_commit"],
+            "head_commit": recovery["head_commit"],
+            "changed_files": [item["path"] for item in changed_files],
+        }
+        event_matches = False
+        for event in db.execute(
+            "SELECT detail FROM audit_events WHERE task_id = ? AND event = ?",
+            (task_id, RECOVERY_EVENT),
+        ).fetchall():
+            try:
+                detail = json.loads(event["detail"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if all(detail.get(key) == value for key, value in expected_event.items()):
+                event_matches = True
+                break
+        if not event_matches:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The Builder recovery is not backed by its matching authorization audit event.",
+            )
+        return {
+            "builder_provenance": "builder-recovery",
+            "builder_recovery_id": recovery["id"],
+            "builder_run_id": recovery["builder_run_id"],
+            "build_digest": None,
+        }
+
+    def verify_qa_builder_provenance(
+        self, *, task_id: str, iteration_id: str
+    ) -> dict[str, str | None]:
+        """Read-only verification shared by QA-recovery inspection and authorization."""
+
+        db = self._connect()
+        try:
+            iteration = db.execute(
+                "SELECT id, task_id, base_commit, commit_sha, workspace_digest,"
+                " builder_run_id, build_report, build_digest"
+                " FROM iterations WHERE id = ? AND task_id = ?",
+                (iteration_id, task_id),
+            ).fetchone()
+            if iteration is None:
+                raise StoreError(
+                    "qa-recovery-refused", "The QA-recovery iteration is missing."
+                )
+            proposal = db.execute(
+                "SELECT status, digest, document FROM proposals"
+                " WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                proposal is None
+                or proposal["status"] != "approved"
+                or hashlib.sha256(proposal["document"].encode("utf-8")).hexdigest()
+                != proposal["digest"]
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The approved proposal for the Builder provenance is missing or changed.",
+                )
+            approved_contract = self._approved_contract(proposal["document"])
+            approved_contract_digest = calculate_contract_digest(approved_contract)
+            builder_run_id = iteration["builder_run_id"]
+            if builder_run_id is None:
+                recovery = db.execute(
+                    "SELECT builder_run_id FROM recoveries"
+                    " WHERE task_id = ? AND iteration_id = ?",
+                    (task_id, iteration_id),
+                ).fetchone()
+                builder_run_id = recovery["builder_run_id"] if recovery is not None else None
+            return self._qa_builder_provenance(
+                db,
+                task_id=task_id,
+                iteration=iteration,
+                builder_run_id=builder_run_id,
+                build_digest=iteration["build_digest"],
+                expected_contract_digest=approved_contract_digest,
+            )
+        finally:
+            db.close()
+
     def authorize_qa_recovery(
         self, *, task_id: str, iteration_id: str, failed_run_id: str, actor: str,
         reason: str | None, base_commit: str, head_commit: str, workspace_digest: str,
-        builder_run_id: str | None, build_digest: str, proposal_id: str,
+        builder_run_id: str | None, build_digest: str | None, proposal_id: str,
         proposal_digest: str, approval_id: str, contract_digest: str,
         validation_output_digest: str, sandbox_image_id: str, limit: int,
     ) -> dict[str, Any]:
@@ -1471,8 +1841,9 @@ class SqliteStore:
                     f"Task {task_id} is {task['status']}; expected qa_failed.",
                 )
             iteration = db.execute(
-                "SELECT number, status, base_commit, commit_sha, workspace_digest,"
+                "SELECT id, number, status, base_commit, commit_sha, workspace_digest,"
                 " builder_run_id, build_report, build_digest,"
+                " validation, validation_exit_code,"
                 " qa_run_id, qa_report, qa_digest, created_at"
                 " FROM iterations WHERE id = ? AND task_id = ?",
                 (iteration_id, task_id),
@@ -1515,20 +1886,6 @@ class SqliteStore:
                 raise StoreError(
                     "qa-recovery-refused",
                     "The recorded change set does not match the one being re-examined.",
-                )
-            if iteration["build_report"] is None or iteration["build_digest"] != build_digest:
-                raise StoreError(
-                    "qa-recovery-refused",
-                    "The iteration does not record the Builder report the retry relies on.",
-                )
-            if (
-                builder_run_id is not None
-                and iteration["builder_run_id"] is not None
-                and iteration["builder_run_id"] != builder_run_id
-            ):
-                raise StoreError(
-                    "qa-recovery-refused",
-                    "The supplied Builder run is not the one recorded on the iteration.",
                 )
             if iteration["base_commit"] != task["repo_commit"] or base_commit != task["repo_commit"]:
                 raise StoreError(
@@ -1598,20 +1955,59 @@ class SqliteStore:
                 raise StoreError(
                     "qa-recovery-refused", "The original approval no longer matches the proposal."
                 )
+            approved_contract = self._approved_contract(proposal["document"])
+            approved_contract_digest = calculate_contract_digest(approved_contract)
+            if approved_contract_digest != contract_digest:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied contract digest does not match the approved proposal.",
+                )
             if approval["repo_commit"] not in (None, task["repo_commit"]):
                 raise StoreError(
                     "qa-recovery-refused",
                     "The approved repository commit is not the one the task recorded.",
                 )
+            builder_provenance = self._qa_builder_provenance(
+                db,
+                task_id=task_id,
+                iteration=iteration,
+                builder_run_id=builder_run_id,
+                build_digest=build_digest,
+                expected_contract_digest=approved_contract_digest,
+            )
+            try:
+                validation = json.loads(iteration["validation"] or "")
+            except (json.JSONDecodeError, TypeError) as error:
+                raise StoreError(
+                    "qa-recovery-refused", "The recorded validation evidence is missing."
+                ) from error
+            self._verify_qa_validation(
+                validation=validation,
+                contract=approved_contract,
+                iteration_validation_exit_code=iteration["validation_exit_code"],
+                workspace_digest=workspace_digest,
+                validation_output_digest=validation_output_digest,
+                sandbox_image_id=sandbox_image_id,
+            )
             db.execute(
-                "INSERT INTO qa_recoveries VALUES"
-                " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO qa_recoveries ("
+                " id, task_id, iteration_id, failed_run_id, recovery_number,"
+                " failure_reason, failure_detail, base_commit, head_commit, workspace_digest,"
+                " builder_provenance, builder_recovery_id, builder_run_id, build_digest,"
+                " proposal_id, proposal_digest, approval_id, contract_digest,"
+                " validation_output_digest, sandbox_image_id, actor, reason, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     recovery_id, task_id, iteration_id, failed_run_id, used + 1,
                     str(run["failure_reason"] or "unknown"),
                     (str(run["failure_detail"] or "") or None), base_commit,
-                    head_commit, workspace_digest, builder_run_id, build_digest,
-                    proposal["id"], proposal["digest"], approval["id"], contract_digest,
+                    head_commit, workspace_digest,
+                    builder_provenance["builder_provenance"],
+                    builder_provenance["builder_recovery_id"],
+                    builder_provenance["builder_run_id"],
+                    builder_provenance["build_digest"],
+                    proposal["id"], proposal["digest"], approval["id"],
+                    approved_contract_digest,
                     validation_output_digest, sandbox_image_id, actor, reason, now(),
                 ),
             )
@@ -1626,8 +2022,8 @@ class SqliteStore:
                     "failed_run_id": failed_run_id,
                     "failure_reason": run["failure_reason"],
                     "workspace_digest": workspace_digest,
-                    "build_digest": build_digest,
-                    "contract_digest": contract_digest,
+                    **builder_provenance,
+                    "contract_digest": approved_contract_digest,
                     "validation_output_digest": validation_output_digest,
                     "sandbox_image_id": sandbox_image_id,
                     "limit": limit,
