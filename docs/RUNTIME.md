@@ -125,6 +125,8 @@ loomsphere-harness --repo . retry-review T-0001 # one Reviewer-only retry
 loomsphere-harness --repo . inspect-recovery T-0001 # work a failed Builder left behind
 loomsphere-harness --repo . recover-builder T-0001 --snapshot-digest <sha256>
 loomsphere-harness --repo . restart-builder T-0001 --failed-run <run id>
+loomsphere-harness --repo . inspect-qa-recovery T-0001 # QA that stopped before answering
+loomsphere-harness --repo . retry-qa T-0001 --failed-run <run id>
 loomsphere-harness --repo . changes T-0001     # recorded change set of the deliverable
 loomsphere-harness --repo . evidence T-0001    # validation run and review evidence
 loomsphere-harness --repo . accept  T-0001 --digest <deliverable sha256> [--reason "..."]
@@ -141,7 +143,9 @@ stderr), `3` the command did not reach its gate (`run` → `awaiting_approval`,
 `implement` → `awaiting_acceptance`, `changes`/`evidence` → no deliverable,
 `inspect-recovery` → the preserved work is not recoverable, `recover-builder` → the
 recovered work did not reach `awaiting_acceptance`, `restart-builder` → the
-restarted work did not reach `awaiting_acceptance`).
+restarted work did not reach `awaiting_acceptance`, `inspect-qa-recovery` → the
+stopped QA run is not re-runnable, `retry-qa` → the re-run did not reach
+`awaiting_acceptance`).
 
 ## Recovering work a failed Builder left behind
 
@@ -235,6 +239,20 @@ refuses a task that already failed, so nothing but rewriting state could continu
   opens the next iteration, so validation, QA, the Reviewer, and the human acceptance
   gate are exactly the ones a first attempt faces. Nothing is retried automatically,
   and no budget, limit, or gate is relaxed.
+## Re-running a QA invocation that stopped before answering
+
+A QA invocation can fail before it answers — the Demandro M0-02 run hit its token
+limit after four requests — leaving the task in `qa_failed` with the Builder's work
+frozen and validated. `inspect-qa-recovery <task>` is read-only and reports the
+stopped run with its recorded `usage`, the validation evidence it would reuse, the
+recoveries already spent, every obstacle, and the exact command to run next.
+`retry-qa <task> --failed-run <run id>` re-runs **only** QA, once per iteration:
+Intake, Architect, Builder, and the sandbox validation are not repeated, because they
+were already proved against the identical source and image. The authorization is
+appended before the run starts, the stopped run keeps its record, and a passing
+answer continues through the normal Reviewer, delivery, and human-acceptance stages.
+The full eligibility list, refusal conditions, and the token-consumption reading are
+in [QA recovery](workflows/qa-recovery.md).
 ## What is enforced
 
 - **Approval** is by the local OS user (not a model) and must quote the SHA-256 of
@@ -258,7 +276,8 @@ refuses a task that already failed, so nothing but rewriting state could continu
   `interrupted` on the next command and the stage can be re-run with `run`; a Builder
   stage is additionally left recoverable, with its uncommitted work preserved for
   `recover-builder`, and a Builder that wrote nothing is eligible for one
-  human-authorized `restart-builder`.
+  human-authorized `restart-builder`. A QA invocation that stopped without answering
+  is eligible for one human-authorized `retry-qa`.
 - **Isolated worktree**: the Builder never runs in the developer's checkout. Each
   task gets `task-<key>` at `workspace_root/task-<key>` on branch
   `loomsphere/task-<key>`, created from the approved `HEAD`. The workspace root must

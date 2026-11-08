@@ -13,20 +13,29 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .reports import ReportError, parse_build_report
+from .schemas.acceptance_contract import (
+    AcceptanceContract,
+    AcceptanceContractError,
+    build_contract,
+    contract_digest as calculate_contract_digest,
+)
 
 try:  # pragma: no cover - the fallback exists only for platforms without POSIX locks
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-SCHEMA_VERSION = 4
-#: Versions this build can open. A v1, v2, or v3 database is migrated forward by
-#: ``initialize``; ``check`` refuses anything else so no stage runs on data it
+SCHEMA_VERSION = 5
+#: Versions this build can open. A v1, v2, v3, or v4 database is migrated forward
+#: by ``initialize``; ``check`` refuses anything else so no stage runs on data it
 #: cannot read.
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, SCHEMA_VERSION)
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4, SCHEMA_VERSION)
 GENESIS = "0" * 64
 
 #: Every role that can own a run row in schema v2.
@@ -55,6 +64,24 @@ BUILDER_RESTART_EVENT = "builder.restart-authorized"
 INTERRUPTED_RUN_STATUSES = ("failed", "interrupted")
 RESTARTABLE_FAILURES = ("timed-out", "builder-interrupted", "interrupted")
 MAX_BUILDER_RESTARTS = 1
+
+#: Audit event that records one human authorisation to re-run only the QA stage.
+#: The immutable row it accompanies is the durable limit, so the entitlement
+#: survives a process restart and cannot be spent by a concurrent invocation.
+QA_RECOVERY_EVENT = "qa.recovery-authorized"
+
+#: Failure reasons a QA re-run may be authorised against. Every one of them means
+#: the QA invocation stopped before it produced a report, so there is no recorded
+#: QA verdict that a retry could contradict or overrule. A run that answered and
+#: was refused for its format is not in this list: it made a decision.
+QA_RECOVERABLE_FAILURES = (
+    "resource-limit-exceeded", "timed-out", "provider-unavailable", "model-error",
+    "harness-error", "empty-response", "builder-interrupted", "interrupted",
+)
+
+#: One authorised QA re-run per failed iteration. Raising this is a policy change,
+#: not a configuration detail, so the store refuses any other value out loud.
+MAX_QA_RECOVERIES = 1
 
 
 class StoreError(RuntimeError):
@@ -167,6 +194,35 @@ CREATE TABLE builder_restarts (
   empty_snapshot_digest TEXT NOT NULL,
   actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE qa_recoveries (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  failed_run_id TEXT NOT NULL REFERENCES runs(id),
+  recovery_number INTEGER NOT NULL CHECK (recovery_number >= 1),
+  failure_reason TEXT NOT NULL, failure_detail TEXT,
+  base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+  workspace_digest TEXT NOT NULL,
+  builder_provenance TEXT NOT NULL CHECK (
+    builder_provenance IN ('builder-report','builder-recovery')
+  ),
+  builder_recovery_id TEXT REFERENCES recoveries(id),
+  builder_run_id TEXT NOT NULL REFERENCES runs(id),
+  build_digest TEXT,
+  proposal_id TEXT NOT NULL REFERENCES proposals(id),
+  proposal_digest TEXT NOT NULL,
+  approval_id TEXT NOT NULL REFERENCES approvals(id),
+  contract_digest TEXT NOT NULL,
+  validation_output_digest TEXT NOT NULL,
+  sandbox_image_id TEXT NOT NULL,
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
+  CHECK (
+    (builder_provenance = 'builder-report'
+      AND builder_recovery_id IS NULL AND build_digest IS NOT NULL)
+    OR
+    (builder_provenance = 'builder-recovery'
+      AND builder_recovery_id IS NOT NULL AND build_digest IS NULL)
+  )
+);
 CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_events
   BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
 CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
@@ -197,6 +253,10 @@ CREATE TRIGGER builder_restarts_no_update BEFORE UPDATE ON builder_restarts
   BEGIN SELECT RAISE(ABORT, 'a Builder restart record is immutable'); END;
 CREATE TRIGGER builder_restarts_no_delete BEFORE DELETE ON builder_restarts
   BEGIN SELECT RAISE(ABORT, 'a Builder restart record cannot be deleted'); END;
+CREATE TRIGGER qa_recoveries_no_update BEFORE UPDATE ON qa_recoveries
+  BEGIN SELECT RAISE(ABORT, 'a QA recovery record is immutable'); END;
+CREATE TRIGGER qa_recoveries_no_delete BEFORE DELETE ON qa_recoveries
+  BEGIN SELECT RAISE(ABORT, 'a QA recovery record cannot be deleted'); END;
 """
 
 #: Tables added by schema v2. Kept separate so the v1→v2 migration applies exactly
@@ -281,6 +341,47 @@ CREATE TRIGGER IF NOT EXISTS builder_restarts_no_update BEFORE UPDATE ON builder
   BEGIN SELECT RAISE(ABORT, 'a Builder restart record is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS builder_restarts_no_delete BEFORE DELETE ON builder_restarts
   BEGIN SELECT RAISE(ABORT, 'a Builder restart record cannot be deleted'); END;
+"""
+
+#: Objects added by schema v5: the human-authorised re-run of a QA stage whose
+#: invocation failed before it produced a report. The row is immutable, unique per
+#: iteration, and binds the exact Builder provenance, change set, validation run,
+#: and approval that the retry is allowed to run against, so a retry cannot drift
+#: onto other evidence.
+V5_TABLES = """
+CREATE TABLE IF NOT EXISTS qa_recoveries (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+  iteration_id TEXT NOT NULL UNIQUE REFERENCES iterations(id),
+  failed_run_id TEXT NOT NULL REFERENCES runs(id),
+  recovery_number INTEGER NOT NULL CHECK (recovery_number >= 1),
+  failure_reason TEXT NOT NULL, failure_detail TEXT,
+  base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+  workspace_digest TEXT NOT NULL,
+  builder_provenance TEXT NOT NULL CHECK (
+    builder_provenance IN ('builder-report','builder-recovery')
+  ),
+  builder_recovery_id TEXT REFERENCES recoveries(id),
+  builder_run_id TEXT NOT NULL REFERENCES runs(id),
+  build_digest TEXT,
+  proposal_id TEXT NOT NULL REFERENCES proposals(id),
+  proposal_digest TEXT NOT NULL,
+  approval_id TEXT NOT NULL REFERENCES approvals(id),
+  contract_digest TEXT NOT NULL,
+  validation_output_digest TEXT NOT NULL,
+  sandbox_image_id TEXT NOT NULL,
+  actor TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
+  CHECK (
+    (builder_provenance = 'builder-report'
+      AND builder_recovery_id IS NULL AND build_digest IS NOT NULL)
+    OR
+    (builder_provenance = 'builder-recovery'
+      AND builder_recovery_id IS NOT NULL AND build_digest IS NULL)
+  )
+);
+CREATE TRIGGER IF NOT EXISTS qa_recoveries_no_update BEFORE UPDATE ON qa_recoveries
+  BEGIN SELECT RAISE(ABORT, 'a QA recovery record is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS qa_recoveries_no_delete BEFORE DELETE ON qa_recoveries
+  BEGIN SELECT RAISE(ABORT, 'a QA recovery record cannot be deleted'); END;
 """
 
 
@@ -421,8 +522,40 @@ class SqliteStore:
         if version == 3:
             self._migrate_v3_to_v4(connection)
             version = 4
+        if version == 4:
+            self._migrate_v4_to_v5(connection)
+            version = 5
         if version != SCHEMA_VERSION:  # pragma: no cover - unreachable by construction
             raise StoreError("state-version", "The state database version is unsupported.")
+
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        """Add the QA-recovery authorization table without touching a row.
+
+        v5, like v4 and v3, only creates objects, so every previously recorded row
+        is read back unchanged and compared by count. The tables counted include
+        the two later evidence tables, so a migration that dropped a recovery or a
+        restart record would be caught here rather than at the next stage.
+        """
+
+        previous = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("tasks", "runs", "iterations", "recoveries", "builder_restarts")
+        }
+        connection.executescript(V5_TABLES)
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("UPDATE meta SET value = '5' WHERE key = 'schema_version'")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        for table, count in previous.items():
+            now_count = connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            if now_count != count:
+                raise StoreError(
+                    "state-corrupt", "The schema migration did not preserve every recorded row."
+                )
 
     def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
         """Add the Builder-restart authorization table without touching a row.
@@ -591,9 +724,13 @@ class SqliteStore:
 
         db = self._connect()
         try:
-            rows = db.execute("SELECT * FROM audit_events ORDER BY seq").fetchall()
+            return self._verify_audit_chain(db)
         finally:
             db.close()
+
+    @staticmethod
+    def _verify_audit_chain(db: sqlite3.Connection) -> int:
+        rows = db.execute("SELECT * FROM audit_events ORDER BY seq").fetchall()
         previous = GENESIS
         for row in rows:
             body = _dump(
@@ -816,6 +953,8 @@ class SqliteStore:
                                  {"run_id": run["id"]})
                 if run["role"] == "builder":
                     self._close_interrupted_iteration(db, run["task_id"])
+                if run["role"] == "qa":
+                    self._close_interrupted_qa_iteration(db, run["task_id"])
                 recovered.append(run["id"])
             # A stage can also be claimed before its run row exists: the claim and
             # the run are written together, but a recovery claim holds the stage
@@ -831,17 +970,36 @@ class SqliteStore:
             # ``recoveries`` row for its current iteration. Matching on the shape
             # alone would fail a live implementation whose validation merely
             # overlapped another process's ``status``.
+            #
+            # A QA re-run is claimed by its own row in ``qa_recoveries`` and holds
+            # the stage across a prompt composition that has no run row either, so
+            # that claim is the positive evidence for the QA stage. The Builder
+            # rule is unchanged: only a ``recoveries`` row identifies its runless
+            # stage, and a QA claim never satisfies it.
             for failed, running in running_status.values():
+                if running == "qa_running":
+                    claim = (
+                        " AND EXISTS ("
+                        "  SELECT 1 FROM iterations i"
+                        "  JOIN qa_recoveries q ON q.iteration_id = i.id"
+                        "  WHERE i.task_id = t.id"
+                        "  AND i.number = (SELECT MAX(number) FROM iterations"
+                        "                  WHERE task_id = t.id))"
+                    )
+                else:
+                    claim = (
+                        " AND EXISTS ("
+                        "  SELECT 1 FROM iterations i"
+                        "  JOIN recoveries r ON r.iteration_id = i.id"
+                        "  WHERE i.task_id = t.id"
+                        "  AND i.number = (SELECT MAX(number) FROM iterations"
+                        "                  WHERE task_id = t.id))"
+                    )
                 for task in db.execute(
                     "SELECT t.id FROM tasks t"
                     " WHERE t.status = ?"
                     " AND t.id NOT IN (SELECT task_id FROM runs WHERE status = 'running')"
-                    " AND EXISTS ("
-                    "  SELECT 1 FROM iterations i"
-                    "  JOIN recoveries r ON r.iteration_id = i.id"
-                    "  WHERE i.task_id = t.id"
-                    "  AND i.number = (SELECT MAX(number) FROM iterations"
-                    "                  WHERE task_id = t.id))",
+                    + claim,
                     (running,),
                 ).fetchall():
                     if task["id"] in leased:
@@ -850,6 +1008,8 @@ class SqliteStore:
                                      "stage.interrupted", {"run_id": None})
                     if running == "implementation_running":
                         self._close_interrupted_iteration(db, task["id"])
+                    elif running == "qa_running":
+                        self._close_interrupted_qa_iteration(db, task["id"])
                     recovered.append(task["id"])
         return recovered
 
@@ -867,6 +1027,24 @@ class SqliteStore:
             "UPDATE iterations SET status = 'failed', failure_reason = 'interrupted',"
             " failure_detail = 'The process stopped before the run finished.',"
             " updated_at = ? WHERE task_id = ? AND status = 'building'",
+            (now(), task_id),
+        )
+
+    @staticmethod
+    def _close_interrupted_qa_iteration(db: sqlite3.Connection, task_id: str) -> None:
+        """Stop a QA stage left open by a dead process on the iteration that owns it.
+
+        A live QA failure closes its iteration as it records the failure. A process
+        that dies does not, so the iteration would stay ``qa_running`` for ever —
+        and every QA recovery path requires a failed iteration, which would make the
+        recorded failed run inspectable but never recoverable. The run and the
+        audit chain that recorded it are untouched: only the stage is closed.
+        """
+
+        db.execute(
+            "UPDATE iterations SET status = 'failed', failure_reason = 'interrupted',"
+            " failure_detail = 'The process stopped before the run finished.',"
+            " updated_at = ? WHERE task_id = ? AND status = 'qa_running'",
             (now(), task_id),
         )
 
@@ -1253,6 +1431,614 @@ class SqliteStore:
                 },
             )
         return self.recovery_for_iteration(iteration_id)  # type: ignore[return-value]
+
+    def qa_recoveries(self, task_id: str) -> list[dict[str, Any]]:
+        """Every recorded authorization to re-run the QA stage for one task."""
+
+        db = self._connect()
+        try:
+            rows = db.execute(
+                "SELECT * FROM qa_recoveries WHERE task_id = ? ORDER BY created_at",
+                (task_id,),
+            ).fetchall()
+        finally:
+            db.close()
+        return [dict(row) for row in rows]
+
+    def qa_recovery_for_iteration(self, iteration_id: str) -> dict[str, Any] | None:
+        db = self._connect()
+        try:
+            return _row(db.execute(
+                "SELECT * FROM qa_recoveries WHERE iteration_id = ?", (iteration_id,)
+            ).fetchone())
+        finally:
+            db.close()
+
+    @staticmethod
+    def _approved_contract(document: str) -> AcceptanceContract:
+        try:
+            proposal = json.loads(document)
+            criteria = proposal.get("acceptance_criteria_mapping")
+            if not isinstance(criteria, list):
+                raise ValueError("the proposal has no acceptance criteria mapping")
+            return build_contract(criteria)
+        except (json.JSONDecodeError, AttributeError, ValueError, AcceptanceContractError) as error:
+            raise StoreError(
+                "qa-recovery-refused",
+                f"The approved acceptance contract cannot be verified ({error}).",
+            ) from error
+
+    @staticmethod
+    def _verify_qa_validation(
+        *,
+        validation: Any,
+        contract: AcceptanceContract,
+        iteration_validation_exit_code: int | None,
+        workspace_digest: str,
+        validation_output_digest: str,
+        sandbox_image_id: str,
+    ) -> None:
+        def refuse() -> None:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The supplied validation digest or sandbox image does not match the "
+                "successful acceptance evidence recorded on the iteration.",
+            )
+
+        if (
+            not isinstance(validation, dict)
+            or validation.get("status") != "succeeded"
+            or validation.get("exit_code") != 0
+            or iteration_validation_exit_code != 0
+            or validation.get("workspace_digest") != workspace_digest
+            or validation.get("output_digest") != validation_output_digest
+            or validation.get("sandbox_image_id") != sandbox_image_id
+            or not isinstance(sandbox_image_id, str)
+            or not sandbox_image_id.startswith("sha256:")
+            or not isinstance(validation_output_digest, str)
+            or not validation_output_digest
+        ):
+            refuse()
+
+        coverage = validation.get("verification_coverage")
+        evidence = coverage.get("criteria") if isinstance(coverage, dict) else None
+        if not isinstance(evidence, list) or len(evidence) != len(contract.criteria):
+            refuse()
+        by_id = {item.get("id"): item for item in evidence if isinstance(item, dict)}
+        if len(by_id) != len(contract.criteria):
+            refuse()
+        expected_source = workspace_digest
+        expected_image = sandbox_image_id
+        expected_image_name = validation.get("sandbox_image")
+        pytest_criteria = [
+            criterion for criterion in contract.criteria
+            if criterion.verification.kind == "pytest"
+        ]
+        if pytest_criteria:
+            environment = coverage.get("environment_check")
+            if (
+                not isinstance(environment, dict)
+                or environment.get("command") != ["python", "-m", "pytest", "--version"]
+                or environment.get("status") != "succeeded"
+                or environment.get("source_digest") != expected_source
+                or environment.get("source_digest_after") != expected_source
+                or environment.get("sandbox_image_id") != expected_image
+                or environment.get("sandbox_image") != expected_image_name
+            ):
+                refuse()
+        for criterion in contract.criteria:
+            result = by_id.get(criterion.id)
+            if (
+                result is None
+                or result.get("declared") != criterion.verification.model_dump(mode="json")
+                or result.get("mandatory") != criterion.mandatory
+            ):
+                refuse()
+            if not criterion.mandatory:
+                continue
+            if criterion.verification.kind != "pytest":
+                refuse()
+            selector = criterion.verification.selector
+            expected_commands = (
+                ["python", "-m", "pytest", "--collect-only", "-q", selector],
+                ["python", "-m", "pytest", "-q", selector],
+            )
+            collection = result.get("collection")
+            execution = result.get("execution")
+            if (
+                result.get("status") != "succeeded"
+                or result.get("selector_exists") is not True
+                or result.get("selector_executed") is not True
+                or not isinstance(collection, dict)
+                or collection.get("command") != expected_commands[0]
+                or collection.get("status") != "succeeded"
+                or collection.get("exit_code") != 0
+                or collection.get("source_digest") != expected_source
+                or collection.get("source_digest_after") != expected_source
+                or collection.get("sandbox_image_id") != expected_image
+                or collection.get("sandbox_image") != expected_image_name
+                or not collection.get("output_digest")
+                or not isinstance(execution, dict)
+                or execution.get("command") != expected_commands[1]
+                or execution.get("status") != "succeeded"
+                or execution.get("exit_code") != 0
+                or execution.get("source_digest") != expected_source
+                or execution.get("source_digest_after") != expected_source
+                or execution.get("sandbox_image_id") != expected_image
+                or execution.get("sandbox_image") != expected_image_name
+                or not execution.get("output_digest")
+            ):
+                refuse()
+
+    def _qa_builder_provenance(
+        self,
+        db: sqlite3.Connection,
+        *,
+        task_id: str,
+        iteration: sqlite3.Row,
+        builder_run_id: str | None,
+        build_digest: str | None,
+        expected_contract_digest: str,
+    ) -> dict[str, str | None]:
+        """Verify exactly one report or authorized-recovery provenance path."""
+
+        report_recorded = iteration["build_report"] is not None
+        digest_recorded = iteration["build_digest"] is not None
+        if report_recorded != digest_recorded:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The iteration has incomplete Builder report provenance.",
+            )
+
+        if report_recorded:
+            if (
+                builder_run_id != iteration["builder_run_id"]
+                or build_digest != iteration["build_digest"]
+                or not iteration["builder_run_id"]
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied Builder report provenance does not match the iteration.",
+                )
+            if db.execute(
+                "SELECT 1 FROM recoveries WHERE task_id = ? AND iteration_id = ?",
+                (task_id, iteration["id"]),
+            ).fetchone() is not None:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The iteration has conflicting Builder recovery provenance.",
+                )
+            run = db.execute(
+                "SELECT role, status, response_text FROM runs WHERE id = ? AND task_id = ?",
+                (iteration["builder_run_id"], task_id),
+            ).fetchone()
+            if run is None or run["role"] != "builder" or run["status"] != "succeeded":
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report has no successful Builder run.",
+                )
+            try:
+                report = parse_build_report(run["response_text"] or "")
+                stored_report = json.loads(iteration["build_report"])
+            except (ReportError, json.JSONDecodeError, TypeError) as error:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report cannot be verified.",
+                ) from error
+            if (
+                report.digest != iteration["build_digest"]
+                or stored_report != asdict(report)
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded Builder report does not match its stored digest.",
+                )
+            return {
+                "builder_provenance": "builder-report",
+                "builder_recovery_id": None,
+                "builder_run_id": iteration["builder_run_id"],
+                "build_digest": iteration["build_digest"],
+            }
+
+        if build_digest is not None:
+            raise StoreError(
+                "qa-recovery-refused",
+                "A missing Builder report is not backed by valid recovery provenance.",
+            )
+        recovery = db.execute(
+            "SELECT * FROM recoveries WHERE task_id = ? AND iteration_id = ?",
+            (task_id, iteration["id"]),
+        ).fetchone()
+        if (
+            recovery is None
+            or builder_run_id != recovery["builder_run_id"]
+            or (
+                iteration["builder_run_id"] is not None
+                and recovery["builder_run_id"] != iteration["builder_run_id"]
+            )
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The missing Builder report has no recovery record for this iteration.",
+            )
+        run = db.execute(
+            "SELECT role, status, failure_reason FROM runs WHERE id = ? AND task_id = ?",
+            (recovery["builder_run_id"], task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["role"] != "builder"
+            or run["status"] != "failed"
+            or run["failure_reason"] != recovery["failure_reason"]
+            or recovery["builder_run_id"] is None
+            or recovery["base_commit"] != iteration["base_commit"]
+            or recovery["head_commit"] != iteration["commit_sha"]
+            or recovery["recovery_digest"] != iteration["workspace_digest"]
+            or recovery["contract_digest"] != expected_contract_digest
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery does not match the failed run, approved "
+                "contract, or frozen change set.",
+            )
+        try:
+            changed_files = json.loads(recovery["changed_files"])
+        except (json.JSONDecodeError, TypeError) as error:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery has invalid changed-file evidence.",
+            ) from error
+        if (
+            not isinstance(changed_files, list)
+            or not changed_files
+            or any(not isinstance(item, dict) or not item.get("path") for item in changed_files)
+        ):
+            raise StoreError(
+                "qa-recovery-refused",
+                "The recorded Builder recovery has no valid changed-file evidence.",
+            )
+
+        self._verify_audit_chain(db)
+        expected_event = {
+            "recovery_id": recovery["id"],
+            "iteration_id": recovery["iteration_id"],
+            "builder_run_id": recovery["builder_run_id"],
+            "failure_reason": recovery["failure_reason"],
+            "recovery_digest": recovery["recovery_digest"],
+            "snapshot_digest": recovery["snapshot_digest"],
+            "contract_digest": recovery["contract_digest"],
+            "base_commit": recovery["base_commit"],
+            "head_commit": recovery["head_commit"],
+            "changed_files": [item["path"] for item in changed_files],
+        }
+        event_matches = False
+        for event in db.execute(
+            "SELECT detail FROM audit_events WHERE task_id = ? AND event = ?",
+            (task_id, RECOVERY_EVENT),
+        ).fetchall():
+            try:
+                detail = json.loads(event["detail"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if all(detail.get(key) == value for key, value in expected_event.items()):
+                event_matches = True
+                break
+        if not event_matches:
+            raise StoreError(
+                "qa-recovery-refused",
+                "The Builder recovery is not backed by its matching authorization audit event.",
+            )
+        return {
+            "builder_provenance": "builder-recovery",
+            "builder_recovery_id": recovery["id"],
+            "builder_run_id": recovery["builder_run_id"],
+            "build_digest": None,
+        }
+
+    def verify_qa_builder_provenance(
+        self, *, task_id: str, iteration_id: str
+    ) -> dict[str, str | None]:
+        """Read-only verification shared by QA-recovery inspection and authorization."""
+
+        db = self._connect()
+        try:
+            iteration = db.execute(
+                "SELECT id, task_id, base_commit, commit_sha, workspace_digest,"
+                " builder_run_id, build_report, build_digest"
+                " FROM iterations WHERE id = ? AND task_id = ?",
+                (iteration_id, task_id),
+            ).fetchone()
+            if iteration is None:
+                raise StoreError(
+                    "qa-recovery-refused", "The QA-recovery iteration is missing."
+                )
+            proposal = db.execute(
+                "SELECT status, digest, document FROM proposals"
+                " WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                proposal is None
+                or proposal["status"] != "approved"
+                or hashlib.sha256(proposal["document"].encode("utf-8")).hexdigest()
+                != proposal["digest"]
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The approved proposal for the Builder provenance is missing or changed.",
+                )
+            approved_contract = self._approved_contract(proposal["document"])
+            approved_contract_digest = calculate_contract_digest(approved_contract)
+            builder_run_id = iteration["builder_run_id"]
+            if builder_run_id is None:
+                recovery = db.execute(
+                    "SELECT builder_run_id FROM recoveries"
+                    " WHERE task_id = ? AND iteration_id = ?",
+                    (task_id, iteration_id),
+                ).fetchone()
+                builder_run_id = recovery["builder_run_id"] if recovery is not None else None
+            return self._qa_builder_provenance(
+                db,
+                task_id=task_id,
+                iteration=iteration,
+                builder_run_id=builder_run_id,
+                build_digest=iteration["build_digest"],
+                expected_contract_digest=approved_contract_digest,
+            )
+        finally:
+            db.close()
+
+    def authorize_qa_recovery(
+        self, *, task_id: str, iteration_id: str, failed_run_id: str, actor: str,
+        reason: str | None, base_commit: str, head_commit: str, workspace_digest: str,
+        builder_run_id: str | None, build_digest: str | None, proposal_id: str,
+        proposal_digest: str, approval_id: str, contract_digest: str,
+        validation_output_digest: str, sandbox_image_id: str, limit: int,
+    ) -> dict[str, Any]:
+        """Claim the one authorised re-run of a failed QA stage, atomically.
+
+        Every condition a QA re-run depends on is re-checked here, inside the write
+        transaction, rather than trusted from the caller: the task status, the
+        one-per-iteration limit, the failed QA run and its reason, the absence of
+        any QA verdict, the exact change set and validation run that are being
+        re-examined, and the approval that binds the proposal and contract. Two
+        concurrent invocations therefore cannot both authorise, and a recorded row
+        cannot be replayed.
+
+        The task moves to ``qa_running`` and the iteration with it, so the
+        authorization is the only thing that permits the next QA invocation and a
+        process that stops between the claim and the call leaves a state a later
+        repair pass can close. The failed run, its failure reason, and every audit
+        event already recorded are never modified.
+        """
+
+        recovery_id = str(uuid.uuid4())
+        with self._tx() as db:
+            task = db.execute(
+                "SELECT status, repo_commit FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise StoreError("task-not-found", f"No task {task_id}.")
+            if limit != MAX_QA_RECOVERIES:
+                raise StoreError(
+                    "qa-recovery-exhausted",
+                    f"The authorised QA re-run limit is fixed at {MAX_QA_RECOVERIES}.",
+                )
+            # The authorisation count is checked before the status so that a second
+            # concurrent attempt reports exhaustion, which is what happened, rather
+            # than the transition this attempt never reached.
+            used = db.execute(
+                "SELECT COUNT(*) AS n FROM qa_recoveries WHERE task_id = ?", (task_id,)
+            ).fetchone()["n"]
+            if used >= limit:
+                raise StoreError(
+                    "qa-recovery-exhausted",
+                    f"Task {task_id} already used its {limit} authorised QA retry.",
+                )
+            if task["status"] != "qa_failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Task {task_id} is {task['status']}; expected qa_failed.",
+                )
+            iteration = db.execute(
+                "SELECT id, number, status, base_commit, commit_sha, workspace_digest,"
+                " builder_run_id, build_report, build_digest,"
+                " validation, validation_exit_code,"
+                " qa_run_id, qa_report, qa_digest, created_at"
+                " FROM iterations WHERE id = ? AND task_id = ?",
+                (iteration_id, task_id),
+            ).fetchone()
+            if iteration is None:
+                raise StoreError(
+                    "iteration-not-found", f"No iteration {iteration_id} for {task_id}."
+                )
+            latest_iteration = db.execute(
+                "SELECT id FROM iterations WHERE task_id = ? ORDER BY number DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if latest_iteration is None or latest_iteration["id"] != iteration_id:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied iteration is not the task's latest iteration.",
+                )
+            if iteration["status"] != "failed":
+                raise StoreError(
+                    "invalid-transition",
+                    f"Iteration {iteration_id} is {iteration['status']}; expected failed.",
+                )
+            if (
+                iteration["qa_report"] is not None
+                or iteration["qa_digest"] is not None
+                or iteration["qa_run_id"] is not None
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The iteration recorded a QA verdict, so there is nothing to re-run.",
+                )
+            # A QA re-run examines the exact change set and validation run already on
+            # record. Nothing is re-executed, so a single byte of drift in either
+            # would make the retry a decision about evidence no human authorised.
+            if (
+                iteration["commit_sha"] != head_commit
+                or iteration["workspace_digest"] != workspace_digest
+                or iteration["base_commit"] != base_commit
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The recorded change set does not match the one being re-examined.",
+                )
+            if iteration["base_commit"] != task["repo_commit"] or base_commit != task["repo_commit"]:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The iteration base commit is not the approved repository commit.",
+                )
+            placeholders = ",".join("?" for _ in INTERRUPTED_RUN_STATUSES)
+            run = db.execute(
+                "SELECT id, role, status, failure_reason, failure_detail, started_at FROM runs"
+                f" WHERE id = ? AND task_id = ? AND status IN ({placeholders})",
+                (failed_run_id, task_id, *INTERRUPTED_RUN_STATUSES),
+            ).fetchone()
+            if run is None or run["role"] != "qa":
+                raise StoreError(
+                    "qa-recovery-refused", "The supplied id is not a failed QA run."
+                )
+            if run["failure_reason"] not in QA_RECOVERABLE_FAILURES:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The failed QA run did not stop for a recoverable execution failure.",
+                )
+            latest_qa_run = db.execute(
+                "SELECT id FROM runs WHERE task_id = ? AND role = 'qa'"
+                " ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                run["started_at"] < iteration["created_at"]
+                or latest_qa_run is None
+                or latest_qa_run["id"] != failed_run_id
+            ):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied QA run is not the failed run for this iteration.",
+                )
+            if db.execute(
+                "SELECT 1 FROM deliverables WHERE task_id = ? LIMIT 1", (task_id,)
+            ).fetchone() is not None or db.execute(
+                "SELECT 1 FROM acceptances WHERE task_id = ? LIMIT 1", (task_id,)
+            ).fetchone() is not None:
+                raise StoreError(
+                    "qa-recovery-refused", "A deliverable or delivery decision already exists."
+                )
+            proposal = db.execute(
+                "SELECT id, digest, status, document FROM proposals"
+                " WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            approval = db.execute(
+                "SELECT id, proposal_id, proposal_digest, decision, repo_commit FROM approvals"
+                " WHERE task_id = ? ORDER BY decided_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                proposal is None
+                or approval is None
+                or proposal["id"] != proposal_id
+                or proposal["digest"] != proposal_digest
+                or proposal["status"] != "approved"
+                or hashlib.sha256(proposal["document"].encode("utf-8")).hexdigest()
+                != proposal["digest"]
+                or approval["id"] != approval_id
+                or approval["decision"] != "approved"
+                or approval["proposal_id"] != proposal["id"]
+                or approval["proposal_digest"] != proposal["digest"]
+            ):
+                raise StoreError(
+                    "qa-recovery-refused", "The original approval no longer matches the proposal."
+                )
+            approved_contract = self._approved_contract(proposal["document"])
+            approved_contract_digest = calculate_contract_digest(approved_contract)
+            if approved_contract_digest != contract_digest:
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The supplied contract digest does not match the approved proposal.",
+                )
+            if approval["repo_commit"] not in (None, task["repo_commit"]):
+                raise StoreError(
+                    "qa-recovery-refused",
+                    "The approved repository commit is not the one the task recorded.",
+                )
+            builder_provenance = self._qa_builder_provenance(
+                db,
+                task_id=task_id,
+                iteration=iteration,
+                builder_run_id=builder_run_id,
+                build_digest=build_digest,
+                expected_contract_digest=approved_contract_digest,
+            )
+            try:
+                validation = json.loads(iteration["validation"] or "")
+            except (json.JSONDecodeError, TypeError) as error:
+                raise StoreError(
+                    "qa-recovery-refused", "The recorded validation evidence is missing."
+                ) from error
+            self._verify_qa_validation(
+                validation=validation,
+                contract=approved_contract,
+                iteration_validation_exit_code=iteration["validation_exit_code"],
+                workspace_digest=workspace_digest,
+                validation_output_digest=validation_output_digest,
+                sandbox_image_id=sandbox_image_id,
+            )
+            db.execute(
+                "INSERT INTO qa_recoveries ("
+                " id, task_id, iteration_id, failed_run_id, recovery_number,"
+                " failure_reason, failure_detail, base_commit, head_commit, workspace_digest,"
+                " builder_provenance, builder_recovery_id, builder_run_id, build_digest,"
+                " proposal_id, proposal_digest, approval_id, contract_digest,"
+                " validation_output_digest, sandbox_image_id, actor, reason, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    recovery_id, task_id, iteration_id, failed_run_id, used + 1,
+                    str(run["failure_reason"] or "unknown"),
+                    (str(run["failure_detail"] or "") or None), base_commit,
+                    head_commit, workspace_digest,
+                    builder_provenance["builder_provenance"],
+                    builder_provenance["builder_recovery_id"],
+                    builder_provenance["builder_run_id"],
+                    builder_provenance["build_digest"],
+                    proposal["id"], proposal["digest"], approval["id"],
+                    approved_contract_digest,
+                    validation_output_digest, sandbox_image_id, actor, reason, now(),
+                ),
+            )
+            # The status transition is audited with the authorization, so the one
+            # event that permits a second QA invocation carries the exact record it
+            # authorized.
+            self._set_status(
+                db, task_id, "qa_running", actor, ("qa_failed",), QA_RECOVERY_EVENT,
+                {
+                    "recovery_id": recovery_id,
+                    "iteration_id": iteration_id,
+                    "failed_run_id": failed_run_id,
+                    "failure_reason": run["failure_reason"],
+                    "workspace_digest": workspace_digest,
+                    **builder_provenance,
+                    "contract_digest": approved_contract_digest,
+                    "validation_output_digest": validation_output_digest,
+                    "sandbox_image_id": sandbox_image_id,
+                    "limit": limit,
+                    "attempt": used + 1,
+                },
+            )
+            # The iteration follows the task, so the state left behind if this
+            # process stops before QA is invoked is one the repair pass can close
+            # rather than a `qa_failed` task pointing at a `qa_running` stage.
+            db.execute(
+                "UPDATE iterations SET status = 'qa_running', updated_at = ?"
+                " WHERE id = ? AND status = 'failed'",
+                (now(), iteration_id),
+            )
+        return self.qa_recovery_for_iteration(iteration_id)  # type: ignore[return-value]
 
     def builder_restarts(self, task_id: str) -> list[dict[str, Any]]:
         """Every recorded authorization to restart this task's Builder."""

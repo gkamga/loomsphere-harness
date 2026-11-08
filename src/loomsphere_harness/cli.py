@@ -30,8 +30,8 @@ from loomsphere_harness.workspace import WorkspaceError
 
 COMMANDS = (
     "init", "submit", "run", "show", "approve", "reject", "implement", "retry-review",
-    "inspect-recovery", "recover-builder", "restart-builder", "changes", "evidence",
-    "accept", "reject-delivery", "status", "audit",
+    "inspect-recovery", "recover-builder", "restart-builder", "inspect-qa-recovery",
+    "retry-qa", "changes", "evidence", "accept", "reject-delivery", "status", "audit",
 )
 EXPECTED_ERRORS = (
     ConfigError, AssetIntegrityError, EngineError, StoreError, RepositoryError, ApprovalError,
@@ -96,6 +96,20 @@ def build_parser() -> argparse.ArgumentParser:
     restart_builder.add_argument(
         "--failed-run", dest="failed_run_id", required=True,
         help="failed Builder run id shown by `inspect-recovery`")
+    inspect_qa_recovery = sub.add_parser(
+        "inspect-qa-recovery",
+        help="show whether a failed QA stage can be re-run after its invocation stopped, "
+             "without changing anything (read-only: asks reads no budget and spends no retry)")
+    inspect_qa_recovery.add_argument("task")
+    retry_qa = sub.add_parser(
+        "retry-qa",
+        help="re-run only QA for a stopped invocation, against the recorded contract, change "
+             "set, and validation evidence (one authorized re-run per iteration; does not "
+             "re-run Intake, Architect, the Builder, or the validation)")
+    retry_qa.add_argument("task")
+    retry_qa.add_argument(
+        "--failed-run", dest="failed_run_id", required=True,
+        help="failed QA run id shown by `inspect-qa-recovery`")
     changes = sub.add_parser("changes", help="show the recorded change set of the deliverable")
     changes.add_argument("task")
     evidence = sub.add_parser("evidence", help="show the validation and review evidence")
@@ -568,6 +582,112 @@ def render_recovery(view: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_qa_recovery(view: dict[str, Any]) -> str:
+    """Show whether a stopped QA invocation can be re-run, and why."""
+
+    inspection = view["qa_recovery"]
+    task = inspection["task"]
+    lines = [f"{task['id']}  {task['status']}  {task['title']}"]
+    builder_provenance = inspection.get("builder_provenance")
+    if isinstance(builder_provenance, dict):
+        provenance = builder_provenance.get("builder_provenance")
+        lines.append(
+            f"Builder provenance {provenance or builder_provenance.get('status')}"
+        )
+        if builder_provenance.get("builder_recovery_id"):
+            lines.append(
+                f"  recovery {builder_provenance['builder_recovery_id']}  "
+                f"Builder run {builder_provenance.get('builder_run_id')}"
+            )
+        if builder_provenance.get("reason"):
+            lines.append(f"  provenance obstacle {builder_provenance['reason']}")
+    iteration = inspection.get("iteration")
+    if iteration is None:
+        lines.append("no iteration is recorded for this task")
+    else:
+        lines.append(
+            f"iteration {iteration['number']}  {iteration['status']}  "
+            f"{iteration.get('failure_reason') or '-'}"
+        )
+        lines.append(
+            f"  commit {(iteration.get('commit') or '-')[:12]}  base "
+            f"{(iteration.get('base_commit') or '-')[:12]}"
+        )
+        lines.append(f"  source digest {iteration.get('workspace_digest') or '-'}")
+        lines.append(f"  Builder report {iteration.get('builder_report')}")
+        verdict = iteration.get("qa_verdict")
+        lines.append(
+            "  QA verdict: none recorded (the invocation stopped before answering)"
+            if verdict is None
+            else f"  QA verdict: {verdict}"
+        )
+
+    qa_run = inspection.get("qa_run")
+    if qa_run is None:
+        lines.append("qa run: no stopped QA run is recorded")
+    else:
+        lines.append(
+            f"qa run {qa_run['id']}  {qa_run['status']}  "
+            f"{qa_run.get('failure_reason') or '-'}"
+        )
+        detail = str(qa_run.get("failure_detail") or "").strip()
+        if detail:
+            lines.extend(f"  {line}" for line in detail.splitlines()[:6])
+        # The token question is answered with the numbers the runtime recorded, or
+        # with the fact that it recorded none. A retry never enlarges the budget.
+        usage = qa_run.get("usage")
+        limits = qa_run.get("limits")
+        if isinstance(usage, dict) and usage:
+            lines.append(
+                "  usage " + "  ".join(f"{key} {usage[key]}" for key in sorted(usage))
+            )
+        if isinstance(limits, dict) and limits:
+            lines.append(
+                "  limits " + "  ".join(f"{key} {limits[key]}" for key in sorted(limits))
+            )
+
+    workspace = inspection.get("workspace")
+    change_set = inspection.get("change_set")
+    if workspace:
+        lines += ["", f"workspace {workspace['path']}", f"  branch {workspace.get('branch') or '-'}"]
+    if change_set:
+        lines.append(
+            f"  base {change_set['base_commit'][:12]} -> {change_set['head_commit'][:12]}"
+            f"  files {len(change_set['changed_files'])}"
+        )
+        lines.append(f"change set digest {change_set['workspace_digest']}")
+    validation = inspection.get("validation")
+    if validation:
+        lines.append(
+            f"validation {' '.join(validation['command'])} -> exit {validation['exit_code']}"
+            f"  image {validation.get('sandbox_image_id') or '-'}"
+        )
+        lines.append(
+            f"  output digest {validation['output_digest']}  "
+            f"criteria {validation['criteria']}"
+        )
+
+    lines += [
+        "",
+        f"authorized QA re-runs {inspection['used']} of {inspection['limit']} "
+        "for this iteration",
+    ]
+    for item in inspection.get("recoveries") or []:
+        lines.append(
+            f"  {item['id']}  run {item['failed_run_id']}  {item['failure_reason']}  "
+            f"{item['created_at']}"
+        )
+    obstacles = inspection.get("obstacles") or []
+    if obstacles:
+        lines.append("")
+        lines.append("Not re-runnable:")
+        lines.extend(f"  - {obstacle}" for obstacle in obstacles)
+    elif inspection.get("next"):
+        lines.append("QA re-run available. Authorize exactly this run with:")
+        lines.append(f"  {inspection['next']}")
+    return "\n".join(lines)
+
+
 def run_command(args: argparse.Namespace) -> int:
     engine = _engine(args)
     command = args.command
@@ -613,6 +733,14 @@ def run_command(args: argparse.Namespace) -> int:
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command == "restart-builder":
         view = engine.restart_builder(args.task, failed_run_id=args.failed_run_id)
+        _emit(args, view, render_iterations(view))
+        return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
+    elif command == "inspect-qa-recovery":
+        view = engine.inspect_qa_recovery(args.task)
+        _emit(args, view, render_qa_recovery(view))
+        return 0 if view["qa_recovery"]["eligible"] else 3
+    elif command == "retry-qa":
+        view = engine.retry_qa(args.task, failed_run_id=args.failed_run_id)
         _emit(args, view, render_iterations(view))
         return 0 if view["task"]["status"] == "awaiting_acceptance" else 3
     elif command in ("changes", "evidence"):

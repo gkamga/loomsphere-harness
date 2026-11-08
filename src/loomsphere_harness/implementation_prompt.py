@@ -274,6 +274,39 @@ def recovery_block(recovery: Mapping[str, Any] | None) -> str:
     )
 
 
+def qa_retry_block(retry: Mapping[str, Any] | None) -> str:
+    """The provenance note a human-authorised QA re-run carries into QA.
+
+    A QA re-run is not a second opinion. The previous invocation stopped before it
+    produced a report, so no verdict exists to revise, and a human authorised exactly
+    one re-run against evidence that has not changed. QA is told that in full: which
+    run stopped, how it stopped, and that nothing was rebuilt or re-validated.
+    Without it, QA would be asked to answer evidence it has no reason to believe was
+    ever presented, and the honest answer to that is the wrong one.
+    """
+
+    if not retry:
+        return ""
+    detail = str(retry.get("failure_detail") or "").strip()
+    return (
+        "## QA re-run provenance\n\n"
+        "This is the first QA answer for this evidence. The previous QA invocation "
+        "for this iteration stopped before it produced a report, and a recorded "
+        "human decision authorised exactly one re-run:\n\n"
+        f"- The failed QA run is `{retry.get('run_id') or 'not-recorded'}` and it "
+        f"stopped with `{retry.get('failure_reason') or 'unknown'}`.\n"
+        "- It produced no QA verdict. There is no earlier opinion to review, "
+        "correct, or overrule.\n"
+        "- Nothing was rebuilt, re-validated, or re-written for this attempt: the "
+        "approved contract, the change set "
+        f"(`{retry.get('workspace_digest') or 'unknown'}`), and the executed "
+        "validation evidence are exactly the ones recorded.\n"
+        f"- This is authorised re-run {retry.get('attempt') or 1} of at most "
+        f"{retry.get('limit') or 1} for this iteration.\n\n"
+        + (f"Recorded failure detail:\n```\n{detail[:800]}\n```\n\n" if detail else "")
+    )
+
+
 def compose_builder_prompt(
     *,
     persona: str,
@@ -336,6 +369,7 @@ def compose_qa_prompt(
     approved_criteria: Sequence[str] = (),
     skills: Sequence[SkillDocument] = (),
     recovery: Mapping[str, Any] | None = None,
+    qa_retry: Mapping[str, Any] | None = None,
 ) -> ComposedPrompt:
     files = "\n".join(f"- {path}" for path in implementation_files) or "- (none reported)"
     command = " ".join(validation_command) or "(no validation command was executed)"
@@ -359,6 +393,7 @@ def compose_qa_prompt(
                 approved_criteria=approved_criteria,
             ),
             recovery_block(recovery),
+            qa_retry_block(qa_retry),
             (
                 "## Recorded implementation\n\n"
                 f"Builder summary:\n{builder_summary}\n\n"
@@ -468,5 +503,6 @@ __all__ = [
     "compose_reviewer_prompt",
     "load_role_persona",
     "recovery_block",
+    "qa_retry_block",
     "scope_block",
 ]

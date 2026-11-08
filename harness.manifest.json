@@ -388,9 +388,13 @@
     "docs/workflows/live-acceptance-2c2.md": {
       "bytes": 5110,
       "sha256": "0b8342df5ec69260b7d75dd5e7aa897ce04f66f184f8a294a3b50f85d941c1f4"
+    },
+    "docs/workflows/qa-recovery.md": {
+      "bytes": 9191,
+      "sha256": "1b64e4a87ebff470b205e2bc0b8f609bbd4e4cf39cc3156d406bcb85a2df4786"
     }
   },
-  "docs_digest": "48a0c8f4c55fb4b4a467acf7848f3a42e9f4652357a112bce9c2a5b89abde4d3",
+  "docs_digest": "d9a4e4af3e387de0b785cdfce6ff057ecd7c4d7f7f446c784d0d82472b2215a6",
   "hooks": [],
   "manifest_version": 2,
   "skills": [
