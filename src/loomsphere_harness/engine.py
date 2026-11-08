@@ -658,6 +658,37 @@ class Engine:
         )
         return {"implementation": outcome, **self.describe(task_id)}
 
+    def inspect_qa_recovery(self, task_id: str) -> dict[str, Any]:
+        """Report whether a failed QA stage can be re-run, changing nothing.
+
+        Deliberately does not call `recover()`, for the same reason
+        `inspect_recovery` does not: reaping an interrupted run writes run and task
+        statuses and appends audit events, so an inspection that reaped first would
+        mutate the state it promises to describe and could consume the one re-run it
+        exists to help a human decide about.
+        """
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        inspection = ImplementationStage(self).inspect_qa_recovery(task_id)
+        return {"qa_recovery": inspection, **self.describe(task_id)}
+
+    def retry_qa(self, task_id: str, *, failed_run_id: str) -> dict[str, Any]:
+        """Re-run only QA for an iteration whose QA invocation never answered.
+
+        Nothing that was already proven is repeated: the approved contract, the
+        recorded change set, the immutable sandbox validation, and the acceptance
+        verification evidence are re-verified and reused, and only the QA invocation
+        a human authorized is executed again. Reviewer, delivery, and acceptance
+        then follow the ordinary path unchanged.
+        """
+
+        from loomsphere_harness.implementation import ImplementationStage
+
+        self.recover()
+        outcome = ImplementationStage(self).retry_qa(task_id, failed_run_id=failed_run_id)
+        return {"implementation": outcome, **self.describe(task_id)}
+
     def accept_delivery(
         self, task_id: str, *, deliverable_digest: str, reason: str | None = None
     ) -> dict[str, Any]:

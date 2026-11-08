@@ -37,13 +37,14 @@ from runtime_support import (  # noqa: E402
 )
 
 from loomsphere_harness import implementation as implementation_module  # noqa: E402
-from loomsphere_harness.cli import render_recovery  # noqa: E402
+from loomsphere_harness.cli import render_qa_recovery, render_recovery  # noqa: E402
 from loomsphere_harness.config import SandboxConfig, ValidationConfig  # noqa: E402
 from loomsphere_harness.engine import Engine, EngineError  # noqa: E402
 from loomsphere_harness.implementation import ImplementationStage  # noqa: E402
 from loomsphere_harness.pydantic_harness import PydanticHarnessRunner  # noqa: E402
 from loomsphere_harness.repository import GitRepository, OsUserIdentity  # noqa: E402
 from loomsphere_harness.sandbox import SandboxExecutor, SandboxPolicy  # noqa: E402
+from loomsphere_harness.schemas.acceptance_contract import contract_digest  # noqa: E402
 from loomsphere_harness.store import SqliteStore, StoreError  # noqa: E402
 from loomsphere_harness.workspace import (  # noqa: E402
     changed_paths,
@@ -195,6 +196,7 @@ def loop_model(
     unreported_files: dict[str, str] | None = None,
     proposal: dict | None = None,
     builder_failures: dict[int, Exception] | None = None,
+    qa_failures: dict[int, Exception] | None = None,
     attempt_files: dict[int, dict[str, str]] | None = None,
 ) -> FunctionModel:
     """Answer as Intake, Architect, Builder, QA, and Reviewer, in that order.
@@ -213,12 +215,19 @@ def loop_model(
     A QA entry may be raw response text instead of a report dict, which is how a
     suite scripts the shapes this module's sibling pins: prose, a truncated turn,
     or two conflicting fenced documents in one answer.
+
+    `qa_failures` maps a QA attempt number to the exception that attempt raises, the
+    way the real Demandro QA invocation stopped: after reading its evidence and
+    spending its budget, and without answering. It is separate from
+    `builder_failures` because the two stages fail for different reasons and a suite
+    needs to script either one independently.
     """
 
     counts = progress if progress is not None else {"builder": 0, "qa": 0, "review": 0}
     qa_sequence = list(qa_reports or [QA_REPORT])
     review_sequence = list(review_verdicts or [REVIEW_VERDICT])
     failures = dict(builder_failures or {})
+    qa_failures = dict(qa_failures or {})
 
     def next_report(sequence: list[dict], name: str) -> dict:
         index = min(counts[name], len(sequence) - 1)
@@ -254,6 +263,11 @@ def loop_model(
                 raise failure
             return ModelResponse(parts=[TextPart(fenced(build_report or BUILD_REPORT))])
         if "# Role: QA" in prompt:
+            failure = qa_failures.get(counts["qa"] + 1)
+            if failure is not None:
+                counts["qa"] += 1
+                # The evidence was read and the budget was spent; no answer exists.
+                raise failure
             return ModelResponse(parts=[TextPart(render(next_report(qa_sequence, "qa")))])
         if "# Role: Reviewer" in prompt:
             verdict = next_report(review_sequence, "review")
@@ -2457,6 +2471,544 @@ class BuilderRestart(LoopCase):
         self.assertEqual(view["implementation"]["reason"], "review-rejected")
         self.assertIsNone(view["acceptance"])
         self.assertIsNone(view["deliverable"])
+
+
+class QaRecovery(LoopCase):
+    """Human-authorised re-run of a QA invocation that stopped without answering.
+
+    This is the Demandro M0-02 shape. The Builder finished and its work was frozen
+    on the task branch, the frozen change set passed the immutable sandbox
+    validation with every acceptance selector verified, and then QA's invocation hit
+    the run's token budget after four requests. Nothing was wrong with the
+    implementation, yet no supported path existed out of ``qa_failed``.
+
+    Every test here pins the two halves of the fix at once: the re-run reuses what
+    was already proven (contract, change set, validation evidence, approval) and
+    repeats nothing else, and it is still only ever one run — recorded before it
+    happens, spent once, and refused when anything about the recorded state has
+    moved.
+    """
+
+    def worktree(self, engine, task_id):
+        return engine.workspace_root / f"task-{task_id.lower()}"
+
+    def corrupt(self, statement: str, *parameters) -> None:
+        """Damage recorded evidence the way a bug would; for these tests only."""
+
+        with closing(sqlite3.connect(self.state)) as db:
+            db.execute(statement, parameters)
+            db.commit()
+
+    def failed_qa(self, **options):
+        """A task whose Builder and validation succeeded and whose QA stopped."""
+
+        options.setdefault("qa_failures", {1: out_of_budget()})
+        engine, task_id, calls = self.approved_task(**options)
+        view = engine.implement(task_id)
+        self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
+        self.assertEqual(view["task"]["status"], "qa_failed")
+        self.assertIsNone(view["deliverable"])
+        return engine, task_id, calls
+
+    def qa_runs(self, engine, task_id):
+        return [run for run in engine.store.runs(task_id) if run["role"] == "qa"]
+
+    def failed_run(self, engine, task_id):
+        runs = self.qa_runs(engine, task_id)
+        self.assertTrue(runs)
+        return runs[-1]
+
+    def inspection(self, engine, task_id):
+        return engine.inspect_qa_recovery(task_id)["qa_recovery"]
+
+    def assertRefused(self, engine, task_id, *, code="qa-recovery-refused",
+                      worktree_present=True):
+        """A refusal changes nothing at all: no run, no audit event, no commit."""
+
+        worktree = self.worktree(engine, task_id)
+        task_before = engine._task(task_id)
+        iteration_before = engine.store.iteration(task_id)
+        runs_before = engine.store.runs(task_id)
+        audit_before = engine.store.audit_events(task_id)
+        recoveries_before = engine.store.qa_recoveries(task_id)
+        head_before = self.head_of(worktree) if worktree_present else None
+        porcelain_before = self.porcelain(worktree) if worktree_present else None
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_qa(
+                task_id, failed_run_id=self.failed_run(engine, task_id)["id"]
+            )
+
+        self.assertEqual(raised.exception.code, code)
+        self.assertEqual(engine._task(task_id), task_before)
+        self.assertEqual(engine.store.iteration(task_id), iteration_before)
+        self.assertEqual(engine.store.runs(task_id), runs_before)
+        self.assertEqual(engine.store.audit_events(task_id), audit_before)
+        self.assertEqual(engine.store.qa_recoveries(task_id), recoveries_before)
+        if worktree_present:
+            self.assertEqual(self.head_of(worktree), head_before)
+            self.assertEqual(self.porcelain(worktree), porcelain_before)
+        else:
+            self.assertFalse(worktree.exists())
+        self.assertEqual(self.porcelain(self.repo), "")
+        return raised.exception
+
+    def authorization(self, engine, task_id):
+        """The exact values a legitimate authorization is bound to."""
+
+        iteration = engine.store.iteration(task_id)
+        proposal = engine.store.proposal(task_id)
+        approval = engine.store.approval(task_id)
+        stage = ImplementationStage(engine)
+        contract, _criteria = stage._contract(task_id)
+        validation = stage._recorded_validation(iteration, contract)
+        return {
+            "task_id": task_id,
+            "iteration_id": iteration["id"],
+            "failed_run_id": self.failed_run(engine, task_id)["id"],
+            "actor": "bob",
+            "reason": None,
+            "base_commit": iteration["base_commit"],
+            "head_commit": iteration["commit_sha"],
+            "workspace_digest": iteration["workspace_digest"],
+            "builder_run_id": iteration["builder_run_id"],
+            "build_digest": iteration["build_digest"],
+            "proposal_id": proposal["id"],
+            "proposal_digest": proposal["digest"],
+            "approval_id": approval["id"],
+            "contract_digest": contract_digest(contract),
+            "validation_output_digest": validation.output_digest,
+            "sandbox_image_id": str(validation.sandbox_image_id),
+            "limit": 1,
+        }
+
+    # -- the Demandro case ------------------------------------------------------
+    def test_a_stopped_qa_run_is_re_run_and_reaches_the_reviewer(self) -> None:
+        engine, task_id, calls = self.failed_qa()
+        iteration = engine.store.iteration(task_id)
+        failed = self.failed_run(engine, task_id)
+        containers_before = len([call for call in calls if call[1:2] == ["run"]])
+        digest = iteration["workspace_digest"]
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(view["implementation"]["result"], "delivered")
+        self.assertEqual(view["task"]["status"], "awaiting_acceptance")
+        # Nothing was rebuilt, re-validated, or re-approved: the only new role run
+        # is the QA invocation a human authorised, followed by the ordinary
+        # Reviewer. Intake, Architect, and Builder each ran exactly once.
+        roles = [run["role"] for run in view["runs"]]
+        self.assertEqual(
+            roles, ["intake", "architect", "builder", "qa", "qa", "reviewer"]
+        )
+        self.assertEqual(len([call for call in calls if call[1:2] == ["run"]]),
+                         containers_before)
+
+        first, second = self.qa_runs(engine, task_id)
+        self.assertEqual(first, failed)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(second["status"], "succeeded")
+        self.assertEqual(iteration["commit_sha"], self.head_of(self.worktree(engine, task_id)))
+        self.assertEqual(engine.store.iteration(task_id)["workspace_digest"], digest)
+
+        document = view["deliverable"]["document"]
+        self.assertEqual(document["qa"]["report"]["verdict"], "passed")
+        self.assertEqual(document["iteration"]["commit"], iteration["commit_sha"])
+        # The validation a human is accepting is the one that already ran.
+        self.assertEqual(
+            document["validation"]["record"]["output_digest"],
+            iteration["validation"]["output_digest"],
+        )
+        self.assertEqual(document["validation"]["status"], "succeeded")
+
+        recovery = document["qa_recovery"]
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery["failed_qa_run_id"], failed["id"])
+        self.assertEqual(recovery["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(recovery["authorized_by"], "alice")
+        self.assertEqual(recovery["recovery_number"], 1)
+        self.assertEqual(recovery["workspace_digest"], digest)
+        self.assertEqual(
+            recovery["validation_output_digest"], iteration["validation"]["output_digest"]
+        )
+        # The record states what did not happen, so an acceptance is never mistaken
+        # for a second QA opinion on top of a first one.
+        self.assertEqual(recovery["previous_qa_verdict"], "not-recorded")
+        self.assertFalse(recovery["rebuilt"])
+        self.assertFalse(recovery["revalidated"])
+
+        events = [event["event"] for event in view["audit"]]
+        self.assertEqual(events.count("qa.recovery-authorized"), 1)
+        # The append-only chain still verifies after the re-run appended to it.
+        self.assertGreaterEqual(
+            engine.store.verify_audit_chain(), len(engine.store.audit_events(task_id))
+        )
+
+    def test_inspecting_a_stopped_qa_run_changes_nothing(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        worktree = self.worktree(engine, task_id)
+        head_before = self.head_of(worktree)
+        porcelain_before = self.porcelain(worktree)
+        runs_before = engine.store.runs(task_id)
+        audit_before = engine.store.audit_events(task_id)
+
+        first = self.inspection(engine, task_id)
+        second = self.inspection(engine, task_id)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first["eligible"], first["obstacles"])
+        self.assertEqual(first["obstacles"], [])
+        self.assertEqual(first["limit"], 1)
+        self.assertEqual(first["used"], 0)
+        self.assertEqual(first["recoveries"], [])
+        self.assertEqual(first["iteration"]["status"], "failed")
+        self.assertEqual(first["iteration"]["builder_report"], "recorded")
+        self.assertIsNone(first["iteration"]["qa_verdict"])
+        self.assertEqual(first["qa_run"]["failure_reason"], "resource-limit-exceeded")
+        # The token question is reported from what the runtime recorded, or from
+        # the fact that it recorded nothing — never from a guess.
+        self.assertIn("usage", first["qa_run"])
+        self.assertIn("limits", first["qa_run"])
+        self.assertEqual(first["validation"]["exit_code"], 0)
+        self.assertGreaterEqual(first["validation"]["criteria"], 1)
+        self.assertIn("retry-qa", first["next"])
+        self.assertIn(first["qa_run"]["id"], first["next"])
+
+        # The human-facing view is rendered from this exact structure.
+        rendered = render_qa_recovery({"qa_recovery": first})
+        self.assertIn("retry-qa", rendered)
+        self.assertIn(first["qa_run"]["id"], rendered)
+        self.assertIn("authorized QA re-runs 0 of 1", rendered)
+        self.assertIn("QA verdict: none recorded", rendered)
+        self.assertNotIn("Not re-runnable:", rendered)
+
+        # Reading is not changing: same commit, same worktree, same records.
+        self.assertEqual(self.head_of(worktree), head_before)
+        self.assertEqual(self.porcelain(worktree), porcelain_before)
+        self.assertEqual(engine.store.runs(task_id), runs_before)
+        self.assertEqual(engine.store.audit_events(task_id), audit_before)
+        self.assertEqual(engine.store.qa_recoveries(task_id), [])
+
+    def test_the_failed_qa_run_and_the_iteration_failure_are_never_rewritten(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        iteration_before = engine.store.iteration(task_id)
+        failed = self.failed_run(engine, task_id)
+
+        engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        first, _second = self.qa_runs(engine, task_id)
+        self.assertEqual(first, failed)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failure_reason"], "resource-limit-exceeded")
+        after = engine.store.iteration(task_id)
+        # The iteration's own failure record survives its own recovery.
+        self.assertEqual(after["id"], iteration_before["id"])
+        self.assertEqual(after["failure_reason"], iteration_before["failure_reason"])
+        self.assertEqual(after["failure_detail"], iteration_before["failure_detail"])
+        self.assertEqual(after["commit_sha"], iteration_before["commit_sha"])
+        self.assertEqual(after["build_digest"], iteration_before["build_digest"])
+        recoveries = engine.store.qa_recoveries(task_id)
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0]["failed_run_id"], failed["id"])
+        self.assertEqual(recoveries[0]["head_commit"], iteration_before["commit_sha"])
+        self.assertEqual(
+            recoveries[0]["validation_output_digest"],
+            iteration_before["validation"]["output_digest"],
+        )
+        self.assertGreater(engine.store.verify_audit_chain(), 0)
+
+    # -- what a re-run must refuse ---------------------------------------------
+    def test_a_source_file_changed_after_the_freeze_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        worktree = self.worktree(engine, task_id)
+        (worktree / "tests" / "test_hello.py").write_text("# tampered\n", encoding="utf-8")
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("no longer holds the recorded change set" in item
+                for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id, code="qa-recovery-refused")
+        self.assertIn("no longer holds the recorded change set", str(error))
+
+    def test_an_uncommitted_commit_that_moved_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        worktree = self.worktree(engine, task_id)
+        (worktree / "tests" / "test_hello.py").write_text("# other\n", encoding="utf-8")
+        for arguments in (
+            ["add", "-A"],
+            ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "other"],
+        ):
+            subprocess.run(["git", "-C", str(worktree), *arguments], check=True)
+
+        self.assertRefused(engine, task_id, code="qa-recovery-refused")
+
+    def test_a_missing_worktree_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        shutil.rmtree(self.worktree(engine, task_id))
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertEqual(inspection["change_set"], None)
+        self.assertRefused(engine, task_id, code="qa-recovery-refused",
+                           worktree_present=False)
+
+    def test_missing_or_failed_validation_evidence_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        # A test-only database: corrupt the recorded validation the way a bug would.
+        self.corrupt("UPDATE iterations SET validation = NULL WHERE task_id = ?", task_id)
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertTrue(
+            any("validation evidence cannot be re-verified" in item
+                for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id, code="qa-recovery-refused")
+
+    def test_validation_recorded_before_a_qa_failure_is_still_required(self) -> None:
+        # A validation run that failed never lets QA run at all, so the only way to
+        # reach `qa_failed` is with validation that passed. This pins that the
+        # re-run refuses when the recorded validation no longer says so.
+        engine, task_id, _ = self.failed_qa()
+        iteration = engine.store.iteration(task_id)
+        validation = dict(iteration["validation"], exit_code=1, status="failed")
+        self.corrupt(
+            "UPDATE iterations SET validation = ? WHERE task_id = ?",
+            json.dumps(validation), task_id,
+        )
+
+        self.assertRefused(engine, task_id, code="qa-recovery-refused")
+
+    def test_an_adverse_qa_verdict_is_never_a_recovery_candidate(self) -> None:
+        engine, task_id, _ = self.approved_task(qa_reports=[QA_FAILED, QA_REPORT])
+        engine.implement(task_id)
+
+        inspection = self.inspection(engine, task_id)
+
+        self.assertFalse(inspection["eligible"])
+        self.assertIsNone(inspection["qa_run"])
+        self.assertTrue(
+            any("only qa_failed can be retried" in item
+                for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_qa(task_id, failed_run_id="run-not-a-qa-run")
+        self.assertEqual(raised.exception.code, "qa-recovery-refused")
+        self.assertEqual(engine.store.qa_recoveries(task_id), [])
+
+    def test_an_invalid_qa_report_is_not_a_stopped_run(self) -> None:
+        # An answer refused for its shape reached the end of its turn and reported a
+        # reason. It is a decision about the answer, not a stopped invocation.
+        engine, task_id, _ = self.approved_task(
+            qa_reports=[{"summary": "I could not decide."}]
+        )
+        engine.implement(task_id)
+        iteration = engine.store.iteration(task_id)
+
+        self.assertEqual(engine._task(task_id)["status"], "qa_failed")
+        self.assertEqual(iteration["failure_reason"], "invalid-qa-report")
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        # The run's own record is reported, so a human can see that the invocation
+        # answered and its answer was refused — not that it stopped silently.
+        self.assertEqual(inspection["qa_run"]["failure_reason"], "invalid-qa-report")
+        self.assertTrue(
+            any("a re-run applies only to a run that stopped before answering" in item
+                for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        self.assertRefused(engine, task_id, code="qa-recovery-refused")
+
+    def test_a_different_run_id_than_the_inspected_one_is_refused(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        failed = self.failed_run(engine, task_id)
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_qa(task_id, failed_run_id="run-0" * 1)
+
+        self.assertEqual(raised.exception.code, "qa-recovery-refused")
+        self.assertIn(failed["id"], str(raised.exception))
+        self.assertEqual(engine.store.qa_recoveries(task_id), [])
+        self.assertEqual(engine._task(task_id)["status"], "qa_failed")
+
+    def test_a_task_that_is_not_qa_failed_cannot_be_re_run(self) -> None:
+        engine, task_id, _ = self.approved_task()
+
+        with self.assertRaises(EngineError) as raised:
+            engine.retry_qa(task_id, failed_run_id="run-0")
+
+        self.assertEqual(raised.exception.code, "qa-recovery-refused")
+
+    # -- the one-authorised-run guarantee --------------------------------------
+    def test_the_re_run_is_limited_to_one_per_iteration(self) -> None:
+        engine, task_id, _ = self.failed_qa(
+            qa_failures={1: out_of_budget(), 2: out_of_budget("the run hit its budget again")}
+        )
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
+        self.assertEqual(view["task"]["status"], "qa_failed")
+        self.assertEqual(len(self.qa_runs(engine, task_id)), 2)
+        self.assertIsNone(view["deliverable"])
+
+        inspection = self.inspection(engine, task_id)
+        self.assertFalse(inspection["eligible"])
+        self.assertEqual(inspection["used"], 1)
+        self.assertIsNone(inspection["next"])
+        self.assertTrue(
+            any("already used its 1 authorised QA re-run" in item
+                for item in inspection["obstacles"]),
+            inspection["obstacles"],
+        )
+        error = self.assertRefused(engine, task_id, code="qa-recovery-exhausted")
+        self.assertIn("already used its 1 authorised QA re-run", str(error))
+
+    def test_a_live_re_run_cannot_be_taken_twice(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        failed = self.failed_run(engine, task_id)
+
+        with engine.store.recovery_lease(task_id):
+            with self.assertRaises(StoreError) as raised:
+                engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(raised.exception.code, "recovery-active")
+        self.assertEqual(engine.store.qa_recoveries(task_id), [])
+        self.assertEqual(engine._task(task_id)["status"], "qa_failed")
+
+    def test_two_processes_cannot_both_authorize_a_qa_re_run(self) -> None:
+        """The single authorization is a database guarantee, not a process flag."""
+
+        engine, task_id, _ = self.failed_qa()
+        values = self.authorization(engine, task_id)
+
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", _QA_AUTHORIZE_SCRIPT, str(self.state),
+                 json.dumps(values)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(HARNESS_ROOT),
+            )
+            for _ in range(2)
+        ]
+        outcomes = []
+        for process in processes:
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            outcomes.append(json.loads(stdout))
+
+        self.assertEqual(len([item for item in outcomes if "id" in item]), 1, outcomes)
+        self.assertEqual(
+            [item["error"] for item in outcomes if "error" in item],
+            ["qa-recovery-exhausted"],
+        )
+        self.assertEqual(len(engine.store.qa_recoveries(task_id)), 1)
+        self.assertEqual(engine._task(task_id)["status"], "qa_running")
+
+    # -- the gates the re-run does not bypass ---------------------------------
+    def test_a_recovered_qa_that_stops_again_records_the_new_failure(self) -> None:
+        engine, task_id, _ = self.failed_qa(
+            qa_failures={1: out_of_budget(), 2: out_of_budget("the run hit its budget again")}
+        )
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "resource-limit-exceeded")
+        self.assertEqual(view["task"]["status"], "qa_failed")
+        self.assertIsNone(view["deliverable"])
+        # The re-run stopped where the first one stopped and nothing rolled forward:
+        # no Reviewer was asked, and both failing invocations keep their own record.
+        self.assertEqual([run["role"] for run in view["runs"]]
+                         .count("reviewer"), 0)
+        first, second = self.qa_runs(engine, task_id)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["failure_reason"], "resource-limit-exceeded")
+        self.assertEqual(engine.store.iteration(task_id)["status"], "failed")
+        self.assertEqual(len(engine.store.qa_recoveries(task_id)), 1)
+
+    def test_a_recovered_qa_that_answers_adversely_reworks_instead_of_delivering(
+        self,
+    ) -> None:
+        engine, task_id, _ = self.failed_qa(qa_reports=[QA_FAILED])
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        # The re-run produced an opinion, so the ordinary rework path applies and
+        # nothing is delivered on the strength of the authorization.
+        self.assertEqual(view["implementation"]["result"], "changes_required")
+        self.assertEqual(view["task"]["status"], "changes_required")
+        self.assertIsNone(view["deliverable"])
+        self.assertIsNone(view["acceptance"])
+        self.assertEqual(engine.store.iteration(task_id)["status"], "changes_required")
+
+    def test_a_rejecting_reviewer_still_ends_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_qa(review_verdicts=[REVIEW_REJECTED])
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(view["implementation"]["reason"], "review-rejected")
+        self.assertEqual(view["task"]["status"], "implementation_failed")
+        self.assertIsNone(view["deliverable"])
+        self.assertIsNone(view["acceptance"])
+        # The QA re-run happened and is recorded even though review ended the task.
+        self.assertEqual(len(self.qa_runs(engine, task_id)), 2)
+        self.assertEqual(len(engine.store.qa_recoveries(task_id)), 1)
+        self.assertEqual(engine.store.iteration(task_id)["status"], "review_failed")
+
+    def test_a_reviewer_report_that_cannot_be_read_ends_the_recovered_work(self) -> None:
+        engine, task_id, _ = self.failed_qa(
+            review_verdicts=[{"summary": "I could not decide."}]
+        )
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertEqual(view["implementation"]["result"], "failed")
+        self.assertEqual(view["implementation"]["reason"], "invalid-review-report")
+        # The invocation failed rather than deciding, so the task carries the
+        # Reviewer failure status and not the adverse-decision one.
+        self.assertEqual(view["task"]["status"], "review_failed")
+        self.assertIsNone(view["deliverable"])
+        self.assertEqual(engine.store.iteration(task_id)["status"], "review_failed")
+
+    def test_the_re_run_still_waits_for_a_human(self) -> None:
+        engine, task_id, _ = self.failed_qa()
+        failed = self.failed_run(engine, task_id)
+
+        view = engine.retry_qa(task_id, failed_run_id=failed["id"])
+
+        self.assertIsNone(view["acceptance"])
+        with self.assertRaises(StoreError):
+            engine.accept_delivery(task_id, deliverable_digest="0" * 64)
+        decision = engine.accept_delivery(
+            task_id, deliverable_digest=view["deliverable"]["digest"]
+        )
+        self.assertEqual(decision["decision"], "accepted")
+
+
+_QA_AUTHORIZE_SCRIPT = (
+    "import json, sys\n"
+    "from loomsphere_harness.store import SqliteStore, StoreError\n"
+    "values = json.loads(sys.argv[2])\n"
+    "try:\n"
+    "    row = SqliteStore(sys.argv[1]).authorize_qa_recovery(**values)\n"
+    "except StoreError as error:\n"
+    "    print(json.dumps({'error': error.code}))\n"
+    "else:\n"
+    "    print(json.dumps({'id': row['id']}))\n"
+)
 
 
 _AUTHORIZE_SCRIPT = (

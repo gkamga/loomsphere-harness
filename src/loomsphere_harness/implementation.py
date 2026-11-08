@@ -88,7 +88,12 @@ from loomsphere_harness.workspace import (
     screen_change_set,
     workspace_path_for,
 )
-from loomsphere_harness.store import MAX_BUILDER_RESTARTS, RESTARTABLE_FAILURES
+from loomsphere_harness.store import (
+    MAX_BUILDER_RESTARTS,
+    MAX_QA_RECOVERIES,
+    QA_RECOVERABLE_FAILURES,
+    RESTARTABLE_FAILURES,
+)
 
 DELIVERABLE_SCHEMA_VERSION = "1.0.0"
 
@@ -157,6 +162,15 @@ RECOVERABLE_RUN_STATUSES = ("failed", "interrupted")
 
 REASON_RESTART_REFUSED = "restart-refused"
 REASON_RESTART_EXHAUSTED = "restart-exhausted"
+
+#: A QA invocation that stopped before it produced a report may be re-run once per
+#: iteration, by a human, against the same approved contract, change set, and
+#: validation evidence. The authorisation is recorded, so the limit survives a
+#: restart and a concurrent invocation cannot spend it twice. Nothing about the
+#: token budget is raised: a retry that fails the same way is evidence about the
+#: budget, not a reason to enlarge it.
+REASON_QA_RECOVERY_REFUSED = "qa-recovery-refused"
+REASON_QA_RECOVERY_EXHAUSTED = "qa-recovery-exhausted"
 _SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
 COMMIT_MESSAGE = "loomsphere-harness: {task} iteration {number}"
@@ -1379,6 +1393,527 @@ class ImplementationStage:
             **outcome,
         }
 
+    # -- human-authorised re-run of a failed QA stage ------------------------
+    @staticmethod
+    def _failed_qa_run(runs: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+        """The QA run that stopped, or ``None`` when QA answered.
+
+        A QA run is only a candidate for a re-run when it *stopped*: its status says
+        it failed or was interrupted rather than completing. A run that completed and
+        was refused for the shape of its answer is a reported failure with a recorded
+        reason, and it is never a candidate here.
+        """
+
+        qa_runs = [
+            run for run in runs
+            if run["role"] == QA and run["status"] in RECOVERABLE_RUN_STATUSES
+        ]
+        return qa_runs[-1] if qa_runs else None
+
+    @staticmethod
+    def _refuse_qa_recovery(message: str) -> NoReturn:
+        raise EngineError(REASON_QA_RECOVERY_REFUSED, message)
+
+    def _qa_recovery_obstacles(
+        self,
+        task: dict[str, Any],
+        iteration: dict[str, Any] | None,
+        qa_run: dict[str, Any] | None,
+        *,
+        changeset: ChangeSet | None = None,
+        workspace_error: str | None = None,
+        validation: ValidationOutcome | None = None,
+        validation_error: str | None = None,
+    ) -> list[str]:
+        """Every reason a failed QA stage cannot be re-run, in one place.
+
+        `inspect-qa-recovery` reports these and `retry-qa` refuses on the same list,
+        so what a human is shown and what the gate enforces cannot drift. Each entry
+        states a fact about the recorded state; none of them is inferred from the
+        model's own answer, because the whole premise of this path is that no answer
+        was ever recorded.
+        """
+
+        store = self.store
+        task_id = task["id"]
+        obstacles: list[str] = []
+        if task["status"] != "qa_failed":
+            obstacles.append(
+                f"Task {task_id} is {task['status']}; only qa_failed can be retried."
+            )
+        if iteration is None:
+            obstacles.append("The task has no iteration whose QA stage can be re-run.")
+        else:
+            if iteration["status"] != ITERATION_FAILED:
+                obstacles.append(
+                    f"Iteration {iteration['number']} is {iteration['status']}; "
+                    "only a failed iteration can be re-run."
+                )
+            if (
+                iteration.get("qa_report") is not None
+                or iteration.get("qa_digest") is not None
+                or iteration.get("qa_run_id") is not None
+            ):
+                obstacles.append(
+                    "This iteration recorded a QA verdict, so there is nothing to re-run; "
+                    "a verdict is never re-asked in the hope of a different answer."
+                )
+            if iteration.get("build_report") is None or not iteration.get("build_digest"):
+                obstacles.append(
+                    "This iteration recorded no Builder report. Use `inspect-recovery` and "
+                    "`recover-builder` to take the preserved work through QA instead."
+                )
+            if not iteration.get("commit_sha"):
+                obstacles.append("The iteration recorded no commit to re-examine.")
+            if iteration["base_commit"] != task.get("repo_commit"):
+                obstacles.append(
+                    "The iteration base commit does not match the approved repository commit."
+                )
+        if qa_run is None:
+            obstacles.append("No failed QA run is recorded for this task.")
+        else:
+            if qa_run["status"] not in RECOVERABLE_RUN_STATUSES:
+                obstacles.append(f"The QA run is {qa_run['status']}, not a failed run.")
+            reason = qa_run.get("failure_reason")
+            if reason not in QA_RECOVERABLE_FAILURES:
+                obstacles.append(
+                    f"The QA run stopped with {reason!r}; a re-run applies only to a run that "
+                    "stopped before answering, not to a refused, invalid, or adverse report."
+                )
+        if store.deliverable(task_id) is not None or store.acceptance(task_id) is not None:
+            obstacles.append("A deliverable or delivery decision already exists.")
+        used = len(
+            [item for item in store.qa_recoveries(task_id)
+             if iteration is None or item["iteration_id"] == iteration["id"]]
+        )
+        if used >= MAX_QA_RECOVERIES:
+            obstacles.append(
+                f"Iteration {iteration['number'] if iteration else '?'} already used its "
+                f"{MAX_QA_RECOVERIES} authorised QA re-run."
+            )
+        if workspace_error is not None:
+            obstacles.append(
+                f"The worktree no longer holds the recorded change set ({workspace_error})."
+            )
+        elif changeset is None and iteration is not None:
+            obstacles.append(
+                "The worktree holding the recorded change set could not be read."
+            )
+        if validation_error is not None:
+            obstacles.append(
+                f"The recorded validation evidence cannot be re-verified ({validation_error})."
+            )
+        elif validation is not None and iteration is not None:
+            if validation.workspace_digest != iteration.get("workspace_digest"):
+                obstacles.append(
+                    "The recorded validation was run against different source than the "
+                    "iteration recorded."
+                )
+            if changeset is not None and changeset.workspace_digest != validation.workspace_digest:
+                obstacles.append(
+                    "The worktree content differs from the source the recorded validation ran "
+                    "against."
+                )
+        obstacles.extend(self._approval_obstacles(task, iteration))
+        return obstacles
+
+    def _recorded_build_report(
+        self, runs: dict[str, dict[str, Any]], iteration: dict[str, Any]
+    ) -> BuildReport | None:
+        """The Builder report the iteration recorded, or ``None`` when there is none.
+
+        A QA re-run must be able to tell QA what the Builder claimed without asking
+        the Builder again, so the recorded answer is parsed and re-bound to its stored
+        digest. A recovered Builder never wrote one, and nothing is invented for it.
+        """
+
+        if iteration.get("build_report") is None and iteration.get("build_digest") is None:
+            return None
+        run = runs.get(iteration.get("builder_run_id") or "")
+        if run is None or run["role"] != "builder" or run["status"] != "succeeded":
+            self._refuse_qa_recovery(
+                "The recorded Builder run is missing or did not succeed."
+            )
+        try:
+            report = parse_build_report(run.get("response_text") or "")
+        except ReportError:
+            self._refuse_qa_recovery("The recorded Builder response no longer parses.")
+        if not iteration.get("build_digest") or report.digest != iteration["build_digest"]:
+            self._refuse_qa_recovery(
+                "The recorded Builder report does not match its stored digest."
+            )
+        return report
+
+    @staticmethod
+    def _qa_retry_note(
+        task: dict[str, Any],
+        iteration: dict[str, Any],
+        qa_run: dict[str, Any],
+        changeset: ChangeSet,
+        *,
+        attempt: int,
+    ) -> dict[str, Any]:
+        """The provenance QA is told about its own re-run, and the record keeps."""
+
+        return {
+            "run_id": qa_run["id"],
+            "failure_reason": qa_run.get("failure_reason"),
+            "failure_detail": str(qa_run.get("failure_detail") or ""),
+            "workspace_digest": changeset.workspace_digest,
+            "head_commit": changeset.head_commit,
+            "base_commit": changeset.base_commit,
+            "iteration": iteration["number"],
+            "task": task["id"],
+            "attempt": attempt,
+            "limit": MAX_QA_RECOVERIES,
+        }
+
+    def inspect_qa_recovery(self, task_id: str) -> dict[str, Any]:
+        """Report whether a failed QA stage can be re-run, without changing anything.
+
+        Read-only by construction: it consults the recorded iteration, run, and
+        approval, re-verifies the recorded validation evidence, and reads the
+        worktree's change set. It creates no workspace, stages nothing, commits
+        nothing, invokes no role, and appends no audit event, so asking the question
+        can never spend the one re-run the task is allowed.
+
+        The whole point of this path is that the implementation, the validation run,
+        and the acceptance evidence were already produced and approved. This reports
+        them so a human can decide about *them*, not about a rebuilt approximation of
+        them, and it reports the token accounting the failed run recorded so the
+        budget question can be answered with measurements.
+        """
+
+        engine = self.engine
+        store = self.store
+        task = engine._task(task_id)
+        iteration = store.iteration(task_id)
+        runs = store.runs(task_id)
+        qa_run = self._failed_qa_run(runs)
+        used = len(
+            [item for item in store.qa_recoveries(task_id)
+             if iteration is None or item["iteration_id"] == iteration["id"]]
+        )
+        view: dict[str, Any] = {
+            "task": {"id": task_id, "title": task["title"], "status": task["status"]},
+            "iteration": (
+                None
+                if iteration is None
+                else {
+                    "id": iteration["id"],
+                    "number": iteration["number"],
+                    "status": iteration["status"],
+                    "failure_reason": iteration.get("failure_reason"),
+                    "failure_detail": iteration.get("failure_detail"),
+                    "commit": iteration.get("commit_sha"),
+                    "base_commit": iteration.get("base_commit"),
+                    "workspace_digest": iteration.get("workspace_digest"),
+                    "qa_verdict": (iteration.get("qa_report") or {}).get("verdict"),
+                    "builder_report": (
+                        "recorded" if iteration.get("build_digest") else "not-recorded"
+                    ),
+                }
+            ),
+            "qa_run": (
+                None
+                if qa_run is None
+                else {
+                    "id": qa_run["id"],
+                    "status": qa_run["status"],
+                    "failure_reason": qa_run.get("failure_reason"),
+                    "failure_detail": qa_run.get("failure_detail"),
+                    "started_at": qa_run.get("started_at"),
+                    "finished_at": qa_run.get("finished_at"),
+                    # Whatever the runtime already recorded, reported verbatim: the
+                    # question "why did four requests cost 69,624 tokens" is answered
+                    # by these numbers or by their absence, never by a guess.
+                    "usage": (qa_run.get("events") or {}).get("usage"),
+                    "limits": (qa_run.get("events") or {}).get("limits"),
+                }
+            ),
+            "recoveries": [
+                {
+                    "id": item["id"],
+                    "failed_run_id": item["failed_run_id"],
+                    "failure_reason": item["failure_reason"],
+                    "recovery_number": item["recovery_number"],
+                    "workspace_digest": item["workspace_digest"],
+                    "validation_output_digest": item["validation_output_digest"],
+                    "created_at": item["created_at"],
+                }
+                for item in store.qa_recoveries(task_id)
+            ],
+            "limit": MAX_QA_RECOVERIES,
+            "used": used,
+            "eligible": False,
+            "obstacles": [],
+            "validation": None,
+            "workspace": None,
+            "change_set": None,
+            "next": None,
+        }
+
+        changeset: ChangeSet | None = None
+        workspace_error: str | None = None
+        validation: ValidationOutcome | None = None
+        validation_error: str | None = None
+
+        # The expensive re-verification runs only when there is an iteration that
+        # recorded a change set and a QA run that stopped. Everything else is already
+        # reported as an obstacle above, from the records alone.
+        if iteration is not None and qa_run is not None:
+            if iteration.get("commit_sha"):
+                try:
+                    resumed = resume_task_workspace(engine.workspace_root, task_id)
+                    view["workspace"] = {
+                        "path": str(resumed.path),
+                        "branch": resumed.branch,
+                        "commit": resumed.commit,
+                        "base_commit": resumed.base_commit,
+                    }
+                    changeset = inspect_change_set(
+                        resumed.path,
+                        base_commit=iteration["base_commit"],
+                        reviewed_commit=str(iteration["commit_sha"]),
+                    )
+                    view["change_set"] = {
+                        "base_commit": changeset.base_commit,
+                        "head_commit": changeset.head_commit,
+                        "workspace_digest": changeset.workspace_digest,
+                        "changed_files": changeset.changed_files,
+                    }
+                except WorkspaceError as error:
+                    workspace_error = f"{error.code}: {error.message}"
+            try:
+                contract, _criteria = self._contract(task_id)
+                validation = self._recorded_validation(iteration, contract)
+            except (EngineError, AcceptanceContractError) as error:
+                validation_error = getattr(error, "message", str(error))
+            else:
+                view["validation"] = {
+                    "command": list(validation.command),
+                    "exit_code": validation.exit_code,
+                    "output_digest": validation.output_digest,
+                    "workspace_digest": validation.workspace_digest,
+                    "sandbox_image": validation.sandbox_image,
+                    "sandbox_image_id": validation.sandbox_image_id,
+                    "criteria": len(validation.verification_coverage.get("criteria") or []),
+                }
+
+        view["obstacles"] = self._qa_recovery_obstacles(
+            task, iteration, qa_run,
+            changeset=changeset, workspace_error=workspace_error,
+            validation=validation, validation_error=validation_error,
+        )
+        view["eligible"] = not view["obstacles"]
+        if view["eligible"] and qa_run is not None:
+            view["next"] = (
+                f"loomsphere-harness retry-qa {task_id} --failed-run {qa_run['id']}"
+            )
+        return view
+
+    def retry_qa(self, task_id: str, *, failed_run_id: str) -> dict[str, Any]:
+        """Re-run only QA for an iteration whose QA invocation never answered.
+
+        Intake, Architect, the Builder, the sandbox validation, and the acceptance
+        verification are not repeated: their recorded evidence is re-verified against
+        the approval, the worktree, and the stored runs, and the re-run is refused
+        when anything is missing, stale, or inconsistent. The failed run is never
+        rewritten, and the one authorised re-run is recorded before QA is invoked, so
+        a process that stops in between cannot spend it twice.
+
+        A re-run that QA answers is carried through the Reviewer, the delivery record,
+        and the human acceptance decision by the ordinary stages, unchanged. A re-run
+        that fails again stops where it fails and keeps its evidence. No token budget
+        is raised: a re-run that exceeds the same limit is a measurement about that
+        limit, and enlarging it is a separate decision a human has to make.
+        """
+
+        engine = self.engine
+        store = self.store
+        task = engine._task(task_id)
+        with store.recovery_lease(task_id):
+            return self._retry_qa_under_lease(task, failed_run_id=failed_run_id)
+
+    def _retry_qa_under_lease(
+        self, task: dict[str, Any], *, failed_run_id: str
+    ) -> dict[str, Any]:
+        task_id = task["id"]
+        engine = self.engine
+        store = self.store
+        # Re-read inside the lease: the caller's copy may predate another process's
+        # recorded decision, and every obstacle is stated about the current records.
+        task = engine._task(task_id)
+        iteration = store.iteration(task_id)
+        run_rows = store.runs(task_id)
+        runs = {run["id"]: run for run in run_rows}
+        qa_run = self._failed_qa_run(run_rows)
+        if qa_run is not None and qa_run["id"] != failed_run_id:
+            self._refuse_qa_recovery(
+                f"The recorded failed QA run is {qa_run['id']!r}, not {failed_run_id!r}; "
+                "retry exactly the run that was inspected."
+            )
+        used = len(
+            [item for item in store.qa_recoveries(task_id)
+             if iteration is None or item["iteration_id"] == iteration["id"]]
+        )
+        if used >= MAX_QA_RECOVERIES:
+            raise EngineError(
+                REASON_QA_RECOVERY_EXHAUSTED,
+                f"Iteration {iteration['id'] if iteration else '?'} already used its "
+                f"{MAX_QA_RECOVERIES} authorised QA re-run.",
+            )
+
+        changeset: ChangeSet | None = None
+        workspace: TaskWorkspace | None = None
+        workspace_error: str | None = None
+        validation: ValidationOutcome | None = None
+        validation_error: str | None = None
+        contract: AcceptanceContract | None = None
+        criteria_lines: tuple[str, ...] = ()
+        if iteration is not None and qa_run is not None:
+            try:
+                contract, criteria_lines = self._contract(task_id)
+                validation = self._recorded_validation(iteration, contract)
+            except (EngineError, AcceptanceContractError) as error:
+                validation_error = getattr(error, "message", str(error))
+            if iteration.get("commit_sha"):
+                try:
+                    workspace = resume_task_workspace(engine.workspace_root, task_id)
+                    changeset = inspect_change_set(
+                        workspace.path,
+                        base_commit=iteration["base_commit"],
+                        reviewed_commit=str(iteration["commit_sha"]),
+                    )
+                except WorkspaceError as error:
+                    workspace_error = f"{error.code}: {error.message}"
+
+        obstacles = self._qa_recovery_obstacles(
+            task, iteration, qa_run,
+            changeset=changeset, workspace_error=workspace_error,
+            validation=validation, validation_error=validation_error,
+        )
+        if obstacles:
+            self._refuse_qa_recovery(" ".join(obstacles))
+        if (
+            iteration is None or qa_run is None or changeset is None
+            or workspace is None or validation is None or contract is None
+        ):  # pragma: no cover - guarded above
+            self._refuse_qa_recovery("The task has no re-runnable QA stage.")
+
+        # Everything QA is about to read is re-derived from the records, never from
+        # the caller: the recorded Builder answer (or the fact that none exists), the
+        # recorded change set, and the recorded validation run.
+        report = self._recorded_build_report(runs, iteration)
+        recovery = store.recovery_for_iteration(iteration["id"])
+        note = self._qa_retry_note(
+            task, iteration, qa_run, changeset, attempt=used + 1
+        )
+        persona, _, selection = engine.persona_and_skills(task, QA)
+        try:
+            qa_prompt = compose_qa_prompt(
+                persona=persona,
+                task_title=task["title"],
+                requirements=task["requirements"],
+                acceptance_criteria=task["acceptance_criteria"],
+                task_identifier=task_id,
+                implementation_summary=report.summary if report is not None else "",
+                implementation_files=changeset.paths,
+                diff_excerpt=diff_excerpt(changeset.diff, DIFF_EXCERPT_CHARS),
+                validation_command=validation.command,
+                validation_exit_code=validation.exit_code,
+                validation_output=(
+                    "The validation output text is not stored: the recorded evidence keeps "
+                    f"its digest ({validation.output_digest}) rather than its content, and "
+                    "the command, the exit code, and the per-criterion execution digests "
+                    "are the evidence that this run succeeded."
+                ),
+                approved_criteria=criteria_lines,
+                skills=selection.documents,
+                recovery=recovery,
+                qa_retry=note,
+            )
+        except LoopPromptError as error:
+            # Nothing is authorised yet, so a prompt that cannot be composed costs
+            # the task nothing: the one re-run is still there for a later attempt.
+            self._refuse_qa_recovery(f"{error.code}: {error.message}")
+
+        proposal = store.proposal(task_id)
+        approval = store.approval(task_id)
+        if proposal is None or approval is None:
+            self._refuse_qa_recovery("The approved proposal or approval is missing.")
+        record = store.authorize_qa_recovery(
+            task_id=task_id,
+            iteration_id=iteration["id"],
+            failed_run_id=failed_run_id,
+            actor=engine.identity.current().id,
+            reason=None,
+            base_commit=changeset.base_commit,
+            head_commit=changeset.head_commit,
+            workspace_digest=changeset.workspace_digest,
+            builder_run_id=iteration.get("builder_run_id"),
+            build_digest=str(iteration["build_digest"]),
+            proposal_id=proposal["id"],
+            proposal_digest=proposal["digest"],
+            approval_id=approval["id"],
+            contract_digest=contract_digest(contract),
+            validation_output_digest=validation.output_digest,
+            sandbox_image_id=str(validation.sandbox_image_id),
+            limit=MAX_QA_RECOVERIES,
+        )
+
+        # QA is invoked once. The iteration already holds the claim, so a failure is
+        # recorded against the new run and nothing retries on its behalf.
+        qa = self._run_qa(
+            task, task_id=task_id, iteration_id=iteration["id"],
+            number=iteration["number"], contract=contract,
+            workspace_path=workspace.path, qa_prompt=qa_prompt,
+            selection=selection, actor=engine.identity.current().id,
+            entry_status="qa_running",
+        )
+        if isinstance(qa, dict):
+            return {**qa, "qa_recovery_id": record["id"]}
+
+        try:
+            review_prompt, review_selection = self._review_prompt(
+                task, report=report, qa=qa, diff=changeset.diff,
+                command=validation.command, exit_code=validation.exit_code,
+                criteria_lines=criteria_lines, recovery=recovery,
+            )
+        except LoopPromptError as error:
+            return self._record_failure(
+                task_id, iteration["id"], reason=error.code, detail=error.message,
+                expect=("qa_running",),
+                extra={"qa_recovery_id": record["id"]},
+            )
+
+        store.update_iteration(
+            iteration_id=iteration["id"], actor=engine.identity.current().id,
+            event="iteration.review-started",
+            fields={"status": ITERATION_REVIEW_RUNNING},
+            detail={"iteration": iteration["number"]},
+        )
+        review_outcome = engine.invoke_role(
+            task=task, role=REVIEWER, composed=review_prompt, selection=review_selection,
+            expect=("qa_running",), running="review_running",
+            failed="review_failed", workspace_path=workspace.path, writable=False,
+        )
+        outcome = self._finish_review(
+            task_id=task_id, iteration_id=iteration["id"], contract=contract,
+            review_outcome=review_outcome, changeset=changeset, report=report, qa=qa,
+            validation=validation, workspace=workspace,
+        )
+        if outcome["result"] == "ready":
+            published = self._publish(task, iteration, contract, outcome)
+            return {
+                "result": "delivered",
+                "iteration_id": iteration["id"],
+                "qa_recovery_id": record["id"],
+                "qa_run_id": (store.iteration(task_id) or {}).get("qa_run_id"),
+                **published,
+            }
+        return {**outcome, "qa_recovery_id": record["id"]}
+
     def _format_failed_review_run(
         self, task_id: str, iteration: dict[str, Any], runs: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
@@ -1565,6 +2100,7 @@ class ImplementationStage:
         qa_prompt: ComposedPrompt,
         selection: SkillSelection,
         actor: str,
+        entry_status: str = "implementation_running",
     ) -> QaReport | dict[str, Any]:
         """Ask QA, and at most once more when the answer is unreadable.
 
@@ -1573,6 +2109,13 @@ class ImplementationStage:
         run records, the audit event, and the evidence QA reads cannot drift between
         them. A returned ``QaReport`` was recorded and passed; a returned ``dict`` is
         the already-recorded failure the caller must hand back unchanged.
+
+        ``entry_status`` is the task status the first invocation is allowed to see.
+        A normal iteration and a recovered Builder both enter from
+        ``implementation_running``; a human-authorised QA re-run enters from
+        ``qa_running``, because its claim is what moved the task there. The bound on
+        attempts, the separate run records, and the evidence are otherwise identical,
+        so a re-run is never held to a different standard than a first run.
 
         QA may be asked once more when its answer is unreadable. The evidence it
         reads, the change set, and the contract are unchanged: only the complaint
@@ -1590,7 +2133,7 @@ class ImplementationStage:
         qa_outcome: RoleOutcome | None = None
         qa: QaReport | None = None
         prompt = qa_prompt
-        expect: tuple[str, ...] = ("implementation_running",)
+        expect: tuple[str, ...] = (entry_status,)
         for attempt in range(1, MAX_QA_FORMAT_ATTEMPTS + 1):
             qa_outcome = engine.invoke_role(
                 task=task, role=QA, composed=prompt, selection=selection,
@@ -1599,7 +2142,7 @@ class ImplementationStage:
             )
             if not qa_outcome.succeeded:
                 return self._failed_run(
-                    qa_outcome, task_id, iteration_id, running="implementation_running"
+                    qa_outcome, task_id, iteration_id, running=entry_status
                 )
             try:
                 qa = parse_qa_report(qa_outcome.response_text)
@@ -2190,6 +2733,7 @@ class ImplementationStage:
         # recorded after the copy the loop was holding.
         iteration = self.store.iteration(task_id) or iteration
         recovery = self.store.recovery_for_iteration(iteration["id"])
+        qa_recovery = self.store.qa_recovery_for_iteration(iteration["id"])
 
         document: dict[str, Any] = {
             "schema_version": DELIVERABLE_SCHEMA_VERSION,
@@ -2269,6 +2813,30 @@ class ImplementationStage:
                 "digest": qa.digest,
                 "run_id": iteration.get("qa_run_id"),
             },
+            # A QA re-run is recorded in the deliverable as its own provenance: which
+            # failed invocation it answered for, what that invocation hit, and which
+            # source and validation evidence it was asked about. A human accepting a
+            # QA-recovered delivery is told that no earlier QA verdict existed.
+            "qa_recovery": (
+                None
+                if qa_recovery is None
+                else {
+                    "id": qa_recovery["id"],
+                    "authorized_by": qa_recovery["actor"],
+                    "authorized_at": qa_recovery["created_at"],
+                    "failed_qa_run_id": qa_recovery["failed_run_id"],
+                    "failure_reason": qa_recovery["failure_reason"],
+                    "failure_detail": qa_recovery["failure_detail"],
+                    "recovery_number": qa_recovery["recovery_number"],
+                    "base_commit": qa_recovery["base_commit"],
+                    "head_commit": qa_recovery["head_commit"],
+                    "workspace_digest": qa_recovery["workspace_digest"],
+                    "validation_output_digest": qa_recovery["validation_output_digest"],
+                    "previous_qa_verdict": "not-recorded",
+                    "rebuilt": False,
+                    "revalidated": False,
+                }
+            ),
             "review": {
                 "report": dataclasses.asdict(review),
                 "digest": review.digest,
@@ -2438,6 +3006,7 @@ __all__ = [
     "MAX_BUILDER_RECOVERIES",
     "MAX_BUILDER_RESTARTS",
     "MAX_QA_FORMAT_ATTEMPTS",
+    "MAX_QA_RECOVERIES",
     "MAX_REVIEW_RETRIES",
     "QA_FORMAT_RETRY_EVENT",
     "RECOVERABLE_FAILURES",
@@ -2455,6 +3024,8 @@ __all__ = [
     "REASON_INVALID_REVIEW_REPORT",
     "REASON_ITERATIONS_EXHAUSTED",
     "REASON_QA_BLOCKED",
+    "REASON_QA_RECOVERY_EXHAUSTED",
+    "REASON_QA_RECOVERY_REFUSED",
     "REASON_REVIEW_BLOCKED",
     "REASON_REVIEW_REJECTED",
     "REASON_VALIDATION_FAILED",
